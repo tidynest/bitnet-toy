@@ -542,6 +542,74 @@ impl<'t> Var<'t> {
         }
     }
 
+    /// SiLU (Sigmoid Linear Unit), also known as Swish:
+    ///     silu(x) = x · σ(x)         where σ(x) = 1 / (1 + exp(-x))
+    ///
+    /// Smooth alternative to ReLU with a small "leaky" gradient on the
+    /// negative side - non-zero everywhere, so the dead-neuron problem
+    /// of ReLU does not apply. SiLU is the activation in the "Swi" of
+    /// SwiGLU, the gated FFN form used by LLaMA / BitNet b1.58.
+    ///
+    /// Backward via chain rule:
+    ///     d/dx[x · σ(x)] = σ(x) + x · σ'(x)
+    ///                    = σ(x) + x · σ(x) · (1 − σ(x))
+    ///                    = σ(x) · (1 + x · (1 − σ(x)))
+    ///
+    /// We save the input `x` (not σ(x) or the output) so the backward closure
+    /// can recompute σ once and derive everything else from it. Saving σ would
+    /// cost the same memory and only avoid one exp per element; not worth a
+    /// second tensor allocation.
+    pub fn silu(self) -> Var<'t> {
+        let v_in = self.value();
+        let v_out_data: Vec<f32> = v_in
+            .data
+            .iter()
+            .map(|&x| {
+                let sig = 1.0 / (1.0 + (-x).exp());
+                x * sig
+            })
+            .collect();
+        let v_out = Tensor {
+            data: v_out_data,
+            shape: v_in.shape.clone(),
+        };
+
+        let p0 = self.id;
+        let x_saved = v_in;
+        let backward = Box::new(move |g: &Tensor| -> Vec<(NodeId, Tensor)> {
+            let grad_in_data: Vec<f32> = g
+                .data
+                .iter()
+                .zip(&x_saved.data)
+                .map(|(&grad, &x)| {
+                    let sig = 1.0 / (1.0 + (-x).exp());
+                    // d/dx[silu] = σ · (1 + x · (1 − σ))
+                    let dsilu = sig * (1.0 + x * (1.0 - sig));
+                    grad * dsilu
+                })
+                .collect();
+            vec![(
+                p0,
+                Tensor {
+                    data: grad_in_data,
+                    shape: x_saved.shape.clone(),
+                },
+            )]
+        });
+
+        let grad_zero = Tensor::zeros(v_out.shape.clone());
+        let id = self.tape.push(Node {
+            value: v_out,
+            grad: RefCell::new(grad_zero),
+            backward: Some(backward),
+            parents: vec![p0],
+        });
+        Var {
+            tape: self.tape,
+            id,
+        }
+    }
+
     /// Per-row softmax over the last axis. Input must be 2D `[m, n]`.
     /// Forward uses the subtract-max trick: `exp(x − maxₖ x)` keeps every
     /// exponent ≤ 0 so `exp` never overflows. The post-normalisation result is

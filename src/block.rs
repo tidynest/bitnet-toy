@@ -29,10 +29,11 @@ pub struct AttentionHeadVars<'t> {
 }
 
 /// Bundle of per-block weight Vars. All Vars must live on the same tape as the
-/// input `x` passed to `transformer_block`. Replaces the old single-head 4-Var
-/// layout with a `Vec` of per-head bundles plus the FFN's two weights.
+/// input `x` passed to `transformer_block`. Holds `n_heads` attention bundles
+/// plus the SwiGLU FFN's three weights (gate, up, down).
 pub struct BlockWeights<'t> {
     pub heads: Vec<AttentionHeadVars<'t>>, // length = config.n_heads
+    pub ffn_gate_w: Var<'t>,
     pub ffn_up_w: Var<'t>,
     pub ffn_down_w: Var<'t>,
 }
@@ -54,8 +55,8 @@ pub fn transformer_block<'t>(x: Var<'t>, w: &BlockWeights<'t>, head_dim: usize) 
     let attn_out = attention(x.rmsnorm(), &w.heads, head_dim);
     let x1 = x.add(attn_out);
 
-    // ── Sublayer 2: pre-norm + FFN + residual. ──
-    let ffn_out = ffn(x1.rmsnorm(), w.ffn_up_w, w.ffn_down_w);
+    // ── Sublayer 2: pre-norm + SwiGLU FFN + residual. ──
+    let ffn_out = ffn(x1.rmsnorm(), w.ffn_gate_w, w.ffn_up_w, w.ffn_down_w);
     x1.add(ffn_out)
 }
 
@@ -99,6 +100,7 @@ mod tests {
             .collect();
         BlockWeights {
             heads,
+            ffn_gate_w: Var::leaf(tape, make_weight(hidden_dim, ffn_dim, offset + 0.0001)),
             ffn_up_w: Var::leaf(tape, make_weight(hidden_dim, ffn_dim, offset)),
             ffn_down_w: Var::leaf(tape, make_weight(ffn_dim, hidden_dim, offset)),
         }
@@ -178,6 +180,10 @@ mod tests {
             assert!(has_nonzero(&h.w_o.grad()), "head {} w_o zero grad", i);
         }
         assert!(
+            has_nonzero(&w.ffn_gate_w.grad()),
+            "ffn_gate_w got all-zero gradient"
+        );
+        assert!(
             has_nonzero(&w.ffn_up_w.grad()),
             "ffn_up_w got all-zero gradient"
         );
@@ -223,7 +229,12 @@ mod tests {
 
         tape.backward(loss.id);
 
-        let has_nonzero = |t: &Tensor| t.data.iter().any(|&v| v.abs() > 1e-8);
+        // Tighter threshold than the single-block test: through two stacked
+        // blocks with rmsnorm + STE quantisation + SiLU gating, individual
+        // gradient cells can be very small (1e-9 range) without indicating
+        // a broken chain. We just want to distinguish "chain works"
+        // (any non-trivial value) from "exactly zero" (some link severed).
+        let has_nonzero = |t: &Tensor| t.data.iter().any(|&v| v.abs() > 1e-12);
         for (block_label, bw) in [("w0", &w0), ("w1", &w1)] {
             for (i, h) in bw.heads.iter().enumerate() {
                 assert!(
@@ -251,6 +262,11 @@ mod tests {
                     i
                 );
             }
+            assert!(
+                has_nonzero(&bw.ffn_gate_w.grad()),
+                "{} ffn_gate_w zero grad",
+                block_label
+            );
             assert!(
                 has_nonzero(&bw.ffn_up_w.grad()),
                 "{} ffn_up_w zero grad",

@@ -21,8 +21,9 @@ How the modules compose, top-down.
                 ┌───────────────────┼───────────────────┐
                 |                   |                   |
             block.rs            attention.rs           ffn.rs
-       (RMSNorm + attn       (multi-head, causal,    (BitLinear up,
-        + FFN + residual)    sum-of-projections)     ReLU, BitLinear down)
+       (RMSNorm + attn       (multi-head, causal,    (SwiGLU: gate via
+        + FFN + residual)    sum-of-projections)     SiLU, gated up,
+                                                      down projection)
                                     |
                               autograd.rs
             (Tape, Var, all ops: matmul, softmax, rmsnorm,
@@ -156,6 +157,43 @@ Conventional sizing: `n_heads * head_dim == hidden_dim`. With this
 invariant the total attention parameter count is identical to a single-head
 model with `head_dim = hidden_dim`, but the representation is split across
 `n_heads` orthogonal subspaces.
+
+## SwiGLU FFN
+
+The position-wise feed-forward network uses the SwiGLU form (LLaMA, BitNet
+b1.58). Three weight matrices per block, all BitLinears:
+
+```
+gate = silu(x · W_gate)        # [seq, ffn_dim]
+up   =       x · W_up           # [seq, ffn_dim]
+h    = gate ⊙ up                # element-wise gated product
+y    =        h · W_down        # [seq, hidden_dim]
+```
+
+`silu(x) = x · σ(x)` where `σ(x) = 1 / (1 + exp(-x))`. Smooth alternative to
+ReLU; differentiable everywhere; small leaky negative response avoids the
+dead-neuron problem.
+
+Why SwiGLU rather than ReLU:
+
+- The element-wise product `gate ⊙ up` is per-channel gating: the gate
+  decides per position and per feature how much of the up-projection to
+  pass through. This lets the FFN learn to suppress irrelevant features at
+  fine granularity rather than relying on the down projection alone.
+- SiLU on the gate keeps the activation continuous, which makes the gating
+  decision smooth rather than a hard ReLU cutoff.
+- The up projection is left linear so all the non-linearity lives in the
+  gate. This is the GLU lineage: linear * non-linear, learned end-to-end.
+- Empirically SwiGLU outperforms ReLU and GELU at equal parameter count
+  in language modelling (Shazeer 2020, also confirmed in the LLaMA
+  ablations).
+
+The cost is one extra weight matrix (W_gate) per block. For BitNet that
+extra weight is also ternary, so the on-disk overhead is just one more
+4-byte gamma + (hidden_dim * ffn_dim) i8 entries per block.
+
+`Var::silu` lives in `autograd.rs` next to `Var::relu`; backward computes
+`d/dx[silu] = σ(x) · (1 + x · (1 − σ(x)))` from the saved input.
 
 ## Causal mask
 

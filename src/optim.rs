@@ -128,6 +128,7 @@ pub fn clip_grad_norm(leaves: &ModelLeaves<'_>, max_norm: f32) -> f32 {
             accum(&lh.w_v.grad());
             accum(&lh.w_o.grad());
         }
+        accum(&lb.ffn_gate_w.grad());
         accum(&lb.ffn_up_w.grad());
         accum(&lb.ffn_down_w.grad());
     }
@@ -149,6 +150,7 @@ pub fn clip_grad_norm(leaves: &ModelLeaves<'_>, max_norm: f32) -> f32 {
             rescale_leaf_grad(lh.w_v, scale);
             rescale_leaf_grad(lh.w_o, scale);
         }
+        rescale_leaf_grad(lb.ffn_gate_w, scale);
         rescale_leaf_grad(lb.ffn_up_w, scale);
         rescale_leaf_grad(lb.ffn_down_w, scale);
     }

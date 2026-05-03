@@ -52,9 +52,14 @@ pub struct AttentionHead {
 
 /// Per-block master weights as plain Tensors. Mirror of `BlockWeights<'t>`
 /// (which holds Vars on a tape); these live across training steps.
+///
+/// FFN form: SwiGLU. `ffn_gate_w` and `ffn_up_w` share the same `[hidden, ffn_dim]`
+/// shape; the gate goes through SiLU and is then element-wise multiplied with
+/// the up projection. `ffn_down_w` brings the gated product back to hidden.
 #[derive(Debug, Clone)]
 pub struct BlockMasters {
     pub heads: Vec<AttentionHead>, // length = config.n_heads
+    pub ffn_gate_w: Tensor,        // [hidden, ffn_dim]
     pub ffn_up_w: Tensor,          // [hidden, ffn_dim]
     pub ffn_down_w: Tensor,        // [ffn_dim, hidden]
 }
@@ -138,6 +143,7 @@ impl Model {
                     .collect();
                 BlockMasters {
                     heads,
+                    ffn_gate_w: rng.fill_tensor(vec![h, f], scale_h_f),
                     ffn_up_w: rng.fill_tensor(vec![h, f], scale_h_f),
                     ffn_down_w: rng.fill_tensor(vec![f, h], scale_f_h),
                 }
@@ -176,6 +182,7 @@ impl Model {
                             w_o: Var::leaf(tape, h.w_o.clone()),
                         })
                         .collect(),
+                    ffn_gate_w: Var::leaf(tape, b.ffn_gate_w.clone()),
                     ffn_up_w: Var::leaf(tape, b.ffn_up_w.clone()),
                     ffn_down_w: Var::leaf(tape, b.ffn_down_w.clone()),
                 })
@@ -237,8 +244,9 @@ impl Model {
     /// they don't need to know the model's internal layout.
     ///
     /// Order: token_embed, pos_embed, then per block (each head's q, k, v, o
-    /// followed by ffn_up, ffn_down), finally lm_head. The `optim::AdamW` state
-    /// vectors are sized to match - changing the order here breaks resume.
+    /// followed by ffn_gate, ffn_up, ffn_down), finally lm_head. The
+    /// `optim::AdamW` state vectors are sized to match - changing the order
+    /// here breaks resume.
     pub fn for_each_param_with_grad<F>(&mut self, leaves: &ModelLeaves<'_>, mut f: F)
     where
         F: FnMut(&mut Tensor, &Tensor),
@@ -252,6 +260,7 @@ impl Model {
                 f(&mut mh.w_v, &lh.w_v.grad());
                 f(&mut mh.w_o, &lh.w_o.grad());
             }
+            f(&mut mb.ffn_gate_w, &lb.ffn_gate_w.grad());
             f(&mut mb.ffn_up_w, &lb.ffn_up_w.grad());
             f(&mut mb.ffn_down_w, &lb.ffn_down_w.grad());
         }
@@ -271,6 +280,7 @@ impl Model {
                 f(&lh.w_v.grad());
                 f(&lh.w_o.grad());
             }
+            f(&lb.ffn_gate_w.grad());
             f(&lb.ffn_up_w.grad());
             f(&lb.ffn_down_w.grad());
         }
@@ -290,6 +300,7 @@ impl Model {
                 out.push(h.w_v.shape.clone());
                 out.push(h.w_o.shape.clone());
             }
+            out.push(b.ffn_gate_w.shape.clone());
             out.push(b.ffn_up_w.shape.clone());
             out.push(b.ffn_down_w.shape.clone());
         }
@@ -360,6 +371,7 @@ mod tests {
                 assert!(has_nonzero(&h.w_v.grad()), "block {} head {} w_v", i, j);
                 assert!(has_nonzero(&h.w_o.grad()), "block {} head {} w_o", i, j);
             }
+            assert!(has_nonzero(&b.ffn_gate_w.grad()), "block {} ffn_gate_w", i);
             assert!(has_nonzero(&b.ffn_up_w.grad()), "block {} ffn_up_w", i);
             assert!(has_nonzero(&b.ffn_down_w.grad()), "block {} ffn_down_w", i);
         }

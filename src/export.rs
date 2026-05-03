@@ -46,11 +46,16 @@ use crate::model::{AttentionHead, BlockMasters, Model, ModelConfig};
 use crate::tensor::Tensor;
 use std::io::{self, Read, Write};
 
-// Bumped from "BNT1" -> "BNT2" when multi-head attention was added. Old
-// single-head checkpoints used "BNT1" with no `n_heads` field; this magic
-// bump lets the importer reject them with a clear error rather than read
-// garbage off-by-one.
-const MAGIC: &[u8; 4] = b"BNT2";
+// Magic version history:
+//   BNT1: single-head attention, ReLU FFN (2 weights per block).
+//   BNT2: multi-head attention, ReLU FFN (added n_heads to header).
+//   BNT3: multi-head attention, SwiGLU FFN (added ffn_gate_w as a third
+//         FFN weight per block, written between the heads and ffn_up_w).
+// Each bump invalidates older checkpoints fail-fast rather than letting the
+// importer slide off into garbage payload bytes. The header layout is
+// unchanged from BNT2 (magic + format + 7 u32 fields = 33 bytes); the
+// difference lives entirely in the per-block payload.
+const MAGIC: &[u8; 4] = b"BNT3";
 const HEADER_SIZE: usize = 4 + 1 + 7 * 4; // magic + format byte + 7 u32 fields = 33
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,8 +117,8 @@ fn read_header<R: Read>(r: &mut R) -> io::Result<(Format, ModelConfig)> {
     if &magic != MAGIC {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "not a BNT2 file (bad magic - BNT1 single-head checkpoints \
-             are no longer compatible; retrain or convert)",
+            "not a BNT3 file (bad magic - BNT1 single-head and BNT2 \
+             ReLU-FFN checkpoints are no longer compatible; retrain)",
         ));
     }
     let mut fb = [0u8; 1];
@@ -278,6 +283,7 @@ pub fn export_f32<W: Write>(model: &Model, w: &mut W) -> io::Result<usize> {
             total += write_f32_tensor(w, &h.w_v)?;
             total += write_f32_tensor(w, &h.w_o)?;
         }
+        total += write_f32_tensor(w, &b.ffn_gate_w)?;
         total += write_f32_tensor(w, &b.ffn_up_w)?;
         total += write_f32_tensor(w, &b.ffn_down_w)?;
     }
@@ -296,6 +302,7 @@ pub fn export_ternary<W: Write>(model: &Model, w: &mut W) -> io::Result<usize> {
             total += write_ternary_tensor(w, &h.w_v)?;
             total += write_ternary_tensor(w, &h.w_o)?;
         }
+        total += write_ternary_tensor(w, &b.ffn_gate_w)?;
         total += write_ternary_tensor(w, &b.ffn_up_w)?;
         total += write_ternary_tensor(w, &b.ffn_down_w)?;
     }
@@ -316,6 +323,7 @@ pub fn export_ternary_packed<W: Write>(model: &Model, w: &mut W) -> io::Result<u
             total += write_ternary_packed_tensor(w, &h.w_v)?;
             total += write_ternary_packed_tensor(w, &h.w_o)?;
         }
+        total += write_ternary_packed_tensor(w, &b.ffn_gate_w)?;
         total += write_ternary_packed_tensor(w, &b.ffn_up_w)?;
         total += write_ternary_packed_tensor(w, &b.ffn_down_w)?;
     }
@@ -354,6 +362,7 @@ pub fn import<R: Read>(r: &mut R) -> io::Result<(Model, Format)> {
         }
         blocks.push(BlockMasters {
             heads,
+            ffn_gate_w: read_w(r, vec![h, f])?,
             ffn_up_w: read_w(r, vec![h, f])?,
             ffn_down_w: read_w(r, vec![f, h])?,
         });
@@ -383,11 +392,9 @@ mod tests {
     use std::io::Cursor;
 
     fn tiny_model() -> Model {
-        // n_heads * head_dim == hidden_dim invariant. Two heads × head_dim 2
-        // gives the same total attention parameter count as the old single-head
-        // (head_dim 4) model, so the f32-size test below keeps its 336-floats
-        // expectation. The ternary-size test changes because there are now more
-        // ternary tensors (each carries its own 4-byte gamma).
+        // n_heads * head_dim == hidden_dim invariant for attention.
+        // SwiGLU FFN adds one extra weight tensor (ffn_gate_w) per block, so
+        // total parameter count is larger than the BNT2 (ReLU FFN) model.
         let cfg = ModelConfig {
             vocab_size: 8,
             hidden_dim: 4,
@@ -402,10 +409,16 @@ mod tests {
 
     #[test]
     fn f32_export_size_matches_total_param_count() {
-        // Header (33) + 336 floats × 4 = 1344 + 33 = 1377 bytes.
-        // Param count is identical to the old single-head model because we kept
-        // the n_heads * head_dim == hidden_dim invariant.
-        let expected = HEADER_SIZE + 336 * 4;
+        // Total entries:
+        //   token_embed   : 8 * 4 = 32
+        //   pos_embed     : 4 * 4 = 16
+        //   per block     : 2 heads * 4 * (4*2) + 3 FFN tensors (gate/up/down)
+        //                 = 64 + 96 = 160 entries per block
+        //   2 blocks      : 320
+        //   lm_head       : 4 * 8 = 32
+        //   total         : 48 + 320 + 32 = 400 floats
+        // Header (33) + 400 floats × 4 = 33 + 1600 = 1633 bytes.
+        let expected = HEADER_SIZE + 400 * 4;
         let mut buf = Vec::new();
         let bytes = export_f32(&tiny_model(), &mut buf).unwrap();
         assert_eq!(bytes, expected);
@@ -414,11 +427,15 @@ mod tests {
 
     #[test]
     fn ternary_export_size_matches_expected_layout() {
-        // Header (33) + embeddings (192) + blocks (336) + lm_head ternary (4 + 32 = 36).
-        // Per block: 4 weight tensors per head * 2 heads + 2 FFN tensors = 10 tensors,
-        // each contributing 4 bytes for gamma. Per-tensor entry counts unchanged.
-        // 2 blocks * (128 i8 entries + 10 * 4 gamma bytes) = 256 + 80 = 336.
-        let expected = HEADER_SIZE + 192 + 336 + 36;
+        // Header (33) + embeddings (48 floats * 4 = 192) +
+        //   per block: 11 ternary tensors (4 per head * 2 heads + gate + up + down)
+        //              each carries a 4-byte gamma + 1 byte per i8 entry
+        //              gammas: 11 * 4 = 44, i8 entries: 160
+        //              per-block bytes: 204
+        //   2 blocks: 408
+        //   lm_head ternary: 4-byte gamma + 32 i8 entries = 36
+        // Total: 33 + 192 + 408 + 36 = 669.
+        let expected = HEADER_SIZE + 192 + 408 + 36;
         let mut buf = Vec::new();
         let bytes = export_ternary(&tiny_model(), &mut buf).unwrap();
         assert_eq!(bytes, expected);
