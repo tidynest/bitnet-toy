@@ -122,10 +122,12 @@ pub fn clip_grad_norm(leaves: &ModelLeaves<'_>, max_norm: f32) -> f32 {
     accum(&leaves.token_embed.grad());
     accum(&leaves.pos_embed.grad());
     for lb in &leaves.blocks {
-        accum(&lb.attn_w_q.grad());
-        accum(&lb.attn_w_k.grad());
-        accum(&lb.attn_w_v.grad());
-        accum(&lb.attn_w_o.grad());
+        for lh in &lb.heads {
+            accum(&lh.w_q.grad());
+            accum(&lh.w_k.grad());
+            accum(&lh.w_v.grad());
+            accum(&lh.w_o.grad());
+        }
         accum(&lb.ffn_up_w.grad());
         accum(&lb.ffn_down_w.grad());
     }
@@ -141,10 +143,12 @@ pub fn clip_grad_norm(leaves: &ModelLeaves<'_>, max_norm: f32) -> f32 {
     rescale_leaf_grad(leaves.token_embed, scale);
     rescale_leaf_grad(leaves.pos_embed, scale);
     for lb in &leaves.blocks {
-        rescale_leaf_grad(lb.attn_w_q, scale);
-        rescale_leaf_grad(lb.attn_w_k, scale);
-        rescale_leaf_grad(lb.attn_w_v, scale);
-        rescale_leaf_grad(lb.attn_w_o, scale);
+        for lh in &lb.heads {
+            rescale_leaf_grad(lh.w_q, scale);
+            rescale_leaf_grad(lh.w_k, scale);
+            rescale_leaf_grad(lh.w_v, scale);
+            rescale_leaf_grad(lh.w_o, scale);
+        }
         rescale_leaf_grad(lb.ffn_up_w, scale);
         rescale_leaf_grad(lb.ffn_down_w, scale);
     }
@@ -192,7 +196,8 @@ mod tests {
         ModelConfig {
             vocab_size: 8,
             hidden_dim: 4,
-            head_dim: 4,
+            n_heads: 2,
+            head_dim: 2,
             ffn_dim: 8,
             max_seq_len: 4,
             n_blocks: 2,

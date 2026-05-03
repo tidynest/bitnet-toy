@@ -20,26 +20,43 @@ use crate::block::{BlockWeights, transformer_block};
 use crate::tensor::Tensor;
 
 /// Hyperparameters. Cheap to clone - fields are all `usize`.
+///
+/// Multi-head attention: each block runs `n_heads` independent attention paths
+/// in parallel; their outputs are summed (sum-of-projections form, mathematically
+/// equivalent to concat-then-project). Conventional sizing: `n_heads * head_dim`
+/// equals `hidden_dim`, which keeps total attention parameter count identical
+/// to single-head while splitting the representation into orthogonal subspaces.
 #[derive(Debug, Clone, Copy)]
 pub struct ModelConfig {
     pub vocab_size: usize,
     pub hidden_dim: usize,
+    pub n_heads: usize,
     pub head_dim: usize,
     pub ffn_dim: usize,
     pub max_seq_len: usize,
     pub n_blocks: usize,
 }
 
+/// Master weights for one attention head. Each head holds its own Q/K/V/O
+/// projections; an `n_heads`-long `Vec<AttentionHead>` lives inside each block.
+/// Sum-of-projections form: each head's W_o brings its `head_dim` context
+/// straight back to `hidden_dim`, so the block's attention output is just the
+/// element-wise sum of all head outputs (no concat op needed).
+#[derive(Debug, Clone)]
+pub struct AttentionHead {
+    pub w_q: Tensor, // [hidden, head_dim]
+    pub w_k: Tensor, // [hidden, head_dim]
+    pub w_v: Tensor, // [hidden, head_dim]
+    pub w_o: Tensor, // [head_dim, hidden]
+}
+
 /// Per-block master weights as plain Tensors. Mirror of `BlockWeights<'t>`
 /// (which holds Vars on a tape); these live across training steps.
 #[derive(Debug, Clone)]
 pub struct BlockMasters {
-    pub attn_w_q: Tensor,   // [hidden, head_dim]
-    pub attn_w_k: Tensor,   // [hidden, head_dim]
-    pub attn_w_v: Tensor,   // [hidden, head_dim]
-    pub attn_w_o: Tensor,   // [head_dim, hidden]
-    pub ffn_up_w: Tensor,   // [hidden, ffn_dim]
-    pub ffn_down_w: Tensor, // [ffn_dim, hidden]
+    pub heads: Vec<AttentionHead>, // length = config.n_heads
+    pub ffn_up_w: Tensor,          // [hidden, ffn_dim]
+    pub ffn_down_w: Tensor,        // [ffn_dim, hidden]
 }
 
 /// Top-level model. Owns every trainable tensor.
@@ -110,13 +127,20 @@ impl Model {
         let scale_h_v = 1.0 / (h as f32).sqrt();
 
         let blocks = (0..config.n_blocks)
-            .map(|_| BlockMasters {
-                attn_w_q: rng.fill_tensor(vec![h, d], scale_h_d),
-                attn_w_k: rng.fill_tensor(vec![h, d], scale_h_d),
-                attn_w_v: rng.fill_tensor(vec![h, d], scale_h_d),
-                attn_w_o: rng.fill_tensor(vec![d, h], scale_d_h),
-                ffn_up_w: rng.fill_tensor(vec![h, f], scale_h_f),
-                ffn_down_w: rng.fill_tensor(vec![f, h], scale_f_h),
+            .map(|_| {
+                let heads = (0..config.n_heads)
+                    .map(|_| AttentionHead {
+                        w_q: rng.fill_tensor(vec![h, d], scale_h_d),
+                        w_k: rng.fill_tensor(vec![h, d], scale_h_d),
+                        w_v: rng.fill_tensor(vec![h, d], scale_h_d),
+                        w_o: rng.fill_tensor(vec![d, h], scale_d_h),
+                    })
+                    .collect();
+                BlockMasters {
+                    heads,
+                    ffn_up_w: rng.fill_tensor(vec![h, f], scale_h_f),
+                    ffn_down_w: rng.fill_tensor(vec![f, h], scale_f_h),
+                }
             })
             .collect();
 
@@ -134,6 +158,7 @@ impl Model {
     /// Register every master tensor on the given tape as a fresh leaf.
     /// Returns the bundle of leaf handles you'll pass to `forward` / `apply_grads`.
     pub fn register_leaves<'t>(&self, tape: &'t Tape) -> ModelLeaves<'t> {
+        use crate::block::AttentionHeadVars;
         ModelLeaves {
             token_embed: Var::leaf(tape, self.token_embed.clone()),
             pos_embed: Var::leaf(tape, self.pos_embed.clone()),
@@ -141,10 +166,16 @@ impl Model {
                 .blocks
                 .iter()
                 .map(|b| BlockWeights {
-                    attn_w_q: Var::leaf(tape, b.attn_w_q.clone()),
-                    attn_w_k: Var::leaf(tape, b.attn_w_k.clone()),
-                    attn_w_v: Var::leaf(tape, b.attn_w_v.clone()),
-                    attn_w_o: Var::leaf(tape, b.attn_w_o.clone()),
+                    heads: b
+                        .heads
+                        .iter()
+                        .map(|h| AttentionHeadVars {
+                            w_q: Var::leaf(tape, h.w_q.clone()),
+                            w_k: Var::leaf(tape, h.w_k.clone()),
+                            w_v: Var::leaf(tape, h.w_v.clone()),
+                            w_o: Var::leaf(tape, h.w_o.clone()),
+                        })
+                        .collect(),
                     ffn_up_w: Var::leaf(tape, b.ffn_up_w.clone()),
                     ffn_down_w: Var::leaf(tape, b.ffn_down_w.clone()),
                 })
@@ -205,8 +236,9 @@ impl Model {
     /// Optimisers (`SGD`, `AdamW`, etc.) drive their iteration through here so
     /// they don't need to know the model's internal layout.
     ///
-    /// Order: token_embed, pos_embed, then per block (q, k, v, o, ffn_up, ffn_down),
-    /// finally lm_head. The `optim::AdamW` state vectors are sized to match.
+    /// Order: token_embed, pos_embed, then per block (each head's q, k, v, o
+    /// followed by ffn_up, ffn_down), finally lm_head. The `optim::AdamW` state
+    /// vectors are sized to match - changing the order here breaks resume.
     pub fn for_each_param_with_grad<F>(&mut self, leaves: &ModelLeaves<'_>, mut f: F)
     where
         F: FnMut(&mut Tensor, &Tensor),
@@ -214,10 +246,12 @@ impl Model {
         f(&mut self.token_embed, &leaves.token_embed.grad());
         f(&mut self.pos_embed, &leaves.pos_embed.grad());
         for (mb, lb) in self.blocks.iter_mut().zip(&leaves.blocks) {
-            f(&mut mb.attn_w_q, &lb.attn_w_q.grad());
-            f(&mut mb.attn_w_k, &lb.attn_w_k.grad());
-            f(&mut mb.attn_w_v, &lb.attn_w_v.grad());
-            f(&mut mb.attn_w_o, &lb.attn_w_o.grad());
+            for (mh, lh) in mb.heads.iter_mut().zip(&lb.heads) {
+                f(&mut mh.w_q, &lh.w_q.grad());
+                f(&mut mh.w_k, &lh.w_k.grad());
+                f(&mut mh.w_v, &lh.w_v.grad());
+                f(&mut mh.w_o, &lh.w_o.grad());
+            }
             f(&mut mb.ffn_up_w, &lb.ffn_up_w.grad());
             f(&mut mb.ffn_down_w, &lb.ffn_down_w.grad());
         }
@@ -231,10 +265,12 @@ impl Model {
         f(&leaves.token_embed.grad());
         f(&leaves.pos_embed.grad());
         for lb in &leaves.blocks {
-            f(&lb.attn_w_q.grad());
-            f(&lb.attn_w_k.grad());
-            f(&lb.attn_w_v.grad());
-            f(&lb.attn_w_o.grad());
+            for lh in &lb.heads {
+                f(&lh.w_q.grad());
+                f(&lh.w_k.grad());
+                f(&lh.w_v.grad());
+                f(&lh.w_o.grad());
+            }
             f(&lb.ffn_up_w.grad());
             f(&lb.ffn_down_w.grad());
         }
@@ -248,10 +284,12 @@ impl Model {
         out.push(self.token_embed.shape.clone());
         out.push(self.pos_embed.shape.clone());
         for b in &self.blocks {
-            out.push(b.attn_w_q.shape.clone());
-            out.push(b.attn_w_k.shape.clone());
-            out.push(b.attn_w_v.shape.clone());
-            out.push(b.attn_w_o.shape.clone());
+            for h in &b.heads {
+                out.push(h.w_q.shape.clone());
+                out.push(h.w_k.shape.clone());
+                out.push(h.w_v.shape.clone());
+                out.push(h.w_o.shape.clone());
+            }
             out.push(b.ffn_up_w.shape.clone());
             out.push(b.ffn_down_w.shape.clone());
         }
@@ -265,10 +303,14 @@ mod tests {
     use super::*;
 
     fn tiny_config() -> ModelConfig {
+        // 2 heads × 2 head_dim = hidden_dim 4. Cleanest invariant for tests:
+        // n_heads * head_dim == hidden_dim. Verifies the head-loop sums correctly
+        // across multiple heads (1 head would silently allow concat-vs-sum bugs).
         ModelConfig {
             vocab_size: 8,
             hidden_dim: 4,
-            head_dim: 4,
+            n_heads: 2,
+            head_dim: 2,
             ffn_dim: 8,
             max_seq_len: 4,
             n_blocks: 2,
@@ -312,10 +354,12 @@ mod tests {
         assert!(has_nonzero(&leaves.pos_embed.grad()), "pos_embed");
         assert!(has_nonzero(&leaves.lm_head.grad()), "lm_head");
         for (i, b) in leaves.blocks.iter().enumerate() {
-            assert!(has_nonzero(&b.attn_w_q.grad()), "block {} attn_w_q", i);
-            assert!(has_nonzero(&b.attn_w_k.grad()), "block {} attn_w_k", i);
-            assert!(has_nonzero(&b.attn_w_v.grad()), "block {} attn_w_v", i);
-            assert!(has_nonzero(&b.attn_w_o.grad()), "block {} attn_w_o", i);
+            for (j, h) in b.heads.iter().enumerate() {
+                assert!(has_nonzero(&h.w_q.grad()), "block {} head {} w_q", i, j);
+                assert!(has_nonzero(&h.w_k.grad()), "block {} head {} w_k", i, j);
+                assert!(has_nonzero(&h.w_v.grad()), "block {} head {} w_v", i, j);
+                assert!(has_nonzero(&h.w_o.grad()), "block {} head {} w_o", i, j);
+            }
             assert!(has_nonzero(&b.ffn_up_w.grad()), "block {} ffn_up_w", i);
             assert!(has_nonzero(&b.ffn_down_w.grad()), "block {} ffn_down_w", i);
         }

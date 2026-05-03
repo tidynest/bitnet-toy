@@ -21,8 +21,8 @@ How the modules compose, top-down.
                 ┌───────────────────┼───────────────────┐
                 |                   |                   |
             block.rs            attention.rs           ffn.rs
-       (RMSNorm + attn      (single-head, causal,    (BitLinear up,
-        + FFN + residual)    softmax over keys)       ReLU, BitLinear down)
+       (RMSNorm + attn       (multi-head, causal,    (BitLinear up,
+        + FFN + residual)    sum-of-projections)     ReLU, BitLinear down)
                                     |
                               autograd.rs
             (Tape, Var, all ops: matmul, softmax, rmsnorm,
@@ -125,6 +125,38 @@ incoming gradient unchanged: `vec![(parent_id, grad.clone())]`. This is the
 matters more than its exact magnitude under SGD/AdamW, and the quantiser
 preserves direction information (the master moves; the ternary form follows).
 
+## Multi-head attention (sum-of-projections)
+
+`attention.rs` runs `n_heads` independent attention paths and sums their
+outputs. Each head holds its own Q/K/V/O ternary projections in
+`AttentionHead` (master tensors) and `AttentionHeadVars<'t>` (tape leaves).
+Per-head shapes:
+
+```
+W_q, W_k, W_v : [hidden_dim, head_dim]
+W_o           : [head_dim,  hidden_dim]
+```
+
+Sum-of-projections is mathematically identical to the canonical "concat
+heads then project once with a wide W_o" form, because matrix multiplication
+distributes over horizontal block concatenation:
+
+```
+[H_1 | H_2 | ... | H_n] · [W_o_1; W_o_2; ...; W_o_n]
+                = sum over i of H_i · W_o_i
+```
+
+The sum form avoids needing a `concat` operation in the autograd. The 1/√d_k
+scaling and the causal mask are per-head, applied to each head's own scores
+before softmax. The input `x` is INT8-quantised once and reused across all
+3 * n_heads projection paths; the tape's per-cell gradient accumulator
+gathers gradient from every path back into a single `x` gradient cell.
+
+Conventional sizing: `n_heads * head_dim == hidden_dim`. With this
+invariant the total attention parameter count is identical to a single-head
+model with `head_dim = hidden_dim`, but the representation is split across
+`n_heads` orthogonal subspaces.
+
 ## Causal mask
 
 Without causal masking, attention at position `i` could see input row `i+1`,
@@ -146,18 +178,15 @@ Master parameters in `Model` live across steps; everything else is ephemeral.
 
 ## Where the toy stops
 
-Three places this implementation deliberately diverges from production BitNet:
+Two places this implementation deliberately diverges from production BitNet:
 
-1. **Single-head attention.** Real BitNet uses multi-head. We sum head outputs
-   trivially and call it done. See `TODO.md` for the deferred refactor.
-
-2. **f32 throughout.** Real BitNet has BF16 master weights and INT8 activations
+1. **f32 throughout.** Real BitNet has BF16 master weights and INT8 activations
    stored as `i8` (not `f32` representations of `i8`). The integer matmul that
    produces the speedup is also missing; we keep all arithmetic in f32. The
    *values* are quantised; the *arithmetic* isn't.
 
-3. **No KV cache.** Generation recomputes the full forward each token. Real
+2. **No KV cache.** Generation recomputes the full forward each token. Real
    inference caches K and V across positions to make per-token cost constant.
 
-The first two are listed in `TODO.md`. The third is genuine ML-engineering
+The first is listed in `TODO.md`. The second is genuine ML-engineering
 territory beyond the curriculum's M10 finale.

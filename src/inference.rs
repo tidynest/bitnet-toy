@@ -157,7 +157,8 @@ mod tests {
         let cfg = ModelConfig {
             vocab_size: vocab.size(),
             hidden_dim: 8,
-            head_dim: 8,
+            n_heads: 2,
+            head_dim: 4,
             ffn_dim: 16,
             max_seq_len: 8,
             n_blocks: 1,

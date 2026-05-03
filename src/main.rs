@@ -225,7 +225,11 @@ impl TrainConfig {
             model: crate::model::ModelConfig {
                 vocab_size: 0, // overridden after vocab is built
                 hidden_dim: 16,
-                head_dim: 16,
+                // 2 heads * 8 head_dim == 16 = hidden_dim. Keeps total
+                // attention parameter count identical to the old single-head
+                // (head_dim 16) model while exposing the head-loop summation.
+                n_heads: 2,
+                head_dim: 8,
                 ffn_dim: 32,
                 max_seq_len: 16,
                 n_blocks: 2,
@@ -252,7 +256,11 @@ impl TrainConfig {
             model: crate::model::ModelConfig {
                 vocab_size: 0, // filled after vocab is built
                 hidden_dim: 64,
-                head_dim: 64,
+                // 4 heads * 16 head_dim == 64 = hidden_dim. Same total
+                // attention parameter budget as the previous single-head
+                // (head_dim 64) configuration; 4 orthogonal subspaces.
+                n_heads: 4,
+                head_dim: 16,
                 ffn_dim: 128,
                 max_seq_len: 64,
                 n_blocks: 4,
@@ -306,8 +314,8 @@ fn train_bitnet_lm(cfg: TrainConfig) -> (f32, f32, crate::model::Model, crate::d
             );
         }
         println!(
-            "resuming from checkpoint: hidden {}, ffn {}, head_dim {}, blocks {}, seq_len {}",
-            lc.hidden_dim, lc.ffn_dim, lc.head_dim, lc.n_blocks, lc.max_seq_len
+            "resuming from checkpoint: hidden {}, ffn {}, n_heads {}, head_dim {}, blocks {}, seq_len {}",
+            lc.hidden_dim, lc.ffn_dim, lc.n_heads, lc.head_dim, lc.n_blocks, lc.max_seq_len
         );
         (loaded, lc)
     } else {
@@ -328,7 +336,7 @@ fn train_bitnet_lm(cfg: TrainConfig) -> (f32, f32, crate::model::Model, crate::d
         "── M9: BitNet LM training ──\n\
          corpus     = {} chars\n\
          vocab      = {}\n\
-         model      = hidden {}, ffn {}, head_dim {}, blocks {}, seq_len {}\n\
+         model      = hidden {}, ffn {}, n_heads {}, head_dim {}, blocks {}, seq_len {}\n\
          windows    = {}\n\
          optimiser  = AdamW(b1={}, b2={}, wd={}), peak_lr={:.1e}, floor_lr={:.1e},\n\
                       warmup={} steps, grad_clip={}, total_steps={}",
@@ -336,6 +344,7 @@ fn train_bitnet_lm(cfg: TrainConfig) -> (f32, f32, crate::model::Model, crate::d
         vocab.size(),
         model_cfg.hidden_dim,
         model_cfg.ffn_dim,
+        model_cfg.n_heads,
         model_cfg.head_dim,
         model_cfg.n_blocks,
         model_cfg.max_seq_len,
