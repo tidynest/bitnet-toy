@@ -200,6 +200,21 @@ pub struct TrainConfig {
     pub corpus_path: Option<std::path::PathBuf>,
     /// Print a status line every `log_every` steps (and on the final step).
     pub log_every: usize,
+    /// Fraction of the corpus held out for validation. The split is taken
+    /// from the END of the encoded id stream so all training windows precede
+    /// all validation windows; no leakage. Set to 0.0 to disable validation
+    /// entirely (training metrics only - useful for the embedded TINY_CORPUS
+    /// demo where the corpus is too short to spare any tokens).
+    pub val_split: f32,
+    /// Run a held-out validation pass every `eval_every` steps. The pass
+    /// samples a deterministic, evenly-spaced subset of validation windows
+    /// (size `val_eval_samples`), so the reported val_ppl is comparable
+    /// across eval points. Set to 0 to disable periodic validation.
+    pub eval_every: usize,
+    /// Number of validation windows used per evaluation pass. Held constant
+    /// across eval points so val_ppl trends are meaningful. Lower = faster
+    /// eval, noisier val_ppl. 100-200 is a good range for most corpora.
+    pub val_eval_samples: usize,
     /// If `Some(model)`, start training from these weights instead of fresh
     /// random init. The model's `ModelConfig` overrides `self.model` so the
     /// optimiser sizes and forward shapes match the loaded weights exactly.
@@ -236,6 +251,12 @@ impl TrainConfig {
             },
             corpus_path: None,
             log_every: 50,
+            // TINY_CORPUS is too short to spare any tokens for held-out
+            // validation; running on it would leave only a handful of
+            // windows on each side and the val signal would be useless.
+            val_split: 0.0,
+            eval_every: 0,
+            val_eval_samples: 0,
             start_from: None,
         }
     }
@@ -267,14 +288,60 @@ impl TrainConfig {
             },
             corpus_path: Some(std::path::PathBuf::from("data/tinyshakespeare.txt")),
             log_every: 100,
+            // 10 percent val split: with TinyShakespeare's ~1.1M chars,
+            // that leaves ~111K val chars, ~1.7K val windows at seq_len 64.
+            val_split: 0.10,
+            // Eval every 500 steps gives 10 measurements over a 5000-step
+            // run, which is plenty to see the val_ppl trajectory without
+            // adding meaningful overhead.
+            eval_every: 500,
+            // 100 windows per eval is a fixed-budget tradeoff: ~1 second
+            // wall-clock per eval, val_ppl noise floor around 1-2%.
+            val_eval_samples: 100,
             start_from: None,
         }
     }
 }
 
+/// Mean cross-entropy and perplexity (`exp(mean_ce)`) over a deterministic,
+/// evenly-spaced subset of `val_windows`. Public so callers can run a final
+/// eval after training without re-implementing the loop.
+///
+/// The eval uses a stride pattern (`i * stride` for `i in 0..n_samples`) so
+/// the same windows get picked at every eval point - val_ppl trends are
+/// comparable across the run, not contaminated by which random subset was
+/// drawn that time.
+pub fn eval_val_perplexity(
+    model: &crate::model::Model,
+    val_windows: &[(Vec<usize>, Vec<usize>)],
+    n_samples: usize,
+) -> (f32, f32) {
+    if val_windows.is_empty() || n_samples == 0 {
+        return (f32::NAN, f32::NAN);
+    }
+    let n = n_samples.min(val_windows.len());
+    let stride = (val_windows.len() / n).max(1);
+    let mut total_ce = 0.0_f32;
+    let mut count = 0_usize;
+    for i in 0..n {
+        let (input, target) = &val_windows[i * stride];
+        let tape = Tape::new();
+        let leaves = model.register_leaves(&tape);
+        let logits = model.forward(&leaves, input);
+        let loss = logits.cross_entropy(target);
+        total_ce += loss.value().data[0];
+        count += 1;
+    }
+    let mean_ce = total_ce / count as f32;
+    (mean_ce, mean_ce.exp())
+}
+
 /// Train the full BitNet LM on either the embedded TINY_CORPUS or a corpus
 /// loaded from disk. AdamW + global-L2 grad clip + cosine-with-warmup LR.
-/// Windows are Fisher-Yates shuffled at the start of every epoch.
+/// Each step samples a uniformly random training window. If `cfg.val_split`
+/// is positive, the tail of the encoded id stream is held out for periodic
+/// validation evaluation; held-out perplexity is printed during training
+/// alongside `train_loss` / `anchor_loss` / `min_seen`.
 ///
 /// Returns `(initial_loss, min_loss_seen, trained_model, vocab)`.
 fn train_bitnet_lm(cfg: TrainConfig) -> (f32, f32, crate::model::Model, crate::data::Vocab) {
@@ -323,7 +390,24 @@ fn train_bitnet_lm(cfg: TrainConfig) -> (f32, f32, crate::model::Model, crate::d
         mc.vocab_size = vocab.size();
         (Model::new(&mc, cfg.seed), mc)
     };
-    let windows = make_windows(&ids, model_cfg.max_seq_len);
+
+    // Train / validation split. The split point is taken from the END of
+    // the id stream so all training windows (and thus all gradient updates)
+    // come from corpus positions strictly before the validation tail. No
+    // leakage of val tokens into training. With `val_split = 0.0` the val
+    // slice is empty and validation is skipped entirely.
+    let val_split_clamped = cfg.val_split.clamp(0.0, 0.5);
+    let val_chars = ((ids.len() as f32) * val_split_clamped) as usize;
+    let train_end = ids.len().saturating_sub(val_chars);
+    let train_ids = &ids[..train_end];
+    let val_ids = &ids[train_end..];
+
+    let windows = make_windows(train_ids, model_cfg.max_seq_len);
+    let val_windows = if val_ids.len() > model_cfg.max_seq_len + 1 {
+        make_windows(val_ids, model_cfg.max_seq_len)
+    } else {
+        Vec::new()
+    };
 
     let mut rng = Lcg::new(cfg.seed ^ 0xDEADBEEF);
 
@@ -334,12 +418,13 @@ fn train_bitnet_lm(cfg: TrainConfig) -> (f32, f32, crate::model::Model, crate::d
 
     println!(
         "── M9: BitNet LM training ──\n\
-         corpus     = {} chars\n\
-         vocab      = {}\n\
-         model      = hidden {}, ffn {}, n_heads {}, head_dim {}, blocks {}, seq_len {}\n\
-         windows    = {}\n\
-         optimiser  = AdamW(b1={}, b2={}, wd={}), peak_lr={:.1e}, floor_lr={:.1e},\n\
-                      warmup={} steps, grad_clip={}, total_steps={}",
+         corpus       = {} chars\n\
+         vocab        = {}\n\
+         model        = hidden {}, ffn {}, n_heads {}, head_dim {}, blocks {}, seq_len {}\n\
+         train wins   = {}\n\
+         val wins     = {} (split = {:.0}%)\n\
+         optimiser    = AdamW(b1={}, b2={}, wd={}), peak_lr={:.1e}, floor_lr={:.1e},\n\
+                        warmup={} steps, grad_clip={}, total_steps={}",
         corpus_owned.chars().count(),
         vocab.size(),
         model_cfg.hidden_dim,
@@ -349,6 +434,8 @@ fn train_bitnet_lm(cfg: TrainConfig) -> (f32, f32, crate::model::Model, crate::d
         model_cfg.n_blocks,
         model_cfg.max_seq_len,
         windows.len(),
+        val_windows.len(),
+        val_split_clamped * 100.0,
         cfg.adamw_beta1,
         cfg.adamw_beta2,
         cfg.weight_decay,
@@ -370,12 +457,14 @@ fn train_bitnet_lm(cfg: TrainConfig) -> (f32, f32, crate::model::Model, crate::d
     let initial_loss = eval_loss(&model, &input0, &target0);
     let mut min_loss = initial_loss;
 
+    let val_enabled = !val_windows.is_empty() && cfg.eval_every > 0 && cfg.val_eval_samples > 0;
+
     for step in 0..cfg.n_steps {
         // Sample a fresh random window every step.  The previous "shuffle once,
         // iterate" approach silently restricted training to the first n_steps
         // windows of the shuffle, which was tiny relative to the corpus and
         // caused catastrophic memorisation.  Uniform random sampling makes
-        // every step a draw from the full 1.1M-window pool.
+        // every step a draw from the full window pool.
         let (input, target) = &windows[rng.gen_range(windows.len())];
 
         let lr = cosine_lr(
@@ -399,13 +488,55 @@ fn train_bitnet_lm(cfg: TrainConfig) -> (f32, f32, crate::model::Model, crate::d
         let pre_clip = clip_grad_norm(&leaves, cfg.grad_clip);
         opt.step(&mut model, &leaves);
 
-        if step % cfg.log_every == 0 || step == cfg.n_steps - 1 {
+        let on_log_step = step % cfg.log_every == 0 || step == cfg.n_steps - 1;
+        let on_eval_step = val_enabled
+            && (step % cfg.eval_every == 0 || step == cfg.n_steps - 1);
+
+        if on_log_step {
             let anchor_loss = eval_loss(&model, &input0, &target0);
+            if on_eval_step {
+                let (val_loss, val_ppl) =
+                    eval_val_perplexity(&model, &val_windows, cfg.val_eval_samples);
+                println!(
+                    "step {:>5}   train_loss = {:.4}   anchor_loss = {:.4}   \
+                     min_seen = {:.4}   val_loss = {:.4}   val_ppl = {:.2}   \
+                     lr = {:.4e}   |g| = {:.3}",
+                    step, loss_val, anchor_loss, min_loss, val_loss, val_ppl, lr, pre_clip
+                );
+            } else {
+                println!(
+                    "step {:>5}   train_loss = {:.4}   anchor_loss = {:.4}   \
+                     min_seen = {:.4}   lr = {:.4e}   |g| = {:.3}",
+                    step, loss_val, anchor_loss, min_loss, lr, pre_clip
+                );
+            }
+        } else if on_eval_step {
+            // Eval-only step (no training-loss log fires). Print a single
+            // val_ppl line so the cadence stays visible.
+            let (val_loss, val_ppl) =
+                eval_val_perplexity(&model, &val_windows, cfg.val_eval_samples);
             println!(
-                "step {:>5}   train_loss = {:.4}   anchor_loss = {:.4}   min_seen = {:.4}   lr = {:.4e}   |g| = {:.3}",
-                step, loss_val, anchor_loss, min_loss, lr, pre_clip
+                "step {:>5}   val_loss = {:.4}   val_ppl = {:.2}",
+                step, val_loss, val_ppl
             );
         }
+    }
+
+    // Final, more accurate validation pass at end of training. Use 5× the
+    // running-eval sample count so the headline number reflects the model
+    // less noisily than any individual training-time eval.
+    if val_enabled {
+        let n = (cfg.val_eval_samples * 5).min(val_windows.len());
+        let (val_loss, val_ppl) = eval_val_perplexity(&model, &val_windows, n);
+        let baseline_ppl = vocab.size() as f32;
+        println!(
+            "\nfinal validation:  val_loss = {:.4}   val_ppl = {:.3}   \
+             (uniform-vocab baseline = {:.1}, ratio = {:.3})",
+            val_loss,
+            val_ppl,
+            baseline_ppl,
+            val_ppl / baseline_ppl
+        );
     }
 
     (initial_loss, min_loss, model, vocab)
@@ -707,5 +838,74 @@ mod tests {
             min_loss,
             min_loss / initial
         );
+    }
+
+    /// `eval_val_perplexity` should produce finite, sensible values:
+    /// `val_loss` non-negative finite, `val_ppl` between 1 and the
+    /// uniform-vocab baseline (`vocab_size`) for a model that has done
+    /// at least *some* training. Untrained-model perplexity sits very
+    /// close to the baseline; trained perplexity drops below it.
+    #[test]
+    fn eval_val_perplexity_returns_sensible_values() {
+        use crate::data::{TINY_CORPUS, Vocab, make_windows};
+        use crate::model::{Model, ModelConfig};
+
+        let vocab = Vocab::from_text(TINY_CORPUS);
+        let ids = vocab.encode(TINY_CORPUS);
+        let cfg = ModelConfig {
+            vocab_size: vocab.size(),
+            hidden_dim: 8,
+            n_heads: 2,
+            head_dim: 4,
+            ffn_dim: 16,
+            max_seq_len: 8,
+            n_blocks: 1,
+        };
+        let model = Model::new(&cfg, 42);
+        let val_windows = make_windows(&ids, cfg.max_seq_len);
+
+        let (val_loss, val_ppl) = eval_val_perplexity(&model, &val_windows, 16);
+
+        assert!(val_loss.is_finite(), "val_loss not finite: {}", val_loss);
+        assert!(val_ppl.is_finite(), "val_ppl not finite: {}", val_ppl);
+        assert!(val_loss >= 0.0, "val_loss negative: {}", val_loss);
+        assert!(val_ppl >= 1.0, "val_ppl < 1: {}", val_ppl);
+        // Untrained random model can sit near or slightly above the
+        // uniform-vocab perplexity ceiling because the random init biases
+        // logits in arbitrary directions; allow 2× the ceiling as the
+        // "sanity bound" so the test isn't flaky on different seeds.
+        let baseline = vocab.size() as f32;
+        assert!(
+            val_ppl < baseline * 2.0,
+            "val_ppl {} unreasonably high for vocab {}",
+            val_ppl,
+            baseline
+        );
+    }
+
+    /// Empty / disabled validation should return NaN tuple so callers can
+    /// detect "no eval ran" without ambiguity.
+    #[test]
+    fn eval_val_perplexity_handles_empty_inputs() {
+        use crate::model::{Model, ModelConfig};
+        let cfg = ModelConfig {
+            vocab_size: 4,
+            hidden_dim: 4,
+            n_heads: 2,
+            head_dim: 2,
+            ffn_dim: 8,
+            max_seq_len: 4,
+            n_blocks: 1,
+        };
+        let model = Model::new(&cfg, 0);
+
+        let (loss_a, ppl_a) = eval_val_perplexity(&model, &[], 8);
+        assert!(loss_a.is_nan(), "expected NaN val_loss for empty windows");
+        assert!(ppl_a.is_nan(), "expected NaN val_ppl for empty windows");
+
+        let dummy = vec![(vec![0_usize; 4], vec![1_usize; 4])];
+        let (loss_b, ppl_b) = eval_val_perplexity(&model, &dummy, 0);
+        assert!(loss_b.is_nan(), "expected NaN val_loss for n_samples=0");
+        assert!(ppl_b.is_nan(), "expected NaN val_ppl for n_samples=0");
     }
 }

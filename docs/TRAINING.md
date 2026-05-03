@@ -46,11 +46,15 @@ Default config (defined in `TrainConfig::shakespeare()` in `src/main.rs`):
 | `adamw_beta2`     | 0.95      | Second-moment decay (LLaMA pick) |
 | `seed`            | 1337      | LCG seed for init + window sampling |
 | `model.hidden_dim`     | 64   | |
-| `model.head_dim`       | 64   | Single-head; equals hidden_dim |
+| `model.n_heads`        | 4    | Multi-head attention; sums of n_heads paths |
+| `model.head_dim`       | 16   | Per-head dim; n_heads * head_dim == hidden_dim |
 | `model.ffn_dim`        | 128  | 2x hidden_dim |
 | `model.max_seq_len`    | 64   | Window length |
 | `model.n_blocks`       | 4    | Transformer blocks |
 | `log_every`            | 100  | Print status every N steps |
+| `val_split`            | 0.10 | Tail fraction of corpus held out |
+| `eval_every`           | 500  | Run val pass every N training steps |
+| `val_eval_samples`     | 100  | Val windows per eval pass |
 
 After the run, `models/shakespeare.ternary_packed.bin` contains the trained
 model in base-3 packed format (~60 KB).
@@ -78,19 +82,46 @@ than if training had run uninterrupted.
 
 ## Watching the run
 
-Each log line looks like:
+Most log lines look like this:
 
 ```
 step  1500   train_loss = 2.7379   anchor_loss = 2.7096   min_seen = 2.0854   lr = 2.5401e-3   |g| = 1.549
 ```
 
+On `eval_every`-aligned steps (and the very last step), the line carries
+extra columns from a held-out validation pass:
+
+```
+step   500   train_loss = ...   anchor_loss = ...   min_seen = ...   val_loss = 2.45   val_ppl = 11.6   lr = ...   |g| = ...
+```
+
+After the loop ends, a more accurate final pass with 5x the running-eval
+sample count prints:
+
+```
+final validation:  val_loss = 2.31   val_ppl = 10.07   (uniform-vocab baseline = 65.0, ratio = 0.155)
+```
+
 | Column | Meaning |
 |---|---|
 | `train_loss`  | Loss on the random window this step. Noisy by nature. |
-| `anchor_loss` | Loss on a fixed window (the first one). The smooth signal. |
+| `anchor_loss` | Loss on a fixed window (the first one). The smooth training signal. |
 | `min_seen`    | Best `train_loss` ever seen on any step. |
+| `val_loss`    | Mean cross-entropy across `val_eval_samples` held-out windows (deterministic stride). |
+| `val_ppl`     | `exp(val_loss)`. Interpret as "model is as confused as if uniformly choosing among `val_ppl` options." Lower is better. |
 | `lr`          | Current learning rate (warmup or cosine decay). |
 | `|g|`         | Pre-clip global L2 norm of all gradients. |
+
+`val_ppl` is the metric that actually matters for comparing architectural
+variants. `train_loss` and `anchor_loss` are too noisy: STE quantisation
+makes per-step training loss swing 0.5+ in either direction, and the anchor
+window is a single point estimate. `val_ppl` averages over many held-out
+windows the model never trained on, so it tracks generalisation rather
+than memorisation.
+
+Random-baseline `val_ppl` for char-vocab 65 is exactly 65 (uniform
+distribution). A real char-LM gets `val_ppl` in the 3-12 range depending
+on model size and training time.
 
 ### Healthy convergence (on Shakespeare)
 
@@ -154,8 +185,6 @@ the previous run's, you cannot resume from that previous checkpoint.
   for a 1 GB corpus you'd want streamed window iteration.
 - No batching: each step processes one window. Wall-clock training time
   scales linearly with `n_steps`.
-- No validation split. If you want held-out perplexity, slice the corpus
-  manually before encoding.
 - AdamW state does not persist across `cargo run` invocations. This is OK
   for short resumes; for long resumed sessions, the warmup-and-no-momentum
   start can cost a few hundred steps of progress.
