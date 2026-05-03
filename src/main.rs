@@ -759,17 +759,53 @@ fn run_shakespeare_training(resume_path: Option<std::path::PathBuf>) {
         println!("\nprompt: {:?}\n{}", prompt, g);
     }
 
-    // Temperature sampling: T=0.8 (cooler, more conservative) and T=1.0 (raw model
-    // distribution). Each call uses its own RNG seed so re-runs can be compared.
+    // Sampling modes: temperature alone (raw distribution shaped), top-k
+    // (capped candidate set), top-p / nucleus (adaptive cumulative-probability
+    // cutoff). Each call uses the same RNG so re-runs can be compared.
     let mut rng = data::Lcg::new(0xCAFEF00D);
+
     println!("\n-- temperature sampling (T=0.8) --");
     for prompt in ["ROMEO:", "To be ", "King "] {
-        let g = inference::generate_with_temperature(&model, &vocab, prompt, 200, 0.8, &mut rng);
+        let g = inference::generate_with_mode(
+            &model,
+            &vocab,
+            prompt,
+            200,
+            inference::SamplingMode::Temperature { temperature: 0.8 },
+            &mut rng,
+        );
         println!("\nprompt: {:?}\n{}", prompt, g);
     }
-    println!("\n-- temperature sampling (T=1.0) --");
+
+    println!("\n-- top-k sampling (k=10, T=0.8) --");
     for prompt in ["ROMEO:", "To be ", "King "] {
-        let g = inference::generate_with_temperature(&model, &vocab, prompt, 200, 1.0, &mut rng);
+        let g = inference::generate_with_mode(
+            &model,
+            &vocab,
+            prompt,
+            200,
+            inference::SamplingMode::TopK {
+                k: 10,
+                temperature: 0.8,
+            },
+            &mut rng,
+        );
+        println!("\nprompt: {:?}\n{}", prompt, g);
+    }
+
+    println!("\n-- top-p / nucleus sampling (p=0.9, T=0.8) --");
+    for prompt in ["ROMEO:", "To be ", "King "] {
+        let g = inference::generate_with_mode(
+            &model,
+            &vocab,
+            prompt,
+            200,
+            inference::SamplingMode::TopP {
+                p: 0.9,
+                temperature: 0.8,
+            },
+            &mut rng,
+        );
         println!("\nprompt: {:?}\n{}", prompt, g);
     }
 
