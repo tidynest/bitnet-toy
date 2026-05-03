@@ -185,9 +185,10 @@ the previous run's, you cannot resume from that previous checkpoint.
 
 - The corpus must fit in memory. For TinyShakespeare (1.1 MB) this is fine;
   for a 1 GB corpus you'd want streamed window iteration.
-- AdamW state does not persist across `cargo run` invocations. This is OK
-  for short resumes; for long resumed sessions, the warmup-and-no-momentum
-  start can cost a few hundred steps of progress.
+- AdamW state IS persisted across `cargo run` invocations as of v0.7
+  (BNT3 + OPTM payload). Old pre-v0.7 BNT3 checkpoints still load but
+  the optimiser starts at zero momentum. The cosine LR schedule still
+  restarts each run.
 - Batching is window-level only. The forward pass for a single window is
   still serial across positions and matmul rows; if you want to actually
   use all 16 threads, push `batch_size` and `n_workers` up to 8 or 16.

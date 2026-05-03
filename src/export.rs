@@ -43,8 +43,9 @@
 
 use crate::bitlinear::absmean_ternary;
 use crate::model::{AttentionHead, BlockMasters, Model, ModelConfig};
+use crate::optim::OptimState;
 use crate::tensor::Tensor;
-use std::io::{self, Read, Write};
+use std::io::{self, ErrorKind, Read, Write};
 
 // Magic version history:
 //   BNT1: single-head attention, ReLU FFN (2 weights per block).
@@ -253,6 +254,67 @@ fn read_ternary_packed_tensor<R: Read>(r: &mut R, shape: Vec<usize>) -> io::Resu
     Ok(Tensor { data, shape })
 }
 
+// ---- optim state IO ----
+
+/// 4-byte marker that introduces an optim-state payload. Lets the importer
+/// distinguish "no optim state" (file ends after lm_head, EOF) from "optim
+/// state follows" (these four bytes, then step_count + moment tensors).
+/// Writers always emit this marker when called; readers gracefully accept
+/// EOF here, which is what makes BNT3 files without optim state still load.
+const OPTM_MARKER: &[u8; 4] = b"OPTM";
+
+fn write_optim_state<W: Write>(w: &mut W, state: &OptimState) -> io::Result<usize> {
+    w.write_all(OPTM_MARKER)?;
+    w.write_all(&state.step_count.to_le_bytes())?;
+    let mut bytes = 4 + 4;
+    for t in state.m.iter().chain(state.v.iter()) {
+        for &v in &t.data {
+            w.write_all(&v.to_le_bytes())?;
+            bytes += 4;
+        }
+    }
+    Ok(bytes)
+}
+
+/// Read an optim-state payload if present, otherwise return `Ok(None)`.
+/// `param_shapes` must match the model whose state is being loaded - the
+/// importer reads exactly `2 * sum(shape.product())` floats and uses the
+/// shapes to reconstruct each `m` and `v` tensor.
+fn read_optim_state_or_none<R: Read>(
+    r: &mut R,
+    param_shapes: &[Vec<usize>],
+) -> io::Result<Option<OptimState>> {
+    let mut marker = [0u8; 4];
+    match r.read_exact(&mut marker) {
+        Ok(()) => {}
+        Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
+    }
+    if &marker != OPTM_MARKER {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "expected OPTM marker after lm_head, got {:?}",
+                String::from_utf8_lossy(&marker)
+            ),
+        ));
+    }
+
+    let mut buf = [0u8; 4];
+    r.read_exact(&mut buf)?;
+    let step_count = u32::from_le_bytes(buf);
+
+    let mut m = Vec::with_capacity(param_shapes.len());
+    for shape in param_shapes {
+        m.push(read_f32_tensor(r, shape.clone())?);
+    }
+    let mut v = Vec::with_capacity(param_shapes.len());
+    for shape in param_shapes {
+        v.push(read_f32_tensor(r, shape.clone())?);
+    }
+    Ok(Some(OptimState { step_count, m, v }))
+}
+
 fn read_ternary_tensor<R: Read>(r: &mut R, shape: Vec<usize>) -> io::Result<Tensor> {
     let n: usize = shape.iter().product();
     let mut buf = [0u8; 4];
@@ -272,7 +334,11 @@ fn read_ternary_tensor<R: Read>(r: &mut R, shape: Vec<usize>) -> io::Result<Tens
 
 // ---- public export ----
 
-pub fn export_f32<W: Write>(model: &Model, w: &mut W) -> io::Result<usize> {
+pub fn export_f32<W: Write>(
+    model: &Model,
+    w: &mut W,
+    optim: Option<&OptimState>,
+) -> io::Result<usize> {
     let mut total = write_header(w, &model.config, Format::Float32)?;
     total += write_f32_tensor(w, &model.token_embed)?;
     total += write_f32_tensor(w, &model.pos_embed)?;
@@ -288,10 +354,17 @@ pub fn export_f32<W: Write>(model: &Model, w: &mut W) -> io::Result<usize> {
         total += write_f32_tensor(w, &b.ffn_down_w)?;
     }
     total += write_f32_tensor(w, &model.lm_head)?;
+    if let Some(state) = optim {
+        total += write_optim_state(w, state)?;
+    }
     Ok(total)
 }
 
-pub fn export_ternary<W: Write>(model: &Model, w: &mut W) -> io::Result<usize> {
+pub fn export_ternary<W: Write>(
+    model: &Model,
+    w: &mut W,
+    optim: Option<&OptimState>,
+) -> io::Result<usize> {
     let mut total = write_header(w, &model.config, Format::Ternary)?;
     total += write_f32_tensor(w, &model.token_embed)?;
     total += write_f32_tensor(w, &model.pos_embed)?;
@@ -308,11 +381,18 @@ pub fn export_ternary<W: Write>(model: &Model, w: &mut W) -> io::Result<usize> {
     }
     // LM head is also a BitLinear, so it's ternary too.
     total += write_ternary_tensor(w, &model.lm_head)?;
+    if let Some(state) = optim {
+        total += write_optim_state(w, state)?;
+    }
     Ok(total)
 }
 
 /// Most compact format. BitLinear weights packed 5 ternaries per byte (base-3).
-pub fn export_ternary_packed<W: Write>(model: &Model, w: &mut W) -> io::Result<usize> {
+pub fn export_ternary_packed<W: Write>(
+    model: &Model,
+    w: &mut W,
+    optim: Option<&OptimState>,
+) -> io::Result<usize> {
     let mut total = write_header(w, &model.config, Format::TernaryPacked)?;
     total += write_f32_tensor(w, &model.token_embed)?;
     total += write_f32_tensor(w, &model.pos_embed)?;
@@ -328,14 +408,19 @@ pub fn export_ternary_packed<W: Write>(model: &Model, w: &mut W) -> io::Result<u
         total += write_ternary_packed_tensor(w, &b.ffn_down_w)?;
     }
     total += write_ternary_packed_tensor(w, &model.lm_head)?;
+    if let Some(state) = optim {
+        total += write_optim_state(w, state)?;
+    }
     Ok(total)
 }
 
 // ---- public import ----
 
-/// Read a model file (either format) and reconstruct the `Model` plus the
-/// `Format` it was stored in.
-pub fn import<R: Read>(r: &mut R) -> io::Result<(Model, Format)> {
+/// Read a model file (any format) and reconstruct the `Model`, the `Format`
+/// it was stored in, and an optional `OptimState` if the file carries one.
+/// Older BNT3 files written before optim-state persistence terminate after
+/// `lm_head`; this function returns `Ok((model, fmt, None))` for those.
+pub fn import<R: Read>(r: &mut R) -> io::Result<(Model, Format, Option<OptimState>)> {
     let (fmt, cfg) = read_header(r)?;
     let h = cfg.hidden_dim;
     let d = cfg.head_dim;
@@ -374,16 +459,20 @@ pub fn import<R: Read>(r: &mut R) -> io::Result<(Model, Format)> {
         Format::TernaryPacked => read_ternary_packed_tensor(r, vec![h, cfg.vocab_size])?,
     };
 
-    Ok((
-        Model {
-            token_embed,
-            pos_embed,
-            blocks,
-            lm_head,
-            config: cfg,
-        },
-        fmt,
-    ))
+    let model = Model {
+        token_embed,
+        pos_embed,
+        blocks,
+        lm_head,
+        config: cfg,
+    };
+
+    // Try to read optim state. EOF here means the file pre-dates optim
+    // persistence; that's fine, returns Ok(None).
+    let param_shapes = model.param_shapes();
+    let optim = read_optim_state_or_none(r, &param_shapes)?;
+
+    Ok((model, fmt, optim))
 }
 
 #[cfg(test)]
@@ -420,7 +509,7 @@ mod tests {
         // Header (33) + 400 floats × 4 = 33 + 1600 = 1633 bytes.
         let expected = HEADER_SIZE + 400 * 4;
         let mut buf = Vec::new();
-        let bytes = export_f32(&tiny_model(), &mut buf).unwrap();
+        let bytes = export_f32(&tiny_model(), &mut buf, None).unwrap();
         assert_eq!(bytes, expected);
         assert_eq!(buf.len(), expected);
     }
@@ -437,7 +526,7 @@ mod tests {
         // Total: 33 + 192 + 408 + 36 = 669.
         let expected = HEADER_SIZE + 192 + 408 + 36;
         let mut buf = Vec::new();
-        let bytes = export_ternary(&tiny_model(), &mut buf).unwrap();
+        let bytes = export_ternary(&tiny_model(), &mut buf, None).unwrap();
         assert_eq!(bytes, expected);
         assert_eq!(buf.len(), expected);
     }
@@ -447,8 +536,8 @@ mod tests {
         let model = tiny_model();
         let mut f32_buf = Vec::new();
         let mut ter_buf = Vec::new();
-        export_f32(&model, &mut f32_buf).unwrap();
-        export_ternary(&model, &mut ter_buf).unwrap();
+        export_f32(&model, &mut f32_buf, None).unwrap();
+        export_ternary(&model, &mut ter_buf, None).unwrap();
         assert!(
             ter_buf.len() < f32_buf.len(),
             "ternary export ({} B) must be smaller than f32 ({} B)",
@@ -461,9 +550,9 @@ mod tests {
     fn f32_round_trip_preserves_every_weight_exactly() {
         let model = tiny_model();
         let mut buf = Vec::new();
-        export_f32(&model, &mut buf).unwrap();
+        export_f32(&model, &mut buf, None).unwrap();
 
-        let (loaded, fmt) = import(&mut Cursor::new(&buf)).unwrap();
+        let (loaded, fmt, _opt) = import(&mut Cursor::new(&buf)).unwrap();
         assert_eq!(fmt, Format::Float32);
         assert_eq!(loaded.config.vocab_size, model.config.vocab_size);
         assert_eq!(loaded.token_embed.data, model.token_embed.data);
@@ -484,9 +573,9 @@ mod tests {
         // must preserve the (γ, W_q) decomposition exactly.
         let model = tiny_model();
         let mut buf = Vec::new();
-        export_ternary(&model, &mut buf).unwrap();
+        export_ternary(&model, &mut buf, None).unwrap();
 
-        let (loaded, fmt) = import(&mut Cursor::new(&buf)).unwrap();
+        let (loaded, fmt, _opt) = import(&mut Cursor::new(&buf)).unwrap();
         assert_eq!(fmt, Format::Ternary);
 
         // Embeddings are f32, exact match.
@@ -517,9 +606,9 @@ mod tests {
     fn ternary_packed_round_trip() {
         let model = tiny_model();
         let mut buf = Vec::new();
-        export_ternary_packed(&model, &mut buf).unwrap();
+        export_ternary_packed(&model, &mut buf, None).unwrap();
 
-        let (loaded, fmt) = import(&mut Cursor::new(&buf)).unwrap();
+        let (loaded, fmt, _opt) = import(&mut Cursor::new(&buf)).unwrap();
         assert_eq!(fmt, Format::TernaryPacked);
 
         // Embeddings stay f32, exact match.
@@ -548,8 +637,8 @@ mod tests {
         let model = tiny_model();
         let mut t_buf = Vec::new();
         let mut p_buf = Vec::new();
-        export_ternary(&model, &mut t_buf).unwrap();
-        export_ternary_packed(&model, &mut p_buf).unwrap();
+        export_ternary(&model, &mut t_buf, None).unwrap();
+        export_ternary_packed(&model, &mut p_buf, None).unwrap();
         assert!(
             p_buf.len() < t_buf.len(),
             "packed ({} B) must be smaller than unpacked ternary ({} B)",
@@ -575,6 +664,79 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn import_returns_none_optim_for_files_without_optm_marker() {
+        // Round-trip a model with no optim state. import should succeed and
+        // return None for the third tuple element (no OPTM marker means we
+        // hit EOF cleanly after lm_head).
+        let model = tiny_model();
+        let mut buf = Vec::new();
+        export_ternary_packed(&model, &mut buf, None).unwrap();
+        let (_loaded, _fmt, optim) = import(&mut Cursor::new(&buf)).unwrap();
+        assert!(optim.is_none(), "expected no optim state in payload-less export");
+    }
+
+    #[test]
+    fn optim_state_round_trips_through_packed_export() {
+        // Write a model with a hand-built optim state, read it back, verify
+        // step_count and a sample of m/v values survived the round-trip exactly.
+        // OPTM payload is f32 (lossless), unlike the ternary weights themselves.
+        use crate::optim::OptimState;
+
+        let model = tiny_model();
+        let shapes = model.param_shapes();
+        // Construct an OptimState whose m/v values vary per tensor so a
+        // shape-mismatched read would fail loudly.
+        let m: Vec<Tensor> = shapes
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let n: usize = s.iter().product();
+                let data: Vec<f32> = (0..n).map(|j| (i * 100 + j) as f32 * 0.001).collect();
+                Tensor {
+                    data,
+                    shape: s.clone(),
+                }
+            })
+            .collect();
+        let v: Vec<Tensor> = shapes
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let n: usize = s.iter().product();
+                let data: Vec<f32> =
+                    (0..n).map(|j| (i * 100 + j) as f32 * 0.0001).collect();
+                Tensor {
+                    data,
+                    shape: s.clone(),
+                }
+            })
+            .collect();
+        let saved = OptimState {
+            step_count: 1234,
+            m: m.clone(),
+            v: v.clone(),
+        };
+
+        let mut buf = Vec::new();
+        export_ternary_packed(&model, &mut buf, Some(&saved)).unwrap();
+        let (_loaded_model, _fmt, loaded_optim) = import(&mut Cursor::new(&buf)).unwrap();
+        let loaded = loaded_optim.expect("optim state must round-trip when written");
+
+        assert_eq!(loaded.step_count, 1234);
+        assert_eq!(loaded.m.len(), m.len());
+        assert_eq!(loaded.v.len(), v.len());
+        // Spot-check a couple of tensors for exact f32 equality.
+        for (lt, st) in loaded.m.iter().zip(&m) {
+            assert_eq!(lt.shape, st.shape);
+            assert_eq!(lt.data, st.data);
+        }
+        for (lt, st) in loaded.v.iter().zip(&v) {
+            assert_eq!(lt.shape, st.shape);
+            assert_eq!(lt.data, st.data);
         }
     }
 

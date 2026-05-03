@@ -234,9 +234,15 @@ pub struct TrainConfig {
     /// If `Some(model)`, start training from these weights instead of fresh
     /// random init. The model's `ModelConfig` overrides `self.model` so the
     /// optimiser sizes and forward shapes match the loaded weights exactly.
-    /// Optimiser state (AdamW m, v) and LR schedule warmup both restart fresh;
-    /// expect a brief instability in the first ~30 steps after resuming.
+    /// LR schedule warmup restarts fresh; resumes get clean momentum if
+    /// `start_from_optim` is also set.
     pub start_from: Option<crate::model::Model>,
+    /// If `Some(state)` (and `start_from` is also `Some`), restore the
+    /// AdamW optimiser's momentum / variance buffers from this snapshot.
+    /// Pre-v0.7 checkpoints don't carry optim state; resuming from one of
+    /// those leaves this `None` and the optimiser starts from zeros, costing
+    /// the usual ~30 wobbly steps after resume.
+    pub start_from_optim: Option<crate::optim::OptimState>,
 }
 
 impl TrainConfig {
@@ -278,6 +284,7 @@ impl TrainConfig {
             batch_size: 1,
             n_workers: 1,
             start_from: None,
+            start_from_optim: None,
         }
     }
 
@@ -326,6 +333,7 @@ impl TrainConfig {
             batch_size: 4,
             n_workers: 4,
             start_from: None,
+            start_from_optim: None,
         }
     }
 }
@@ -486,8 +494,19 @@ pub fn eval_val_perplexity(
 /// validation evaluation; held-out perplexity is printed during training
 /// alongside `train_loss` / `anchor_loss` / `min_seen`.
 ///
-/// Returns `(initial_loss, min_loss_seen, trained_model, vocab)`.
-fn train_bitnet_lm(cfg: TrainConfig) -> (f32, f32, crate::model::Model, crate::data::Vocab) {
+/// Returns `(initial_loss, min_loss_seen, trained_model, vocab, optim_snapshot)`.
+/// The optim snapshot is the state of the AdamW optimiser at the end of
+/// training - feed it back through `TrainConfig::start_from_optim` on the
+/// next run for a momentum-preserving resume.
+fn train_bitnet_lm(
+    cfg: TrainConfig,
+) -> (
+    f32,
+    f32,
+    crate::model::Model,
+    crate::data::Vocab,
+    crate::optim::OptimState,
+) {
     use crate::data::{Lcg, TINY_CORPUS, Vocab, make_windows, read_corpus};
     use crate::model::Model;
     use crate::optim::{AdamW, clip_grad_norm_tensors, cosine_lr};
@@ -558,6 +577,13 @@ fn train_bitnet_lm(cfg: TrainConfig) -> (f32, f32, crate::model::Model, crate::d
     opt.beta1 = cfg.adamw_beta1;
     opt.beta2 = cfg.adamw_beta2;
     opt.weight_decay = cfg.weight_decay;
+    if let Some(state) = cfg.start_from_optim {
+        println!(
+            "restoring AdamW state from checkpoint (step_count = {})",
+            state.step_count
+        );
+        opt.restore(state);
+    }
 
     println!(
         "── M9: BitNet LM training ──\n\
@@ -687,7 +713,8 @@ fn train_bitnet_lm(cfg: TrainConfig) -> (f32, f32, crate::model::Model, crate::d
         );
     }
 
-    (initial_loss, min_loss, model, vocab)
+    let optim_snapshot = opt.snapshot();
+    (initial_loss, min_loss, model, vocab, optim_snapshot)
 }
 
 /// Directory where every trained model gets written. Created on demand by
@@ -734,9 +761,20 @@ fn run_shakespeare_training(resume_path: Option<std::path::PathBuf>) {
             }
         };
         match export::import(&mut f) {
-            Ok((m, fmt)) => {
-                println!("loaded {:?}-format checkpoint from {}", fmt, p.display());
+            Ok((m, fmt, optim)) => {
+                let optim_msg = if optim.is_some() {
+                    "with optim state"
+                } else {
+                    "no optim state (will reset AdamW momentum)"
+                };
+                println!(
+                    "loaded {:?}-format checkpoint from {} ({})",
+                    fmt,
+                    p.display(),
+                    optim_msg
+                );
                 cfg.start_from = Some(m);
+                cfg.start_from_optim = optim;
             }
             Err(e) => {
                 eprintln!("could not parse resume file {}: {}", p.display(), e);
@@ -745,7 +783,7 @@ fn run_shakespeare_training(resume_path: Option<std::path::PathBuf>) {
         }
     }
 
-    let (initial, min_seen, model, vocab) = train_bitnet_lm(cfg);
+    let (initial, min_seen, model, vocab, optim_state) = train_bitnet_lm(cfg);
     println!(
         "\nShakespeare training done.  initial = {:.4}   min seen = {:.4}   ratio = {:.2}",
         initial,
@@ -810,7 +848,7 @@ fn run_shakespeare_training(resume_path: Option<std::path::PathBuf>) {
     }
 
     let mut packed = Vec::new();
-    export::export_ternary_packed(&model, &mut packed)
+    export::export_ternary_packed(&model, &mut packed, Some(&optim_state))
         .expect("packed export to Vec cannot fail");
     let path = models_path("shakespeare.ternary_packed.bin");
     let _ = std::fs::write(&path, &packed);
@@ -850,7 +888,8 @@ fn main() {
         m6_initial, m6_final, m6_w[0], m6_w[1]
     );
 
-    let (m9_initial, m9_min, m9_model, m9_vocab) = train_bitnet_lm(TrainConfig::tiny_demo());
+    let (m9_initial, m9_min, m9_model, m9_vocab, _m9_optim) =
+        train_bitnet_lm(TrainConfig::tiny_demo());
     println!(
         "\nM9 result:  initial loss = {:.4}   min loss seen = {:.4}   ratio = {:.2}",
         m9_initial,
@@ -873,11 +912,11 @@ fn main() {
     let mut f32_buf = Vec::new();
     let mut ternary_buf = Vec::new();
     let mut packed_buf = Vec::new();
-    let f32_size =
-        export::export_f32(&m9_model, &mut f32_buf).expect("f32 export to Vec cannot fail");
-    let ternary_size = export::export_ternary(&m9_model, &mut ternary_buf)
+    let f32_size = export::export_f32(&m9_model, &mut f32_buf, None)
+        .expect("f32 export to Vec cannot fail");
+    let ternary_size = export::export_ternary(&m9_model, &mut ternary_buf, None)
         .expect("ternary export to Vec cannot fail");
-    let packed_size = export::export_ternary_packed(&m9_model, &mut packed_buf)
+    let packed_size = export::export_ternary_packed(&m9_model, &mut packed_buf, None)
         .expect("packed export to Vec cannot fail");
 
     let kb = |n: usize| n as f32 / 1024.0;
@@ -922,7 +961,7 @@ fn main() {
     );
     let mut cursor = std::io::Cursor::new(packed_buf);
     match export::import(&mut cursor) {
-        Ok((loaded_model, fmt)) => {
+        Ok((loaded_model, fmt, _opt)) => {
             println!(
                 "loaded {:?}-format model with vocab={}",
                 fmt, loaded_model.config.vocab_size
@@ -1014,7 +1053,7 @@ mod tests {
         let mut cfg = TrainConfig::tiny_demo();
         cfg.n_steps = 200;
         cfg.log_every = usize::MAX; // suppress per-step prints inside the test
-        let (initial, min_loss, _model, _vocab) = train_bitnet_lm(cfg);
+        let (initial, min_loss, _model, _vocab, _optim) = train_bitnet_lm(cfg);
         assert!(
             min_loss < initial * 0.7,
             "BitNet LM did not improve enough: initial = {}, min seen = {}, ratio = {:.3}",
@@ -1127,7 +1166,7 @@ mod tests {
         cfg.log_every = usize::MAX;
         cfg.batch_size = 4;
         cfg.n_workers = 1; // serial for determinism in CI
-        let (initial, min_loss, _model, _vocab) = train_bitnet_lm(cfg);
+        let (initial, min_loss, _model, _vocab, _optim) = train_bitnet_lm(cfg);
         assert!(
             min_loss < initial * 0.7,
             "batched training did not reduce loss enough: initial = {}, min = {}, ratio = {:.3}",

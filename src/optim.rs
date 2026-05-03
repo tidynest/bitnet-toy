@@ -16,6 +16,22 @@
 use crate::model::Model;
 use crate::tensor::Tensor;
 
+// ---- AdamW state for resume ----
+
+/// Persistent snapshot of an `AdamW` optimiser's mutable state. Carried
+/// through the on-disk checkpoint so resumes don't lose AdamW's momentum
+/// estimates - the first ~30 steps after a snapshot-less resume were wobbly
+/// while `m` / `v` re-established from zeros.
+///
+/// Lives outside `AdamW` itself so the export/import code can construct it
+/// from on-disk bytes without needing the live optimiser.
+#[derive(Debug, Clone)]
+pub struct OptimState {
+    pub step_count: u32,
+    pub m: Vec<Tensor>,
+    pub v: Vec<Tensor>,
+}
+
 // ---- AdamW ----
 
 /// AdamW optimiser. State (`m`, `v`) is sized at construction time to match
@@ -61,6 +77,48 @@ impl AdamW {
             m,
             v,
         }
+    }
+
+    /// Snapshot the optimiser's mutable state for export. Cloning the moment
+    /// buffers is cheap relative to one training step; if it ever shows up in
+    /// profiling, change the export path to take `&self` and stream tensors.
+    pub fn snapshot(&self) -> OptimState {
+        OptimState {
+            step_count: self.step_count,
+            m: self.m.clone(),
+            v: self.v.clone(),
+        }
+    }
+
+    /// Replace the optimiser's mutable state with a previously-snapshotted
+    /// `OptimState`. Asserts that every shape matches the optimiser's existing
+    /// buffers - a mismatch means the state was saved against a different
+    /// model architecture and the per-tensor AdamW math would silently corrupt.
+    pub fn restore(&mut self, state: OptimState) {
+        assert_eq!(
+            state.m.len(),
+            self.m.len(),
+            "OptimState m length {} doesn't match optimiser {}",
+            state.m.len(),
+            self.m.len()
+        );
+        for (i, (existing, loaded)) in self.m.iter().zip(&state.m).enumerate() {
+            assert_eq!(
+                existing.shape, loaded.shape,
+                "OptimState m[{}] shape mismatch",
+                i
+            );
+        }
+        for (i, (existing, loaded)) in self.v.iter().zip(&state.v).enumerate() {
+            assert_eq!(
+                existing.shape, loaded.shape,
+                "OptimState v[{}] shape mismatch",
+                i
+            );
+        }
+        self.step_count = state.step_count;
+        self.m = state.m;
+        self.v = state.v;
     }
 
     /// Run one optimiser step from pre-collected gradient tensors.
