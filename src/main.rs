@@ -215,6 +215,22 @@ pub struct TrainConfig {
     /// across eval points so val_ppl trends are meaningful. Lower = faster
     /// eval, noisier val_ppl. 100-200 is a good range for most corpora.
     pub val_eval_samples: usize,
+    /// Number of training windows processed per optimiser step. With
+    /// `batch_size = 1` (default), training matches the older single-window
+    /// path exactly. With `batch_size > 1`, every step samples `batch_size`
+    /// independent windows, computes per-window gradients, averages them,
+    /// applies one optimiser update. Larger batches give smoother gradient
+    /// estimates and need fewer steps to reach the same val_ppl, but each
+    /// step costs `batch_size`x more compute (parallelisable - see `n_workers`).
+    pub batch_size: usize,
+    /// Maximum threads used by the batched step. With `n_workers >= batch_size`
+    /// every window in the batch processes in parallel. Higher = more wall-clock
+    /// speedup but heavier sustained CPU load (matters for thermals on laptops).
+    /// Set to 1 to force serial-batched mode for deterministic comparison.
+    /// Set to 0 to disable parallelism even when `batch_size > 1` (same as 1
+    /// in practice). On the 7940HS, `n_workers = 4` keeps the chip below
+    /// throttling territory; bump to 8 if your fans cope.
+    pub n_workers: usize,
     /// If `Some(model)`, start training from these weights instead of fresh
     /// random init. The model's `ModelConfig` overrides `self.model` so the
     /// optimiser sizes and forward shapes match the loaded weights exactly.
@@ -257,6 +273,10 @@ impl TrainConfig {
             val_split: 0.0,
             eval_every: 0,
             val_eval_samples: 0,
+            // Tiny demo runs serial single-window so timings stay tight and
+            // tests remain deterministic.
+            batch_size: 1,
+            n_workers: 1,
             start_from: None,
         }
     }
@@ -298,9 +318,132 @@ impl TrainConfig {
             // 100 windows per eval is a fixed-budget tradeoff: ~1 second
             // wall-clock per eval, val_ppl noise floor around 1-2%.
             val_eval_samples: 100,
+            // Batched training: 4 windows per step, processed in parallel on
+            // up to 4 worker threads. On the 7940HS this peaks the chip
+            // briefly during the forward+backward then drops back to idle
+            // during optimiser update; sustained CPU utilisation runs around
+            // 25-40 percent. Bump to 8 + 8 if your laptop's cooling can hold.
+            batch_size: 4,
+            n_workers: 4,
             start_from: None,
         }
     }
+}
+
+/// Run forward + backward on a single training window and return the gradient
+/// set (in canonical visitor order) plus the scalar loss. The tape is built
+/// and dropped inside this call, so memory stays bounded by one window's worth
+/// of recorded ops.
+///
+/// This is the per-window worker used by the batched training path - both the
+/// serial single-thread case and the parallel `std::thread::scope` case call
+/// it. Keeping all the autograd graph construction in one tight function
+/// makes the parallel-vs-serial split a pure question of how the windows are
+/// dispatched, not how each one is computed.
+fn compute_grads_for_window(
+    model: &crate::model::Model,
+    input: &[usize],
+    target: &[usize],
+) -> (Vec<crate::tensor::Tensor>, f32) {
+    let tape = Tape::new();
+    let leaves = model.register_leaves(&tape);
+    let logits = model.forward(&leaves, input);
+    let loss = logits.cross_entropy(target);
+    let loss_val = loss.value().data[0];
+    tape.backward(loss.id);
+
+    let mut grads = Vec::with_capacity(model.param_shapes().len());
+    model.for_each_grad(&leaves, |g| grads.push(g.clone()));
+    (grads, loss_val)
+}
+
+/// Compute averaged gradients across `batch_size` randomly-sampled training
+/// windows. Returns the averaged gradient set and the mean loss. Up to
+/// `n_workers` threads run forward+backward in parallel via
+/// `std::thread::scope`; setting `n_workers` to 1 falls back to a serial loop
+/// that is byte-for-byte deterministic given the same RNG state.
+///
+/// The window indices are sampled up front from a single RNG before any
+/// threads spawn, so changing `n_workers` does not change which windows the
+/// batch sees - only the wall-clock cost of processing them.
+fn compute_batched_grads(
+    model: &crate::model::Model,
+    windows: &[(Vec<usize>, Vec<usize>)],
+    rng: &mut crate::data::Lcg,
+    batch_size: usize,
+    n_workers: usize,
+) -> (Vec<crate::tensor::Tensor>, f32) {
+    assert!(batch_size >= 1, "batch_size must be >= 1");
+    let indices: Vec<usize> = (0..batch_size)
+        .map(|_| rng.gen_range(windows.len()))
+        .collect();
+
+    let workers = n_workers.max(1).min(batch_size);
+
+    let results: Vec<(Vec<crate::tensor::Tensor>, f32)> = if workers == 1 {
+        // Serial path. Used when n_workers == 1 (deterministic) or when
+        // batch_size == 1 (parallelising one window has no benefit and
+        // costs a thread spawn).
+        indices
+            .iter()
+            .map(|&i| {
+                let (input, target) = &windows[i];
+                compute_grads_for_window(model, input, target)
+            })
+            .collect()
+    } else {
+        // Parallel path. Split the index list into `workers` chunks; each
+        // worker thread sequentially processes its chunk. Spawning fewer
+        // threads than batch_size (when n_workers < batch_size) batches up
+        // multiple windows on each thread, which is the right tradeoff
+        // when you want to cap concurrent CPU usage.
+        std::thread::scope(|s| {
+            let chunk_size = (indices.len() + workers - 1) / workers;
+            let handles: Vec<_> = indices
+                .chunks(chunk_size)
+                .map(|chunk| {
+                    let chunk_indices: Vec<usize> = chunk.to_vec();
+                    s.spawn(move || {
+                        chunk_indices
+                            .iter()
+                            .map(|&i| {
+                                let (input, target) = &windows[i];
+                                compute_grads_for_window(model, input, target)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+
+            let mut all_results = Vec::with_capacity(indices.len());
+            for h in handles {
+                all_results.extend(h.join().unwrap());
+            }
+            all_results
+        })
+    };
+
+    // Average gradients across the batch. Start from the first result's
+    // tensors (move out, no clone) and sum the rest into them.
+    let n = results.len() as f32;
+    let mut iter = results.into_iter();
+    let (mut avg_grads, mut total_loss) = iter
+        .next()
+        .expect("compute_batched_grads: batch_size was zero");
+    for (other_grads, other_loss) in iter {
+        for (a, b) in avg_grads.iter_mut().zip(&other_grads) {
+            for (av, bv) in a.data.iter_mut().zip(&b.data) {
+                *av += bv;
+            }
+        }
+        total_loss += other_loss;
+    }
+    for g in avg_grads.iter_mut() {
+        for v in g.data.iter_mut() {
+            *v /= n;
+        }
+    }
+    (avg_grads, total_loss / n)
 }
 
 /// Mean cross-entropy and perplexity (`exp(mean_ce)`) over a deterministic,
@@ -347,7 +490,7 @@ pub fn eval_val_perplexity(
 fn train_bitnet_lm(cfg: TrainConfig) -> (f32, f32, crate::model::Model, crate::data::Vocab) {
     use crate::data::{Lcg, TINY_CORPUS, Vocab, make_windows, read_corpus};
     use crate::model::Model;
-    use crate::optim::{AdamW, clip_grad_norm, cosine_lr};
+    use crate::optim::{AdamW, clip_grad_norm_tensors, cosine_lr};
 
     let corpus_owned: String = match &cfg.corpus_path {
         Some(p) => match read_corpus(p) {
@@ -423,6 +566,7 @@ fn train_bitnet_lm(cfg: TrainConfig) -> (f32, f32, crate::model::Model, crate::d
          model        = hidden {}, ffn {}, n_heads {}, head_dim {}, blocks {}, seq_len {}\n\
          train wins   = {}\n\
          val wins     = {} (split = {:.0}%)\n\
+         batching     = batch_size {}, n_workers {}\n\
          optimiser    = AdamW(b1={}, b2={}, wd={}), peak_lr={:.1e}, floor_lr={:.1e},\n\
                         warmup={} steps, grad_clip={}, total_steps={}",
         corpus_owned.chars().count(),
@@ -436,6 +580,8 @@ fn train_bitnet_lm(cfg: TrainConfig) -> (f32, f32, crate::model::Model, crate::d
         windows.len(),
         val_windows.len(),
         val_split_clamped * 100.0,
+        cfg.batch_size,
+        cfg.n_workers,
         cfg.adamw_beta1,
         cfg.adamw_beta2,
         cfg.weight_decay,
@@ -459,14 +605,15 @@ fn train_bitnet_lm(cfg: TrainConfig) -> (f32, f32, crate::model::Model, crate::d
 
     let val_enabled = !val_windows.is_empty() && cfg.eval_every > 0 && cfg.val_eval_samples > 0;
 
-    for step in 0..cfg.n_steps {
-        // Sample a fresh random window every step.  The previous "shuffle once,
-        // iterate" approach silently restricted training to the first n_steps
-        // windows of the shuffle, which was tiny relative to the corpus and
-        // caused catastrophic memorisation.  Uniform random sampling makes
-        // every step a draw from the full window pool.
-        let (input, target) = &windows[rng.gen_range(windows.len())];
+    let batch_size = cfg.batch_size.max(1);
+    let n_workers = cfg.n_workers.max(1);
 
+    for step in 0..cfg.n_steps {
+        // Sample `batch_size` random windows every step. With batch_size = 1
+        // (the default for the tiny demo) this is exactly the prior single-
+        // window path, just with one extra Vec allocation. With batch_size > 1
+        // the per-window forward+backward passes parallelise across up to
+        // `n_workers` threads, returning averaged gradients.
         let lr = cosine_lr(
             step,
             cfg.warmup_steps,
@@ -476,17 +623,18 @@ fn train_bitnet_lm(cfg: TrainConfig) -> (f32, f32, crate::model::Model, crate::d
         );
         opt.lr = lr;
 
-        let tape = Tape::new();
-        let leaves = model.register_leaves(&tape);
-        let logits = model.forward(&leaves, input);
-        let loss = logits.cross_entropy(target);
-        let loss_val = loss.value().data[0];
-        if loss_val < min_loss {
-            min_loss = loss_val;
+        let (mut grads, batch_loss) = compute_batched_grads(
+            &model,
+            &windows,
+            &mut rng,
+            batch_size,
+            n_workers,
+        );
+        if batch_loss < min_loss {
+            min_loss = batch_loss;
         }
-        tape.backward(loss.id);
-        let pre_clip = clip_grad_norm(&leaves, cfg.grad_clip);
-        opt.step(&mut model, &leaves);
+        let pre_clip = clip_grad_norm_tensors(&mut grads, cfg.grad_clip);
+        opt.step_with_grads(&mut model, &grads);
 
         let on_log_step = step % cfg.log_every == 0 || step == cfg.n_steps - 1;
         let on_eval_step = val_enabled
@@ -501,13 +649,13 @@ fn train_bitnet_lm(cfg: TrainConfig) -> (f32, f32, crate::model::Model, crate::d
                     "step {:>5}   train_loss = {:.4}   anchor_loss = {:.4}   \
                      min_seen = {:.4}   val_loss = {:.4}   val_ppl = {:.2}   \
                      lr = {:.4e}   |g| = {:.3}",
-                    step, loss_val, anchor_loss, min_loss, val_loss, val_ppl, lr, pre_clip
+                    step, batch_loss, anchor_loss, min_loss, val_loss, val_ppl, lr, pre_clip
                 );
             } else {
                 println!(
                     "step {:>5}   train_loss = {:.4}   anchor_loss = {:.4}   \
                      min_seen = {:.4}   lr = {:.4e}   |g| = {:.3}",
-                    step, loss_val, anchor_loss, min_loss, lr, pre_clip
+                    step, batch_loss, anchor_loss, min_loss, lr, pre_clip
                 );
             }
         } else if on_eval_step {
@@ -880,6 +1028,76 @@ mod tests {
             "val_ppl {} unreasonably high for vocab {}",
             val_ppl,
             baseline
+        );
+    }
+
+    /// Parallel batched gradients must match the serial-batched result
+    /// numerically. Same RNG state, same windows sampled in the same order,
+    /// same per-window forward+backward; only the dispatch differs. Float
+    /// summation is technically order-dependent but for batch_size = 4 the
+    /// drift is at machine-epsilon level.
+    #[test]
+    fn compute_batched_grads_parallel_matches_serial() {
+        use crate::data::{Lcg, TINY_CORPUS, Vocab, make_windows};
+        use crate::model::{Model, ModelConfig};
+
+        let vocab = Vocab::from_text(TINY_CORPUS);
+        let ids = vocab.encode(TINY_CORPUS);
+        let cfg = ModelConfig {
+            vocab_size: vocab.size(),
+            hidden_dim: 8,
+            n_heads: 2,
+            head_dim: 4,
+            ffn_dim: 16,
+            max_seq_len: 8,
+            n_blocks: 1,
+        };
+        let model = Model::new(&cfg, 99);
+        let windows = make_windows(&ids, cfg.max_seq_len);
+
+        let mut rng_a = Lcg::new(0xBEEFCAFE);
+        let (grads_serial, loss_serial) =
+            compute_batched_grads(&model, &windows, &mut rng_a, 4, 1);
+
+        let mut rng_b = Lcg::new(0xBEEFCAFE);
+        let (grads_par, loss_par) =
+            compute_batched_grads(&model, &windows, &mut rng_b, 4, 4);
+
+        assert!((loss_serial - loss_par).abs() < 1e-3);
+        assert_eq!(grads_serial.len(), grads_par.len());
+        for (gs, gp) in grads_serial.iter().zip(&grads_par) {
+            assert_eq!(gs.shape, gp.shape);
+            for (a, b) in gs.data.iter().zip(&gp.data) {
+                let diff = (a - b).abs();
+                let scale = a.abs().max(b.abs()).max(1e-6);
+                assert!(
+                    diff / scale < 1e-3,
+                    "parallel vs serial drift {} / {} = {}",
+                    diff,
+                    scale,
+                    diff / scale
+                );
+            }
+        }
+    }
+
+    /// Batched training (batch_size > 1) must reduce loss like the unbatched
+    /// path does. The averaged gradients should give a smoother optimisation
+    /// trajectory, not a broken one.
+    #[test]
+    fn batched_training_reduces_loss() {
+        let mut cfg = TrainConfig::tiny_demo();
+        cfg.n_steps = 200;
+        cfg.log_every = usize::MAX;
+        cfg.batch_size = 4;
+        cfg.n_workers = 1; // serial for determinism in CI
+        let (initial, min_loss, _model, _vocab) = train_bitnet_lm(cfg);
+        assert!(
+            min_loss < initial * 0.7,
+            "batched training did not reduce loss enough: initial = {}, min = {}, ratio = {:.3}",
+            initial,
+            min_loss,
+            min_loss / initial
         );
     }
 

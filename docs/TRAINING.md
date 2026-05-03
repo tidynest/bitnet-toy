@@ -55,6 +55,8 @@ Default config (defined in `TrainConfig::shakespeare()` in `src/main.rs`):
 | `val_split`            | 0.10 | Tail fraction of corpus held out |
 | `eval_every`           | 500  | Run val pass every N training steps |
 | `val_eval_samples`     | 100  | Val windows per eval pass |
+| `batch_size`           | 4    | Windows processed per optimiser step (averaged grads) |
+| `n_workers`            | 4    | Threads used for parallel forward+backward across the batch |
 
 After the run, `models/shakespeare.ternary_packed.bin` contains the trained
 model in base-3 packed format (~60 KB).
@@ -183,8 +185,32 @@ the previous run's, you cannot resume from that previous checkpoint.
 
 - The corpus must fit in memory. For TinyShakespeare (1.1 MB) this is fine;
   for a 1 GB corpus you'd want streamed window iteration.
-- No batching: each step processes one window. Wall-clock training time
-  scales linearly with `n_steps`.
 - AdamW state does not persist across `cargo run` invocations. This is OK
   for short resumes; for long resumed sessions, the warmup-and-no-momentum
   start can cost a few hundred steps of progress.
+- Batching is window-level only. The forward pass for a single window is
+  still serial across positions and matmul rows; if you want to actually
+  use all 16 threads, push `batch_size` and `n_workers` up to 8 or 16.
+  Future work: parallel matmul rows (TODO), then SIMD intrinsics, then
+  GPU back-end via cudarc.
+
+## Batching and threading notes
+
+`batch_size = 4, n_workers = 4` is a deliberately moderate default for the
+7940HS. Each thread handles one window's forward + backward; on a hot
+laptop this peaks ~50 percent of the chip during the compute window and
+drops back to idle during the optimiser update. If your fans tolerate it,
+`batch_size = 8, n_workers = 8` doubles the per-step compute and roughly
+halves the wall-clock time per step. `batch_size = 1` reverts to the
+single-window deterministic path.
+
+Setting `n_workers = 1` while `batch_size > 1` runs the batch serially in
+one thread. This is byte-for-byte deterministic given the same RNG state -
+useful for debugging or reproducible measurements.
+
+Larger batches give smoother gradient estimates (less stochastic noise per
+step) but each step costs `batch_size`x compute. The standard "linear LR
+scaling" rule says LR should scale with batch_size for equivalent step
+sizes, but our STE quantisation noise dominates at small batch sizes, so
+the rule applies less cleanly here. Default LR is left unchanged across
+batch sizes; tune empirically if you push to batch_size = 16+.

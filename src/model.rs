@@ -267,6 +267,31 @@ impl Model {
         f(&mut self.lm_head, &leaves.lm_head.grad());
     }
 
+    /// Iterate every master parameter (mutable, no leaf grad). Used by the
+    /// batched training path: gradients arrive pre-aggregated as a `Vec<Tensor>`
+    /// in visitor order, so the optimiser walks parameters here and pulls the
+    /// matching gradient by index instead of going through a tape leaf.
+    /// Same canonical order as `for_each_param_with_grad`.
+    pub fn for_each_param_mut<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&mut Tensor),
+    {
+        f(&mut self.token_embed);
+        f(&mut self.pos_embed);
+        for mb in self.blocks.iter_mut() {
+            for mh in mb.heads.iter_mut() {
+                f(&mut mh.w_q);
+                f(&mut mh.w_k);
+                f(&mut mh.w_v);
+                f(&mut mh.w_o);
+            }
+            f(&mut mb.ffn_gate_w);
+            f(&mut mb.ffn_up_w);
+            f(&mut mb.ffn_down_w);
+        }
+        f(&mut self.lm_head);
+    }
+
     /// Iterate every leaf-gradient (read-only). Used by tests + grad-clip
     /// debug printers; not called from the main training loop directly.
     #[allow(dead_code)]

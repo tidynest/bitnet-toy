@@ -13,8 +13,7 @@
 //! the leaves directly, so adding more optimisers later (Lion, Adafactor, etc.)
 //! is a single new struct.
 
-use crate::autograd::Var;
-use crate::model::{Model, ModelLeaves};
+use crate::model::Model;
 use crate::tensor::Tensor;
 
 // ---- AdamW ----
@@ -64,9 +63,13 @@ impl AdamW {
         }
     }
 
-    /// Run one optimiser step. Mutates the model's master tensors in-place
-    /// and updates the optimiser's running moments.
-    pub fn step(&mut self, model: &mut Model, leaves: &ModelLeaves<'_>) {
+    /// Run one optimiser step from pre-collected gradient tensors.
+    /// `grads` must be in the same canonical visitor order as
+    /// `Model::for_each_param_mut`. The training loop calls this once per
+    /// step with averaged gradients (batched path) or with single-window
+    /// gradients (when `batch_size == 1`); callers without a tape pull
+    /// gradients themselves via `Model::for_each_grad`.
+    pub fn step_with_grads(&mut self, model: &mut Model, grads: &[Tensor]) {
         self.step_count += 1;
         let t = self.step_count as i32;
         let bc1 = 1.0 - self.beta1.powi(t);
@@ -79,12 +82,12 @@ impl AdamW {
         let eps = self.eps;
         let wd = self.weight_decay;
 
-        // Destructure to get split borrows for `m` and `v` separately.
         let m_slices = self.m.as_mut_slice();
         let v_slices = self.v.as_mut_slice();
         let mut idx = 0;
 
-        model.for_each_param_with_grad(leaves, |p, g| {
+        model.for_each_param_mut(|p| {
+            let g = &grads[idx];
             let m_i = &mut m_slices[idx];
             let v_i = &mut v_slices[idx];
             idx += 1;
@@ -104,69 +107,31 @@ impl AdamW {
 
 // ---- gradient clipping ----
 
-/// Compute the global L2 norm across every leaf gradient. If it exceeds
-/// `max_norm`, scale every gradient cell by `max_norm / global_norm` so the
-/// post-clip norm equals `max_norm` exactly. Returns the pre-clip norm so
-/// callers can log it.
+/// Compute the global L2 norm across a collected gradient slice. If it
+/// exceeds `max_norm`, rescale every cell in place so the post-clip norm
+/// equals `max_norm` exactly. Returns the pre-clip norm.
 ///
-/// Operates on the leaf grad cells directly via `Tape::write_grad`. Must be
-/// called AFTER `tape.backward(loss.id)` and BEFORE the optimiser step.
-pub fn clip_grad_norm(leaves: &ModelLeaves<'_>, max_norm: f32) -> f32 {
-    // Pass 1: compute global squared L2 norm.
+/// Used by the batched training path: after gradients are averaged across
+/// the batch, this clips them once before the optimiser step. The shape of
+/// the slice doesn't matter to this function - it walks the flat data.
+pub fn clip_grad_norm_tensors(grads: &mut [Tensor], max_norm: f32) -> f32 {
     let mut sum_sq: f32 = 0.0;
-    let mut accum = |g: &Tensor| {
+    for g in grads.iter() {
         for &v in &g.data {
             sum_sq += v * v;
         }
-    };
-    accum(&leaves.token_embed.grad());
-    accum(&leaves.pos_embed.grad());
-    for lb in &leaves.blocks {
-        for lh in &lb.heads {
-            accum(&lh.w_q.grad());
-            accum(&lh.w_k.grad());
-            accum(&lh.w_v.grad());
-            accum(&lh.w_o.grad());
-        }
-        accum(&lb.ffn_gate_w.grad());
-        accum(&lb.ffn_up_w.grad());
-        accum(&lb.ffn_down_w.grad());
     }
-    accum(&leaves.lm_head.grad());
-
     let total_norm = sum_sq.sqrt();
     if total_norm <= max_norm || total_norm == 0.0 {
         return total_norm;
     }
-
-    // Pass 2: rescale every leaf grad cell in place.
     let scale = max_norm / total_norm;
-    rescale_leaf_grad(leaves.token_embed, scale);
-    rescale_leaf_grad(leaves.pos_embed, scale);
-    for lb in &leaves.blocks {
-        for lh in &lb.heads {
-            rescale_leaf_grad(lh.w_q, scale);
-            rescale_leaf_grad(lh.w_k, scale);
-            rescale_leaf_grad(lh.w_v, scale);
-            rescale_leaf_grad(lh.w_o, scale);
+    for g in grads.iter_mut() {
+        for v in g.data.iter_mut() {
+            *v *= scale;
         }
-        rescale_leaf_grad(lb.ffn_gate_w, scale);
-        rescale_leaf_grad(lb.ffn_up_w, scale);
-        rescale_leaf_grad(lb.ffn_down_w, scale);
     }
-    rescale_leaf_grad(leaves.lm_head, scale);
-
     total_norm
-}
-
-/// Rescale a leaf's gradient in place by `scale`. Uses `Tape::write_grad` so
-/// `optim` doesn't need direct access to the inner `RefCell`.
-fn rescale_leaf_grad(var: Var<'_>, scale: f32) {
-    let mut g = var.grad();
-    for v in &mut g.data {
-        *v *= scale;
-    }
-    var.tape.write_grad(var.id, g);
 }
 
 // ---- cosine LR schedule with warmup ----
@@ -227,6 +192,31 @@ mod tests {
         logits.cross_entropy(targets).value().data[0]
     }
 
+    /// Run forward + backward once and collect every leaf gradient into a
+    /// `Vec<Tensor>` in canonical visitor order. Used by the optim tests
+    /// after the leaf-driven helpers were retired in favour of the
+    /// tensor-driven path.
+    fn collect_grads(model: &Model, ids: &[usize], targets: &[usize]) -> Vec<Tensor> {
+        let tape = Tape::new();
+        let leaves = model.register_leaves(&tape);
+        let logits = model.forward(&leaves, ids);
+        let loss = logits.cross_entropy(targets);
+        tape.backward(loss.id);
+        let mut grads = Vec::new();
+        model.for_each_grad(&leaves, |g| grads.push(g.clone()));
+        grads
+    }
+
+    fn norm_of(grads: &[Tensor]) -> f32 {
+        let mut sum_sq = 0.0_f32;
+        for g in grads {
+            for &v in &g.data {
+                sum_sq += v * v;
+            }
+        }
+        sum_sq.sqrt()
+    }
+
     #[test]
     fn adamw_step_decreases_loss_on_a_fixed_window() {
         // Small model, fixed window, tame LR + small weight decay so the test
@@ -244,16 +234,12 @@ mod tests {
 
         let mut min_seen = l0;
         for _ in 0..150 {
-            let tape = Tape::new();
-            let leaves = model.register_leaves(&tape);
-            let logits = model.forward(&leaves, &ids);
-            let loss = logits.cross_entropy(&targets);
-            let lv = loss.value().data[0];
+            let lv = loss_on(&model, &ids, &targets);
             if lv < min_seen {
                 min_seen = lv;
             }
-            tape.backward(loss.id);
-            opt.step(&mut model, &leaves);
+            let grads = collect_grads(&model, &ids, &targets);
+            opt.step_with_grads(&mut model, &grads);
         }
 
         // STE training is noisy step-to-step; assert "best loss seen during
@@ -270,23 +256,12 @@ mod tests {
     fn clip_grad_norm_caps_at_max_when_above_threshold() {
         let cfg = tiny_config();
         let model = Model::new(&cfg, 0);
-        let tape = Tape::new();
-        let leaves = model.register_leaves(&tape);
+        let mut grads = collect_grads(&model, &[1, 2, 3, 4], &[2, 3, 4, 5]);
 
-        let logits = model.forward(&leaves, &[1, 2, 3, 4]);
-        let loss = logits.cross_entropy(&[2, 3, 4, 5]);
-        tape.backward(loss.id);
-
-        let pre = clip_grad_norm(&leaves, 0.1);
+        let pre = clip_grad_norm_tensors(&mut grads, 0.1);
         assert!(pre > 0.0);
 
-        let mut post_sq = 0.0_f32;
-        model.for_each_grad(&leaves, |g| {
-            for &v in &g.data {
-                post_sq += v * v;
-            }
-        });
-        let post = post_sq.sqrt();
+        let post = norm_of(&grads);
         assert!(
             (post - 0.1).abs() < 1e-3,
             "post-clip norm {} not close to 0.1 (pre = {})",
@@ -299,32 +274,14 @@ mod tests {
     fn clip_grad_norm_noop_when_already_under_cap() {
         let cfg = tiny_config();
         let model = Model::new(&cfg, 0);
-        let tape = Tape::new();
-        let leaves = model.register_leaves(&tape);
+        let mut grads = collect_grads(&model, &[1, 2, 3, 4], &[2, 3, 4, 5]);
 
-        let logits = model.forward(&leaves, &[1, 2, 3, 4]);
-        let loss = logits.cross_entropy(&[2, 3, 4, 5]);
-        tape.backward(loss.id);
-
-        let mut pre_sq = 0.0_f32;
-        model.for_each_grad(&leaves, |g| {
-            for &v in &g.data {
-                pre_sq += v * v;
-            }
-        });
-        let pre = pre_sq.sqrt();
-
+        let pre = norm_of(&grads);
         let big = pre * 10.0;
-        let reported = clip_grad_norm(&leaves, big);
+        let reported = clip_grad_norm_tensors(&mut grads, big);
         assert!((reported - pre).abs() < 1e-5);
 
-        let mut post_sq = 0.0_f32;
-        model.for_each_grad(&leaves, |g| {
-            for &v in &g.data {
-                post_sq += v * v;
-            }
-        });
-        let post = post_sq.sqrt();
+        let post = norm_of(&grads);
         assert!((post - pre).abs() < 1e-4);
     }
 
