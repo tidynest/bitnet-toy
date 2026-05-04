@@ -32,6 +32,27 @@ pub fn chained_matmul<T: MatMul>(a: &T, b: &T, c: &T) -> T {
     a.matmul(b).matmul(c)
 }
 
+/// Generic SwiGLU FFN forward pass, written against the trait surface.
+/// Same math as the autograd `ffn::ffn` (LLaMA / BitNet b1.58 form):
+///
+///     gate = silu(x @ W_gate)
+///     up   = x @ W_up
+///     h    = gate * up
+///     y    = h @ W_down
+///
+/// Compiles for any backend `T` that implements the trait set. No
+/// BitNet quantisation in this Phase 2 path; Phase 4 adds GPU autograd
+/// + quant kernels and wires this into training.
+#[allow(dead_code)]
+pub fn ffn_inference<T>(x: &T, w_gate: &T, w_up: &T, w_down: &T) -> T
+where
+    T: MatMul + Silu + Mul,
+{
+    let gate = x.matmul(w_gate).silu();
+    let up = x.matmul(w_up);
+    gate.mul(&up).matmul(w_down)
+}
+
 /// Generic forward pass for one attention head, written purely against
 /// the trait surface declared below. Compiles for any backend `T` that
 /// implements the full op set; `Tensor` and `CudaTensor` both do.
@@ -129,6 +150,19 @@ pub trait CausalMask {
 /// rotated by angle `pos * 10000^(-2i / head_dim)`. Parameter-free.
 pub trait Rope {
     fn rope(&self) -> Self;
+}
+
+/// Sigmoid Linear Unit activation: `silu(x) = x / (1 + exp(-x))`.
+/// Smooth, differentiable everywhere; the activation function used by
+/// SwiGLU's gate branch.
+pub trait Silu {
+    fn silu(&self) -> Self;
+}
+
+/// Elementwise multiply: `out[i] = self[i] * rhs[i]`. Shapes must match.
+/// Used by SwiGLU's gate * up step inside the FFN.
+pub trait Mul {
+    fn mul(&self, rhs: &Self) -> Self;
 }
 
 #[cfg(test)]

@@ -623,6 +623,23 @@ impl Tensor {
         }
     }
 
+    /// Sigmoid Linear Unit activation: `silu(x) = x / (1 + exp(-x))`.
+    /// Smooth, differentiable everywhere. Used as SwiGLU's gate branch.
+    pub fn silu(&self) -> Tensor {
+        let data = self
+            .data
+            .iter()
+            .map(|&x| {
+                let sig = 1.0_f32 / (1.0 + (-x).exp());
+                x * sig
+            })
+            .collect();
+        Tensor {
+            data,
+            shape: self.shape.clone(),
+        }
+    }
+
     /// Rotary Position Embedding (RoPE). Input shape `[seq, head_dim]`;
     /// `head_dim` must be even. For each `(pos, i)` rotates the 2-D
     /// vector `(x[pos, 2i], x[pos, 2i+1])` by `pos * 10000^(-2i/head_dim)`.
@@ -696,6 +713,18 @@ impl crate::device::CausalMask for Tensor {
 impl crate::device::Rope for Tensor {
     fn rope(&self) -> Self {
         Tensor::rope(self)
+    }
+}
+
+impl crate::device::Silu for Tensor {
+    fn silu(&self) -> Self {
+        Tensor::silu(self)
+    }
+}
+
+impl crate::device::Mul for Tensor {
+    fn mul(&self, rhs: &Self) -> Self {
+        Tensor::mul(self, rhs)
     }
 }
 

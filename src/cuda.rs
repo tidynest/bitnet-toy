@@ -142,6 +142,28 @@ extern "C" __global__ void rope_f32(
     out[pos * head_dim + 2 * pair]     = a * c - b * s;
     out[pos * head_dim + 2 * pair + 1] = a * s + b * c;
 }
+
+extern "C" __global__ void silu_f32(
+    const float* __restrict__ x,
+    float* __restrict__ out,
+    int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    float v = x[idx];
+    float sig = 1.0f / (1.0f + expf(-v));
+    out[idx] = v * sig;
+}
+
+extern "C" __global__ void mul_f32(
+    const float* __restrict__ a,
+    const float* __restrict__ b,
+    float* __restrict__ out,
+    int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) out[idx] = a[idx] * b[idx];
+}
 "#;
 
 #[cfg(test)]
@@ -199,13 +221,15 @@ pub struct CudaContextHolder {
     pub stream: Arc<CudaStream>,
     pub blas: CudaBlas,
 
-    /// Phase 2.2 op kernels (compiled together from `KERNELS_SRC`):
+    /// Phase 2.2 / 2.3 op kernels (compiled together from `KERNELS_SRC`):
     pub add_fn: CudaFunction,
     pub mul_scalar_fn: CudaFunction,
     pub transpose_2d_fn: CudaFunction,
     pub causal_mask_fn: CudaFunction,
     pub softmax_row_fn: CudaFunction,
     pub rope_fn: CudaFunction,
+    pub silu_fn: CudaFunction,
+    pub mul_fn: CudaFunction,
 
     /// Hand-rolled tile-based GEMM kernel from `MATMUL_KERNEL_SRC`.
     /// Test-only - the production matmul path uses cuBLAS sgemm (much
@@ -250,6 +274,8 @@ pub fn cuda_state() -> Result<&'static CudaContextHolder, String> {
         let causal_mask_fn = load("causal_mask_f32")?;
         let softmax_row_fn = load("softmax_row_f32")?;
         let rope_fn = load("rope_f32")?;
+        let silu_fn = load("silu_f32")?;
+        let mul_fn = load("mul_f32")?;
 
         #[cfg(test)]
         let matmul_fn = {
@@ -272,6 +298,8 @@ pub fn cuda_state() -> Result<&'static CudaContextHolder, String> {
             causal_mask_fn,
             softmax_row_fn,
             rope_fn,
+            silu_fn,
+            mul_fn,
             #[cfg(test)]
             matmul_fn,
         })
@@ -589,6 +617,58 @@ impl crate::device::Softmax for CudaTensor {
     }
 }
 
+impl crate::device::Silu for CudaTensor {
+    fn silu(&self) -> Self {
+        let s = cuda_state().expect("cuda_state failed");
+        let n = self.data.len();
+        let n_i = i32::try_from(n).expect("n exceeds i32");
+        let mut out = s.stream.alloc_zeros::<f32>(n).expect("alloc_zeros failed");
+        let cfg = LaunchConfig {
+            grid_dim: ((n_i as u32).div_ceil(256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut l = s.stream.launch_builder(&s.silu_fn);
+        l.arg(&self.data);
+        l.arg(&mut out);
+        l.arg(&n_i);
+        // Safety: signature (const float*, float*, int) matches the
+        // three args; both buffers sized n.
+        unsafe { l.launch(cfg) }.expect("silu_f32 launch failed");
+        s.stream.synchronize().expect("synchronize failed");
+        Self { data: out, shape: self.shape.clone() }
+    }
+}
+
+impl crate::device::Mul for CudaTensor {
+    fn mul(&self, rhs: &Self) -> Self {
+        assert_eq!(
+            self.shape, rhs.shape,
+            "mul: shape mismatch: {:?} vs {:?}", self.shape, rhs.shape
+        );
+        let s = cuda_state().expect("cuda_state failed");
+        let n = self.data.len();
+        let n_i = i32::try_from(n).expect("n exceeds i32");
+        let mut out = s.stream.alloc_zeros::<f32>(n).expect("alloc_zeros failed");
+        let cfg = LaunchConfig {
+            grid_dim: ((n_i as u32).div_ceil(256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut l = s.stream.launch_builder(&s.mul_fn);
+        l.arg(&self.data);
+        l.arg(&rhs.data);
+        l.arg(&mut out);
+        l.arg(&n_i);
+        // Safety: signature (const float*, const float*, float*, int)
+        // matches the four args; output sized n; lhs / rhs both sized n
+        // (asserted above).
+        unsafe { l.launch(cfg) }.expect("mul_f32 launch failed");
+        s.stream.synchronize().expect("synchronize failed");
+        Self { data: out, shape: self.shape.clone() }
+    }
+}
+
 impl crate::device::Rope for CudaTensor {
     fn rope(&self) -> Self {
         assert_eq!(self.shape.len(), 2, "rope: rank-2 only, got {:?}", self.shape);
@@ -635,7 +715,9 @@ pub fn cuda_matmul(lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::device::{Add, CausalMask, MatMul, MulScalar, Rope, Softmax, Transpose2D};
+    use crate::device::{
+        Add, CausalMask, MatMul, Mul, MulScalar, Rope, Silu, Softmax, Transpose2D,
+    };
 
     /// Maximum acceptable absolute error per cell from a CPU-vs-CUDA
     /// matmul. Parallel reduction across thread blocks reorders the
@@ -926,6 +1008,80 @@ mod tests {
             assert!(
                 abs <= 1e-3 + 1e-3 * c.abs(),
                 "rope drift at idx {i}: cpu = {c}, cuda = {g}"
+            );
+        }
+    }
+
+    #[test]
+    fn silu_cpu_vs_cuda_matches() {
+        if cuda_state().is_err() {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        }
+        let a = random_tensor(13, 19, 0.7);
+        let cpu = <Tensor as Silu>::silu(&a);
+        let gpu = CudaTensor::from_cpu(&a)
+            .unwrap()
+            .silu()
+            .to_cpu()
+            .unwrap();
+        assert_close(&gpu, &cpu);
+    }
+
+    #[test]
+    fn mul_cpu_vs_cuda_matches() {
+        if cuda_state().is_err() {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        }
+        let a = random_tensor(11, 17, 0.8);
+        let b = random_tensor(11, 17, 0.9);
+        let cpu = <Tensor as Mul>::mul(&a, &b);
+        let gpu = CudaTensor::from_cpu(&a)
+            .unwrap()
+            .mul(&CudaTensor::from_cpu(&b).unwrap())
+            .to_cpu()
+            .unwrap();
+        assert_close(&gpu, &cpu);
+    }
+
+    /// **The headline test of Chunk 2.3.** Matches the Chunk 2.2
+    /// attention test in spirit: the same generic `ffn_inference<T>`
+    /// runs on both backends and the outputs agree within tolerance.
+    /// SwiGLU layout: gate_w, up_w map `[hidden, ffn]`; down_w maps
+    /// `[ffn, hidden]`. Tolerance is the same `1e-3` chained-op
+    /// budget as the attention test.
+    #[test]
+    fn ffn_inference_cpu_vs_cuda_matches() {
+        if cuda_state().is_err() {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        }
+        use crate::device::ffn_inference;
+        let seq = 16usize;
+        let hidden = 32usize;
+        let ffn = 64usize;
+
+        let x = random_tensor(seq, hidden, 2.0);
+        let w_gate = random_tensor(hidden, ffn, 2.1);
+        let w_up = random_tensor(hidden, ffn, 2.2);
+        let w_down = random_tensor(ffn, hidden, 2.3);
+
+        let cpu_out = ffn_inference::<Tensor>(&x, &w_gate, &w_up, &w_down);
+        let x_g = CudaTensor::from_cpu(&x).unwrap();
+        let g_g = CudaTensor::from_cpu(&w_gate).unwrap();
+        let u_g = CudaTensor::from_cpu(&w_up).unwrap();
+        let d_g = CudaTensor::from_cpu(&w_down).unwrap();
+        let gpu_out = ffn_inference::<CudaTensor>(&x_g, &g_g, &u_g, &d_g)
+            .to_cpu()
+            .unwrap();
+
+        assert_eq!(cpu_out.shape, gpu_out.shape, "ffn output shape mismatch");
+        for (i, (&c, &g)) in cpu_out.data.iter().zip(&gpu_out.data).enumerate() {
+            let abs = (c - g).abs();
+            assert!(
+                abs <= 1e-3 + 1e-3 * c.abs(),
+                "ffn drift at idx {i}: cpu = {c}, cuda = {g}"
             );
         }
     }
