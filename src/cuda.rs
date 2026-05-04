@@ -173,6 +173,362 @@ extern "C" __global__ void mul_f32(
     if (idx < n) out[idx] = a[idx] * b[idx];
 }
 
+// Phase 4 chunk 4.2 SiLU backward. Per-cell:
+//   sig    = 1 / (1 + exp(-x))
+//   dsilu  = sig * (1 + x * (1 - sig))
+//   out[i] = grad_y[i] * dsilu(x[i])
+// Matches the CPU `Tensor::silu_backward` cell-for-cell. One thread per
+// element; same launch shape as forward `silu_f32`.
+extern "C" __global__ void silu_backward_f32(
+    const float* __restrict__ grad_y,
+    const float* __restrict__ x,
+    float* __restrict__ out,
+    int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    float xv = x[idx];
+    float sig = 1.0f / (1.0f + expf(-xv));
+    float dsilu = sig * (1.0f + xv * (1.0f - sig));
+    out[idx] = grad_y[idx] * dsilu;
+}
+
+// Phase 4 chunk 4.3 softmax backward. Per-row:
+//   dot_i         = sum_k grad_y[i, k] * s[i, k]
+//   grad_in[i, j] = s[i, j] * (grad_y[i, j] - dot_i)
+// `s` is the saved softmax forward output (autograd.rs:618-621). One
+// thread per row, matching forward `softmax_row_f32`'s launch shape.
+// Two sequential passes (compute dot, then per-cell update) trade
+// intra-row parallelism for kernel simplicity at the model's seq_len
+// (<= 128 v0.13, <= 128 shakespeare-large).
+extern "C" __global__ void softmax_backward_row_f32(
+    const float* __restrict__ grad_y,
+    const float* __restrict__ s,
+    float* __restrict__ out,
+    int m, int n)
+{
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= m) return;
+    const float* gr = grad_y + row * n;
+    const float* sr = s + row * n;
+    float* or_ = out + row * n;
+
+    float dot = 0.0f;
+    for (int k = 0; k < n; ++k) dot += gr[k] * sr[k];
+    for (int j = 0; j < n; ++j) or_[j] = sr[j] * (gr[j] - dot);
+}
+
+// Phase 4 chunk 4.3 causal-mask backward. Lower triangle (j <= i)
+// passes through unchanged; upper triangle is zeroed (the forward
+// overwrote those cells with -inf, contributing no gradient). No saved
+// tensor: the mask pattern is shape-determined. Same 2-D 16x16 launch
+// shape as forward `causal_mask_f32`.
+extern "C" __global__ void causal_mask_backward_f32(
+    const float* __restrict__ grad_y,
+    float* __restrict__ out,
+    int m, int n)
+{
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+    if (i < m && j < n) {
+        out[i * n + j] = (j > i) ? 0.0f : grad_y[i * n + j];
+    }
+}
+
+// Phase 4 chunk 4.4 RMSNorm backward. Per-row formula:
+//   inv_rms_i  = 1 / sqrt(mean_j(x_saved[i, j]^2) + EPS)
+//   dot_i      = sum_j x_saved[i, j] * grad_y[i, j]
+//   factor_i   = dot_i * inv_rms_i^3 / n
+//   grad_in[i, j] = grad_y[i, j] * inv_rms_i - x_saved[i, j] * factor_i
+// EPS = 1e-5 matches the CPU helper exactly. One thread per row -
+// same launch shape as forward `rmsnorm_row_f32`. Three sequential
+// passes per row (mean_sq, dot, then per-cell update) keep the
+// kernel simple at v0.13 hidden_dim 192 / shakespeare-large
+// hidden_dim 256.
+extern "C" __global__ void rmsnorm_backward_row_f32(
+    const float* __restrict__ grad_y,
+    const float* __restrict__ x_saved,
+    float* __restrict__ out,
+    int m, int n)
+{
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= m) return;
+    const float* gr = grad_y + row * n;
+    const float* xr = x_saved + row * n;
+    float* or_ = out + row * n;
+
+    float sum_sq = 0.0f;
+    float dot = 0.0f;
+    for (int j = 0; j < n; ++j) {
+        float xv = xr[j];
+        sum_sq += xv * xv;
+        dot += xv * gr[j];
+    }
+    float inv_rms = 1.0f / sqrtf(sum_sq / (float)n + 1.0e-5f);
+    float factor = dot * inv_rms * inv_rms * inv_rms / (float)n;
+    for (int j = 0; j < n; ++j) {
+        or_[j] = gr[j] * inv_rms - xr[j] * factor;
+    }
+}
+
+// Phase 5.a absmean-ternary weight quant, STE forward. Per-tensor
+// gamma = mean(|W|); output = clamp(round(W/(gamma+eps)), -1, +1) * gamma.
+// Two-stage: (1) per-row partial-sum-of-abs into a scratch [m] buffer
+// (one thread per row, simple per-row reduction over n); (2) per-cell
+// quant + scale-back using the partial sums (one thread per cell, reads
+// scratch + computes gamma = sum(scratch)/total). Stage 2 redundantly
+// computes gamma in every thread, which costs a scalar-divide per cell -
+// trivial vs the kernel-launch cost we'd pay to do a separate scalar
+// reduction. Matches `Tensor::quantise_weights_ste` byte-for-byte.
+extern "C" __global__ void quantise_weights_ste_partial_abs_sum_f32(
+    const float* __restrict__ w,
+    float* __restrict__ row_abs_sum,
+    int m, int n)
+{
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= m) return;
+    const float* wr = w + row * n;
+    float s = 0.0f;
+    for (int j = 0; j < n; ++j) s += fabsf(wr[j]);
+    row_abs_sum[row] = s;
+}
+
+extern "C" __global__ void quantise_weights_ste_apply_f32(
+    const float* __restrict__ w,
+    const float* __restrict__ row_abs_sum,
+    float* __restrict__ out,
+    int m, int n)
+{
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+    if (i >= m || j >= n) return;
+    // gamma = total_abs / (m * n); (gamma + eps) divides forward, then
+    // round + clamp to {-1, 0, +1}, then multiply back by gamma.
+    float total_abs = 0.0f;
+    for (int r = 0; r < m; ++r) total_abs += row_abs_sum[r];
+    float gamma = total_abs / (float)(m * n);
+    float denom = gamma + 1.0e-5f;
+    float v = w[i * n + j] / denom;
+    float q = roundf(v);
+    if (q < -1.0f) q = -1.0f;
+    else if (q > 1.0f) q = 1.0f;
+    out[i * n + j] = q * gamma;
+}
+
+// Phase 5.a absmax-INT8 per-row activation quant, STE forward.
+// Per row: alpha = max_j |x[i, j]|; x_q = clamp(round(x * 127/alpha),
+// -128, +127); out = (alpha/127) * x_q. Edge case: alpha = 0 yields
+// out = 0 directly (no NaN). Two-stage: (1) per-row absmax into [m]
+// buffer (one thread per row); (2) per-cell apply (one thread per
+// cell). Matches `Tensor::quantise_acts_ste` byte-for-byte.
+extern "C" __global__ void quantise_acts_ste_row_absmax_f32(
+    const float* __restrict__ x,
+    float* __restrict__ row_max,
+    int m, int n)
+{
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= m) return;
+    const float* xr = x + row * n;
+    float a = 0.0f;
+    for (int j = 0; j < n; ++j) {
+        float v = fabsf(xr[j]);
+        if (v > a) a = v;
+    }
+    row_max[row] = a;
+}
+
+extern "C" __global__ void quantise_acts_ste_apply_f32(
+    const float* __restrict__ x,
+    const float* __restrict__ row_max,
+    float* __restrict__ out,
+    int m, int n)
+{
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+    if (i >= m || j >= n) return;
+    float a = row_max[i];
+    if (a == 0.0f) {
+        out[i * n + j] = 0.0f;
+        return;
+    }
+    float scale_to_int = 127.0f / a;
+    float v = x[i * n + j] * scale_to_int;
+    float q = roundf(v);
+    if (q < -128.0f) q = -128.0f;
+    else if (q > 127.0f) q = 127.0f;
+    float row_dequant = a * (1.0f / 127.0f);
+    out[i * n + j] = q * row_dequant;
+}
+
+// Phase 5.b: int8 BitLinear forward. Three new kernels feed the
+// cublasGemmEx int8 GEMM path:
+//
+//   1. `quantise_weights_int8_partial_abs_sum` - same per-row abs sum
+//      reduction as the Phase 5.a version. Reused.
+//   2. `quantise_weights_int8_apply` - same shape as Phase 5.a's apply
+//      kernel but writes int8 (ternary {-1, 0, +1}) and a single-cell
+//      gamma scalar instead of a dequantised f32 tensor.
+//   3. `quantise_acts_int8_row_absmax` - same per-row absmax as
+//      Phase 5.a. Reused.
+//   4. `quantise_acts_int8_apply` - writes int8 in [-128, 127] +
+//      keeps alpha[m] as a separate f32 buffer.
+//   5. `scale_int32_to_f32` - the dequantisation step after the
+//      int8 GEMM: y[i, j] = c_int[i, j] * (alpha[i] * gamma / 127).
+//
+// The reductions are reused from Phase 5.a (same layout, same math);
+// only the apply kernels and the scale kernel are new.
+
+// Per-cell apply for ternary weight quant, int8 output. `gamma_out`
+// is a single-element f32 buffer (written redundantly by every
+// thread - same trick the Phase 5.a apply kernel uses; one divide
+// per cell, trivial vs a separate scalar reduction kernel).
+extern "C" __global__ void quantise_weights_int8_apply_f32(
+    const float* __restrict__ w,
+    const float* __restrict__ row_abs_sum,
+    signed char* __restrict__ w_q_out,
+    float* __restrict__ gamma_out,
+    int m, int n)
+{
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+    if (i >= m || j >= n) return;
+    float total_abs = 0.0f;
+    for (int r = 0; r < m; ++r) total_abs += row_abs_sum[r];
+    float gamma = total_abs / (float)(m * n);
+    float denom = gamma + 1.0e-5f;
+    float v = w[i * n + j] / denom;
+    float q = roundf(v);
+    if (q < -1.0f) q = -1.0f;
+    else if (q > 1.0f) q = 1.0f;
+    w_q_out[i * n + j] = (signed char)((int)q);
+    if (i == 0 && j == 0) {
+        gamma_out[0] = gamma;
+    }
+}
+
+// Per-cell apply for activation INT8 quant. Writes raw int8 values
+// in [-128, 127] (no dequant); the Phase 5.b BitLinear path scales
+// the int32 GEMM output by alpha[i] * gamma / 127 in a separate
+// kernel.
+extern "C" __global__ void quantise_acts_int8_apply_f32(
+    const float* __restrict__ x,
+    const float* __restrict__ row_max,
+    signed char* __restrict__ x_q_out,
+    int m, int n)
+{
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+    if (i >= m || j >= n) return;
+    float a = row_max[i];
+    if (a == 0.0f) {
+        x_q_out[i * n + j] = 0;
+        return;
+    }
+    float scale_to_int = 127.0f / a;
+    float v = x[i * n + j] * scale_to_int;
+    float q = roundf(v);
+    if (q < -128.0f) q = -128.0f;
+    else if (q > 127.0f) q = 127.0f;
+    x_q_out[i * n + j] = (signed char)((int)q);
+}
+
+// Phase 5.b: dequantise the int32 cublasGemmEx output back to f32.
+// y[i, j] = c_int[i, j] * (alpha[i] * gamma_scalar / 127).
+// One thread per output cell; alpha is a [m] buffer, gamma is a
+// 1-element buffer read once per thread.
+extern "C" __global__ void scale_int32_to_f32(
+    const int* __restrict__ c_int,
+    const float* __restrict__ alpha,
+    const float* __restrict__ gamma,
+    float* __restrict__ out,
+    int m, int n)
+{
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+    if (i >= m || j >= n) return;
+    float row_scale = alpha[i] * gamma[0] * (1.0f / 127.0f);
+    out[i * n + j] = (float)c_int[i * n + j] * row_scale;
+}
+
+// Phase 4 chunk 4.5.d softmax + cross-entropy fused forward. Per-row
+// (one thread per row): subtract-max log-sum-exp softmax + per-row
+// loss `-(logits[target] - log_denom)`. Writes softmax_out [seq, vocab]
+// and per_row_loss [seq]. The CPU caller averages per_row_loss after
+// D->H (one f32 sum is far cheaper than fighting GPU atomic-add).
+extern "C" __global__ void cross_entropy_softmax_loss_f32(
+    const float* __restrict__ logits,
+    const int*   __restrict__ targets,
+    float* __restrict__ softmax_out,
+    float* __restrict__ per_row_loss,
+    int seq, int vocab)
+{
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= seq) return;
+    const float* lr = logits + row * vocab;
+    float* sr = softmax_out + row * vocab;
+
+    float row_max = -INFINITY;
+    for (int j = 0; j < vocab; ++j) {
+        float v = lr[j];
+        if (v > row_max) row_max = v;
+    }
+    float denom = 0.0f;
+    for (int j = 0; j < vocab; ++j) {
+        float e = expf(lr[j] - row_max);
+        sr[j] = e;
+        denom += e;
+    }
+    float log_denom = row_max + logf(denom);
+    float inv = 1.0f / denom;
+    for (int j = 0; j < vocab; ++j) sr[j] *= inv;
+    int t = targets[row];
+    per_row_loss[row] = -(lr[t] - log_denom);
+}
+
+// Phase 4 chunk 4.5.d cross-entropy backward. Per-cell:
+//   grad_logits[i, j] = (softmax_saved[i, j] - (j == targets[i] ? 1.0 : 0.0)) / seq
+// 2-D 16x16 launch: one thread per (row, col). seq is read from an
+// argument so the kernel does not need a separate pre-divided inv_seq.
+extern "C" __global__ void cross_entropy_backward_f32(
+    const float* __restrict__ softmax_saved,
+    const int*   __restrict__ targets,
+    float* __restrict__ grad_logits,
+    int seq, int vocab)
+{
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+    if (i >= seq || j >= vocab) return;
+    float s = softmax_saved[i * vocab + j];
+    float v = (j == targets[i]) ? (s - 1.0f) : s;
+    grad_logits[i * vocab + j] = v / (float)seq;
+}
+
+// Phase 4 chunk 4.4 RoPE backward. Inverse rotation per (pos, pair):
+// same trig table as forward, sign of `sin` flipped because each
+// per-pair rotation is orthogonal:
+//   grad_in[pos, 2i]   =  grad_y[pos, 2i]   * cos + grad_y[pos, 2i+1] * sin
+//   grad_in[pos, 2i+1] = -grad_y[pos, 2i]   * sin + grad_y[pos, 2i+1] * cos
+// No saved tensor: angles are shape-determined. Same 2-D launch
+// shape as forward `rope_f32` (one thread per (pos, pair) pair).
+extern "C" __global__ void rope_backward_f32(
+    const float* __restrict__ grad_y,
+    float* __restrict__ out,
+    int seq, int head_dim)
+{
+    int pair = blockIdx.x * blockDim.x + threadIdx.x;
+    int pos = blockIdx.y * blockDim.y + threadIdx.y;
+    int half = head_dim / 2;
+    if (pair >= half || pos >= seq) return;
+    float theta_i = powf(10000.0f, -(2.0f * (float)pair) / (float)head_dim);
+    float angle = (float)pos * theta_i;
+    float c = cosf(angle);
+    float s = sinf(angle);
+    float ga = grad_y[pos * head_dim + 2 * pair];
+    float gb = grad_y[pos * head_dim + 2 * pair + 1];
+    out[pos * head_dim + 2 * pair]     =  ga * c + gb * s;
+    out[pos * head_dim + 2 * pair + 1] = -ga * s + gb * c;
+}
+
 extern "C" __global__ void rmsnorm_row_f32(
     const float* __restrict__ x,
     float* __restrict__ out,
@@ -262,8 +618,22 @@ pub struct CudaContextHolder {
     pub softmax_row_fn: CudaFunction,
     pub rope_fn: CudaFunction,
     pub silu_fn: CudaFunction,
+    pub silu_backward_fn: CudaFunction,
     pub mul_fn: CudaFunction,
     pub rmsnorm_row_fn: CudaFunction,
+    pub softmax_backward_row_fn: CudaFunction,
+    pub causal_mask_backward_fn: CudaFunction,
+    pub rmsnorm_backward_row_fn: CudaFunction,
+    pub rope_backward_fn: CudaFunction,
+    pub cross_entropy_softmax_loss_fn: CudaFunction,
+    pub cross_entropy_backward_fn: CudaFunction,
+    pub quantise_weights_partial_abs_sum_fn: CudaFunction,
+    pub quantise_weights_apply_fn: CudaFunction,
+    pub quantise_acts_row_absmax_fn: CudaFunction,
+    pub quantise_acts_apply_fn: CudaFunction,
+    pub quantise_weights_int8_apply_fn: CudaFunction,
+    pub quantise_acts_int8_apply_fn: CudaFunction,
+    pub scale_int32_to_f32_fn: CudaFunction,
 
     /// Hand-rolled tile-based GEMM kernel from `MATMUL_KERNEL_SRC`.
     /// Test-only - the production matmul path uses cuBLAS sgemm (much
@@ -309,8 +679,23 @@ pub fn cuda_state() -> Result<&'static CudaContextHolder, String> {
         let softmax_row_fn = load("softmax_row_f32")?;
         let rope_fn = load("rope_f32")?;
         let silu_fn = load("silu_f32")?;
+        let silu_backward_fn = load("silu_backward_f32")?;
         let mul_fn = load("mul_f32")?;
         let rmsnorm_row_fn = load("rmsnorm_row_f32")?;
+        let softmax_backward_row_fn = load("softmax_backward_row_f32")?;
+        let causal_mask_backward_fn = load("causal_mask_backward_f32")?;
+        let rmsnorm_backward_row_fn = load("rmsnorm_backward_row_f32")?;
+        let rope_backward_fn = load("rope_backward_f32")?;
+        let cross_entropy_softmax_loss_fn = load("cross_entropy_softmax_loss_f32")?;
+        let cross_entropy_backward_fn = load("cross_entropy_backward_f32")?;
+        let quantise_weights_partial_abs_sum_fn =
+            load("quantise_weights_ste_partial_abs_sum_f32")?;
+        let quantise_weights_apply_fn = load("quantise_weights_ste_apply_f32")?;
+        let quantise_acts_row_absmax_fn = load("quantise_acts_ste_row_absmax_f32")?;
+        let quantise_acts_apply_fn = load("quantise_acts_ste_apply_f32")?;
+        let quantise_weights_int8_apply_fn = load("quantise_weights_int8_apply_f32")?;
+        let quantise_acts_int8_apply_fn = load("quantise_acts_int8_apply_f32")?;
+        let scale_int32_to_f32_fn = load("scale_int32_to_f32")?;
 
         #[cfg(test)]
         let matmul_fn = {
@@ -334,8 +719,22 @@ pub fn cuda_state() -> Result<&'static CudaContextHolder, String> {
             softmax_row_fn,
             rope_fn,
             silu_fn,
+            silu_backward_fn,
             mul_fn,
             rmsnorm_row_fn,
+            softmax_backward_row_fn,
+            causal_mask_backward_fn,
+            rmsnorm_backward_row_fn,
+            rope_backward_fn,
+            cross_entropy_softmax_loss_fn,
+            cross_entropy_backward_fn,
+            quantise_weights_partial_abs_sum_fn,
+            quantise_weights_apply_fn,
+            quantise_acts_row_absmax_fn,
+            quantise_acts_apply_fn,
+            quantise_weights_int8_apply_fn,
+            quantise_acts_int8_apply_fn,
+            scale_int32_to_f32_fn,
             #[cfg(test)]
             matmul_fn,
         })
@@ -349,6 +748,26 @@ pub fn cuda_state() -> Result<&'static CudaContextHolder, String> {
 pub struct CudaTensor {
     pub data: CudaSlice<f32>,
     pub shape: Vec<usize>,
+}
+
+/// Deep-copy a `CudaTensor` (alloc + device-to-device memcpy) so two
+/// independent backward branches can flow incoming gradients through
+/// without aliasing the same device buffer. Used by Phase 4 backward
+/// helpers (e.g. `add_backward` returns two clones of grad_c).
+/// Errors from cudarc are panics here, matching the rest of the file's
+/// invariant-style error handling.
+impl Clone for CudaTensor {
+    fn clone(&self) -> Self {
+        let s = cuda_state().expect("cuda_state failed");
+        let new_data = s
+            .stream
+            .clone_dtod(&self.data)
+            .expect("CudaTensor clone (clone_dtod) failed");
+        Self {
+            data: new_data,
+            shape: self.shape.clone(),
+        }
+    }
 }
 
 impl CudaTensor {
@@ -646,6 +1065,67 @@ impl crate::device::Softmax for CudaTensor {
     }
 }
 
+impl crate::device::SoftmaxBackward for CudaTensor {
+    fn softmax_backward(&self, s_out: &Self) -> Self {
+        assert_eq!(
+            self.shape, s_out.shape,
+            "softmax_backward: grad_y / s_out shape mismatch ({:?} vs {:?})",
+            self.shape, s_out.shape,
+        );
+        assert_eq!(self.shape.len(), 2, "softmax_backward: rank-2 only");
+        let s = cuda_state().expect("cuda_state failed");
+        let m = self.shape[0];
+        let n = self.shape[1];
+        let m_i = i32::try_from(m).expect("m exceeds i32");
+        let n_i = i32::try_from(n).expect("n exceeds i32");
+        let mut out = s.stream.alloc_zeros::<f32>(m * n).expect("alloc_zeros failed");
+        let cfg = LaunchConfig {
+            grid_dim: ((m_i as u32).div_ceil(256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut l = s.stream.launch_builder(&s.softmax_backward_row_fn);
+        l.arg(&self.data);
+        l.arg(&s_out.data);
+        l.arg(&mut out);
+        l.arg(&m_i);
+        l.arg(&n_i);
+        // Safety: signature (const float* grad_y, const float* s,
+        // float* out, int m, int n) matches the five args; all three
+        // buffers sized m*n; output freshly allocated above.
+        unsafe { l.launch(cfg) }.expect("softmax_backward_row_f32 launch failed");
+        Self { data: out, shape: vec![m, n] }
+    }
+}
+
+impl crate::device::CausalMaskBackward for CudaTensor {
+    fn causal_mask_backward(&self) -> Self {
+        assert_eq!(self.shape.len(), 2, "causal_mask_backward: rank-2 only");
+        let st = cuda_state().expect("cuda_state failed");
+        let m = self.shape[0];
+        let n = self.shape[1];
+        let m_i = i32::try_from(m).expect("m exceeds i32");
+        let n_i = i32::try_from(n).expect("n exceeds i32");
+        let mut out = st.stream.alloc_zeros::<f32>(m * n).expect("alloc_zeros failed");
+        // 16x16 threads per block matches the forward `causal_mask_f32`
+        // launch shape. One thread per (i, j) output cell.
+        let cfg = LaunchConfig {
+            grid_dim: ((n_i as u32).div_ceil(16), (m_i as u32).div_ceil(16), 1),
+            block_dim: (16, 16, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut l = st.stream.launch_builder(&st.causal_mask_backward_fn);
+        l.arg(&self.data);
+        l.arg(&mut out);
+        l.arg(&m_i);
+        l.arg(&n_i);
+        // Safety: signature (const float* grad_y, float* out, int m,
+        // int n) matches the four args; both buffers sized m*n.
+        unsafe { l.launch(cfg) }.expect("causal_mask_backward_f32 launch failed");
+        Self { data: out, shape: vec![m, n] }
+    }
+}
+
 impl crate::device::Silu for CudaTensor {
     fn silu(&self) -> Self {
         let s = cuda_state().expect("cuda_state failed");
@@ -664,6 +1144,35 @@ impl crate::device::Silu for CudaTensor {
         // Safety: signature (const float*, float*, int) matches the
         // three args; both buffers sized n.
         unsafe { l.launch(cfg) }.expect("silu_f32 launch failed");
+        Self { data: out, shape: self.shape.clone() }
+    }
+}
+
+impl crate::device::SiluBackward for CudaTensor {
+    fn silu_backward(&self, x: &Self) -> Self {
+        assert_eq!(
+            self.shape, x.shape,
+            "silu_backward: grad_y and x shape mismatch ({:?} vs {:?})",
+            self.shape, x.shape,
+        );
+        let s = cuda_state().expect("cuda_state failed");
+        let n = self.data.len();
+        let n_i = i32::try_from(n).expect("n exceeds i32");
+        let mut out = s.stream.alloc_zeros::<f32>(n).expect("alloc_zeros failed");
+        let cfg = LaunchConfig {
+            grid_dim: ((n_i as u32).div_ceil(256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut l = s.stream.launch_builder(&s.silu_backward_fn);
+        l.arg(&self.data);
+        l.arg(&x.data);
+        l.arg(&mut out);
+        l.arg(&n_i);
+        // Safety: signature (const float* grad_y, const float* x,
+        // float* out, int n) matches the four args; all three buffers
+        // sized n; output freshly allocated above.
+        unsafe { l.launch(cfg) }.expect("silu_backward_f32 launch failed");
         Self { data: out, shape: self.shape.clone() }
     }
 }
@@ -690,6 +1199,40 @@ impl crate::device::RmsNorm for CudaTensor {
         // Safety: signature (const float*, float*, int, int) matches
         // the four args; both buffers sized m*n.
         unsafe { l.launch(cfg) }.expect("rmsnorm_row_f32 launch failed");
+        Self { data: out, shape: vec![m, n] }
+    }
+}
+
+impl crate::device::RmsNormBackward for CudaTensor {
+    fn rmsnorm_backward(&self, x_saved: &Self) -> Self {
+        assert_eq!(
+            self.shape, x_saved.shape,
+            "rmsnorm_backward: grad_y / x_saved shape mismatch ({:?} vs {:?})",
+            self.shape, x_saved.shape,
+        );
+        assert_eq!(self.shape.len(), 2, "rmsnorm_backward: rank-2 only");
+        let s = cuda_state().expect("cuda_state failed");
+        let m = self.shape[0];
+        let n = self.shape[1];
+        let m_i = i32::try_from(m).expect("m exceeds i32");
+        let n_i = i32::try_from(n).expect("n exceeds i32");
+        let mut out = s.stream.alloc_zeros::<f32>(m * n).expect("alloc_zeros failed");
+        // Same launch shape as forward `rmsnorm_row_f32`: one thread per row.
+        let cfg = LaunchConfig {
+            grid_dim: ((m_i as u32).div_ceil(256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut l = s.stream.launch_builder(&s.rmsnorm_backward_row_fn);
+        l.arg(&self.data);
+        l.arg(&x_saved.data);
+        l.arg(&mut out);
+        l.arg(&m_i);
+        l.arg(&n_i);
+        // Safety: signature (const float* grad_y, const float* x_saved,
+        // float* out, int m, int n) matches the five args; all three
+        // buffers sized m*n; output freshly allocated above.
+        unsafe { l.launch(cfg) }.expect("rmsnorm_backward_row_f32 launch failed");
         Self { data: out, shape: vec![m, n] }
     }
 }
@@ -751,6 +1294,399 @@ impl crate::device::Rope for CudaTensor {
     }
 }
 
+impl crate::device::RopeBackward for CudaTensor {
+    fn rope_backward(&self) -> Self {
+        assert_eq!(self.shape.len(), 2, "rope_backward: rank-2 only");
+        let s = cuda_state().expect("cuda_state failed");
+        let seq = self.shape[0];
+        let head_dim = self.shape[1];
+        assert!(
+            head_dim % 2 == 0,
+            "rope_backward: head_dim ({head_dim}) must be even"
+        );
+        let seq_i = i32::try_from(seq).expect("seq exceeds i32");
+        let hd_i = i32::try_from(head_dim).expect("head_dim exceeds i32");
+        let half_i = hd_i / 2;
+        let mut out = s.stream.alloc_zeros::<f32>(seq * head_dim).expect("alloc_zeros failed");
+        // Same 2-D 16x16 launch shape as forward `rope_f32` - one
+        // thread per (pos, pair).
+        const TILE: u32 = 16;
+        let cfg = LaunchConfig {
+            grid_dim: ((half_i as u32).div_ceil(TILE), (seq_i as u32).div_ceil(TILE), 1),
+            block_dim: (TILE, TILE, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut l = s.stream.launch_builder(&s.rope_backward_fn);
+        l.arg(&self.data);
+        l.arg(&mut out);
+        l.arg(&seq_i);
+        l.arg(&hd_i);
+        // Safety: signature (const float* grad_y, float* out, int seq,
+        // int head_dim) matches the four args; both buffers sized
+        // seq*head_dim; output freshly allocated above.
+        unsafe { l.launch(cfg) }.expect("rope_backward_f32 launch failed");
+        Self { data: out, shape: vec![seq, head_dim] }
+    }
+}
+
+impl crate::device::CrossEntropy for CudaTensor {
+    fn cross_entropy_forward_save(&self, targets: &[usize]) -> (f32, Self) {
+        assert_eq!(self.shape.len(), 2, "cross_entropy: rank-2 logits");
+        let seq = self.shape[0];
+        let vocab = self.shape[1];
+        assert_eq!(targets.len(), seq, "cross_entropy: target len mismatch");
+        let s = cuda_state().expect("cuda_state failed");
+        // Targets to device as i32 (kernel reads `int*`); usize -> i32
+        // panics on out-of-range (only realistic at vocab >= 2^31, which
+        // the rest of the code wouldn't survive either).
+        let targets_i32: Vec<i32> = targets
+            .iter()
+            .map(|&t| {
+                assert!(t < vocab, "cross_entropy: target {t} >= vocab {vocab}");
+                i32::try_from(t).expect("target exceeds i32")
+            })
+            .collect();
+        let targets_dev = s
+            .stream
+            .clone_htod(&targets_i32)
+            .expect("clone_htod targets");
+        let mut softmax = s.stream.alloc_zeros::<f32>(seq * vocab).expect("alloc softmax");
+        let mut per_row_loss = s.stream.alloc_zeros::<f32>(seq).expect("alloc loss");
+        let seq_i = i32::try_from(seq).expect("seq exceeds i32");
+        let vocab_i = i32::try_from(vocab).expect("vocab exceeds i32");
+        // One thread per row, 256 rows per block.
+        let cfg = LaunchConfig {
+            grid_dim: ((seq_i as u32).div_ceil(256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut l = s.stream.launch_builder(&s.cross_entropy_softmax_loss_fn);
+        l.arg(&self.data);
+        l.arg(&targets_dev);
+        l.arg(&mut softmax);
+        l.arg(&mut per_row_loss);
+        l.arg(&seq_i);
+        l.arg(&vocab_i);
+        // Safety: signature (const float* logits, const int* targets,
+        // float* softmax, float* per_row_loss, int seq, int vocab)
+        // matches; logits / softmax sized seq*vocab; loss sized seq.
+        unsafe { l.launch(cfg) }.expect("cross_entropy_softmax_loss_f32 launch");
+        // Copy per-row losses back and average. seq is small (~64) so
+        // this is far cheaper than fighting GPU atomic-add or a second
+        // reduction kernel.
+        let losses_host = s.stream.clone_dtoh(&per_row_loss).expect("D->H per_row_loss");
+        let total: f32 = losses_host.iter().sum();
+        let loss = total / seq as f32;
+        (
+            loss,
+            Self {
+                data: softmax,
+                shape: vec![seq, vocab],
+            },
+        )
+    }
+}
+
+impl crate::device::CrossEntropyBackward for CudaTensor {
+    fn cross_entropy_backward(&self, targets: &[usize], seq: usize) -> Self {
+        assert_eq!(self.shape.len(), 2, "cross_entropy_backward: rank-2 softmax");
+        assert_eq!(seq, self.shape[0], "cross_entropy_backward: seq mismatch");
+        let vocab = self.shape[1];
+        assert_eq!(targets.len(), seq, "cross_entropy_backward: target len mismatch");
+        let s = cuda_state().expect("cuda_state failed");
+        let targets_i32: Vec<i32> = targets
+            .iter()
+            .map(|&t| i32::try_from(t).expect("target exceeds i32"))
+            .collect();
+        let targets_dev = s
+            .stream
+            .clone_htod(&targets_i32)
+            .expect("clone_htod targets");
+        let mut out = s
+            .stream
+            .alloc_zeros::<f32>(seq * vocab)
+            .expect("alloc grad_logits");
+        let seq_i = i32::try_from(seq).expect("seq exceeds i32");
+        let vocab_i = i32::try_from(vocab).expect("vocab exceeds i32");
+        // 2-D 16x16 launch: one thread per (row, col).
+        let cfg = LaunchConfig {
+            grid_dim: ((vocab_i as u32).div_ceil(16), (seq_i as u32).div_ceil(16), 1),
+            block_dim: (16, 16, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut l = s.stream.launch_builder(&s.cross_entropy_backward_fn);
+        l.arg(&self.data);
+        l.arg(&targets_dev);
+        l.arg(&mut out);
+        l.arg(&seq_i);
+        l.arg(&vocab_i);
+        // Safety: signature (const float* softmax_saved, const int*
+        // targets, float* grad_logits, int seq, int vocab) matches;
+        // both float buffers sized seq*vocab.
+        unsafe { l.launch(cfg) }.expect("cross_entropy_backward_f32 launch");
+        Self { data: out, shape: vec![seq, vocab] }
+    }
+}
+
+impl crate::device::QuantiseWeightsSTE for CudaTensor {
+    fn quantise_weights_ste(&self) -> Self {
+        assert_eq!(self.shape.len(), 2, "quantise_weights_ste: rank-2 only");
+        let s = cuda_state().expect("cuda_state failed");
+        let m = self.shape[0];
+        let n = self.shape[1];
+        let m_i = i32::try_from(m).expect("m exceeds i32");
+        let n_i = i32::try_from(n).expect("n exceeds i32");
+        let mut row_abs_sum = s.stream.alloc_zeros::<f32>(m).expect("alloc row_abs_sum");
+        let mut out = s.stream.alloc_zeros::<f32>(m * n).expect("alloc out");
+        // Stage 1: per-row abs sum.
+        let cfg_rows = LaunchConfig {
+            grid_dim: ((m_i as u32).div_ceil(256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut l1 = s.stream.launch_builder(&s.quantise_weights_partial_abs_sum_fn);
+        l1.arg(&self.data);
+        l1.arg(&mut row_abs_sum);
+        l1.arg(&m_i);
+        l1.arg(&n_i);
+        // Safety: signature matches; both buffers correctly sized.
+        unsafe { l1.launch(cfg_rows) }.expect("quantise_weights_partial_abs_sum launch");
+        // Stage 2: per-cell quant + scale-back.
+        let cfg_cells = LaunchConfig {
+            grid_dim: ((n_i as u32).div_ceil(16), (m_i as u32).div_ceil(16), 1),
+            block_dim: (16, 16, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut l2 = s.stream.launch_builder(&s.quantise_weights_apply_fn);
+        l2.arg(&self.data);
+        l2.arg(&row_abs_sum);
+        l2.arg(&mut out);
+        l2.arg(&m_i);
+        l2.arg(&n_i);
+        unsafe { l2.launch(cfg_cells) }.expect("quantise_weights_apply launch");
+        Self { data: out, shape: vec![m, n] }
+    }
+}
+
+impl crate::device::QuantiseActsSTE for CudaTensor {
+    fn quantise_acts_ste(&self) -> Self {
+        assert_eq!(self.shape.len(), 2, "quantise_acts_ste: rank-2 only");
+        let s = cuda_state().expect("cuda_state failed");
+        let m = self.shape[0];
+        let n = self.shape[1];
+        let m_i = i32::try_from(m).expect("m exceeds i32");
+        let n_i = i32::try_from(n).expect("n exceeds i32");
+        let mut row_max = s.stream.alloc_zeros::<f32>(m).expect("alloc row_max");
+        let mut out = s.stream.alloc_zeros::<f32>(m * n).expect("alloc out");
+        let cfg_rows = LaunchConfig {
+            grid_dim: ((m_i as u32).div_ceil(256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut l1 = s.stream.launch_builder(&s.quantise_acts_row_absmax_fn);
+        l1.arg(&self.data);
+        l1.arg(&mut row_max);
+        l1.arg(&m_i);
+        l1.arg(&n_i);
+        unsafe { l1.launch(cfg_rows) }.expect("quantise_acts_row_absmax launch");
+        let cfg_cells = LaunchConfig {
+            grid_dim: ((n_i as u32).div_ceil(16), (m_i as u32).div_ceil(16), 1),
+            block_dim: (16, 16, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut l2 = s.stream.launch_builder(&s.quantise_acts_apply_fn);
+        l2.arg(&self.data);
+        l2.arg(&row_max);
+        l2.arg(&mut out);
+        l2.arg(&m_i);
+        l2.arg(&n_i);
+        unsafe { l2.launch(cfg_cells) }.expect("quantise_acts_apply launch");
+        Self { data: out, shape: vec![m, n] }
+    }
+}
+
+impl crate::device::BitLinear for CudaTensor {
+    /// Phase 5.b: int8 BitLinear forward via cuBLAS `cublasGemmEx`
+    /// (int8 inputs, int32 accumulator, tensor cores when shapes
+    /// align). Algorithm:
+    ///
+    ///     y[m, n] = (alpha[m] * gamma / 127) * sum_k x_q[m, k] * w_q[k, n]
+    ///
+    /// where `x_q` is INT8 in [-128, 127] (per-row scale `alpha[m]`),
+    /// `w_q` is INT8 in {-1, 0, +1} (scalar scale `gamma`). The
+    /// expensive matmul runs in INT32 on tensor cores; the
+    /// dequantisation kernel folds the scales back at the end. Same
+    /// row-major-via-column-major adapter as the f32 `MatMul` impl
+    /// (pass B and A swapped, swap m and n - cuBLAS sees row-major
+    /// as transposed col-major).
+    ///
+    /// Mathematically equivalent to the Phase 5.a f32 path
+    /// (`quantise_acts_ste(x).matmul(quantise_weights_ste(w))`); the
+    /// only difference is round-off (the int32 accumulator is exact
+    /// for integer multiplies, whereas the f32 matmul accumulates
+    /// rounding error per term). On Ada tensor cores the int8 GEMM
+    /// is ~10-50x faster than the f32 sgemm path at large matmul
+    /// shapes; at small shapes / non-aligned dimensions cuBLAS may
+    /// fall back to non-tensor-core paths and the speedup shrinks.
+    ///
+    /// **Shape fallback**: cuBLAS `cublasGemmEx` with int8 inputs
+    /// requires `lda` and `ldb` to be multiples of 4 (the int8
+    /// kernel reads 32-bit chunks). In our row-major-via-col-major
+    /// adapter that means `n` and `k` must both be multiples of 4.
+    /// In the project the only matmul that violates this is the
+    /// lm_head with `n = vocab = 65`. When the shape check fails
+    /// we fall back to the Phase 5.a f32 path
+    /// (`quantise_acts_ste(x).matmul(quantise_weights_ste(w))`)
+    /// instead of failing the GEMM call. The f32 path is
+    /// algebraically identical so output values match.
+    fn bit_linear(&self, rhs: &Self) -> Self {
+        use cudarc::cublas::{result::gemm_ex, sys};
+        use cudarc::driver::{DevicePtr, DevicePtrMut};
+        use std::ffi::c_void;
+
+        assert_eq!(self.shape.len(), 2, "bit_linear lhs must be 2-D, got {:?}", self.shape);
+        assert_eq!(rhs.shape.len(), 2, "bit_linear rhs must be 2-D, got {:?}", rhs.shape);
+        assert_eq!(
+            self.shape[1], rhs.shape[0],
+            "bit_linear shape mismatch: {:?} @ {:?}", self.shape, rhs.shape
+        );
+        let st = cuda_state().expect("cuda_state failed");
+        let m = self.shape[0];
+        let k = self.shape[1];
+        let n = rhs.shape[1];
+        let m_i = i32::try_from(m).expect("m exceeds i32");
+        let k_i = i32::try_from(k).expect("k exceeds i32");
+        let n_i = i32::try_from(n).expect("n exceeds i32");
+
+        // Shape fallback: cuBLAS int8 GEMM requires lda and ldb to
+        // be multiples of 4. In our row-major-via-col-major adapter
+        // lda = n (B's row-major stride) and ldb = k (A's row-major
+        // stride). When either fails the alignment check, fall back
+        // to the Phase 5.a f32 sgemm path (algebraically identical;
+        // the only matmul in the project that hits this fallback is
+        // the lm_head with n = vocab = 65).
+        if k % 4 != 0 || n % 4 != 0 {
+            use crate::device::{MatMul, QuantiseActsSTE, QuantiseWeightsSTE};
+            let x_eff = self.quantise_acts_ste();
+            let w_eff = rhs.quantise_weights_ste();
+            return x_eff.matmul(&w_eff);
+        }
+
+        // ---- Stage 1: quantise self (acts) to INT8 + alpha[m]. ----
+        let mut alpha = st.stream.alloc_zeros::<f32>(m).expect("alloc alpha");
+        let mut x_q = st.stream.alloc_zeros::<i8>(m * k).expect("alloc x_q");
+        let cfg_x_rows = LaunchConfig {
+            grid_dim: ((m_i as u32).div_ceil(256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut l = st.stream.launch_builder(&st.quantise_acts_row_absmax_fn);
+        l.arg(&self.data);
+        l.arg(&mut alpha);
+        l.arg(&m_i);
+        l.arg(&k_i);
+        unsafe { l.launch(cfg_x_rows) }.expect("acts row absmax launch");
+        let cfg_x_cells = LaunchConfig {
+            grid_dim: ((k_i as u32).div_ceil(16), (m_i as u32).div_ceil(16), 1),
+            block_dim: (16, 16, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut l = st.stream.launch_builder(&st.quantise_acts_int8_apply_fn);
+        l.arg(&self.data);
+        l.arg(&alpha);
+        l.arg(&mut x_q);
+        l.arg(&m_i);
+        l.arg(&k_i);
+        unsafe { l.launch(cfg_x_cells) }.expect("acts int8 apply launch");
+
+        // ---- Stage 2: quantise rhs (weights) to INT8 + gamma scalar. ----
+        let mut gamma = st.stream.alloc_zeros::<f32>(1).expect("alloc gamma");
+        let mut w_row_abs_sum = st.stream.alloc_zeros::<f32>(k).expect("alloc w_row_abs_sum");
+        let mut w_q = st.stream.alloc_zeros::<i8>(k * n).expect("alloc w_q");
+        let cfg_w_rows = LaunchConfig {
+            grid_dim: ((k_i as u32).div_ceil(256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut l = st.stream.launch_builder(&st.quantise_weights_partial_abs_sum_fn);
+        l.arg(&rhs.data);
+        l.arg(&mut w_row_abs_sum);
+        l.arg(&k_i);
+        l.arg(&n_i);
+        unsafe { l.launch(cfg_w_rows) }.expect("weights row abs sum launch");
+        let cfg_w_cells = LaunchConfig {
+            grid_dim: ((n_i as u32).div_ceil(16), (k_i as u32).div_ceil(16), 1),
+            block_dim: (16, 16, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut l = st.stream.launch_builder(&st.quantise_weights_int8_apply_fn);
+        l.arg(&rhs.data);
+        l.arg(&w_row_abs_sum);
+        l.arg(&mut w_q);
+        l.arg(&mut gamma);
+        l.arg(&k_i);
+        l.arg(&n_i);
+        unsafe { l.launch(cfg_w_cells) }.expect("weights int8 apply launch");
+
+        // ---- Stage 3: cublasGemmEx int8 -> int32. ----
+        // Same row-major-via-column-major adapter as the f32 MatMul
+        // impl: ask for C_col = B_col @ A_col of shape (N, M); the
+        // bytes that come out match the desired C_row = A_row @ B_row.
+        let mut c_int = st.stream.alloc_zeros::<i32>(m * n).expect("alloc c_int");
+        let alpha_h: i32 = 1;
+        let beta_h: i32 = 0;
+        let blas_handle = *st.blas.handle();
+        // Safety: pointer arithmetic + raw FFI call. Buffers are
+        // sized correctly above. Stride / shape / type tags below
+        // match the col-major view of the row-major data.
+        unsafe {
+            let (b_ptr, _b_keep) = w_q.device_ptr(&st.stream);
+            let (a_ptr, _a_keep) = x_q.device_ptr(&st.stream);
+            let (c_ptr, _c_keep) = c_int.device_ptr_mut(&st.stream);
+            gemm_ex(
+                blas_handle,
+                sys::cublasOperation_t::CUBLAS_OP_N,
+                sys::cublasOperation_t::CUBLAS_OP_N,
+                n_i,
+                m_i,
+                k_i,
+                &alpha_h as *const i32 as *const c_void,
+                b_ptr as *const c_void,
+                sys::cudaDataType::CUDA_R_8I,
+                n_i,
+                a_ptr as *const c_void,
+                sys::cudaDataType::CUDA_R_8I,
+                k_i,
+                &beta_h as *const i32 as *const c_void,
+                c_ptr as *mut c_void,
+                sys::cudaDataType::CUDA_R_32I,
+                n_i,
+                sys::cublasComputeType_t::CUBLAS_COMPUTE_32I,
+                sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+            )
+            .expect("cublasGemmEx int8 failed");
+        }
+
+        // ---- Stage 4: dequantise int32 -> f32 with per-row alpha + scalar gamma. ----
+        let mut out = st.stream.alloc_zeros::<f32>(m * n).expect("alloc out");
+        let cfg_scale = LaunchConfig {
+            grid_dim: ((n_i as u32).div_ceil(16), (m_i as u32).div_ceil(16), 1),
+            block_dim: (16, 16, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut l = st.stream.launch_builder(&st.scale_int32_to_f32_fn);
+        l.arg(&c_int);
+        l.arg(&alpha);
+        l.arg(&gamma);
+        l.arg(&mut out);
+        l.arg(&m_i);
+        l.arg(&n_i);
+        unsafe { l.launch(cfg_scale) }.expect("scale_int32_to_f32 launch");
+
+        Self { data: out, shape: vec![m, n] }
+    }
+}
+
 // ---- Phase 3: end-to-end forward pass on the GPU.
 //
 // `CudaModel` mirrors the CPU `model::Model` but holds device-resident
@@ -788,15 +1724,20 @@ pub struct CudaModel {
     /// copy it H->D once per forward call. Avoids an embed-lookup
     /// kernel at the cost of a tiny H->D transfer per call.
     pub token_embed_cpu: Tensor,
+    /// Device-side copy of `token_embed`. Needed since v0.17 because the
+    /// LM-head matmul reads `token_embed` (transposed) directly - tied
+    /// embeddings. Synced from `token_embed_cpu` once per `from_cpu`
+    /// call (which itself runs once per training step in the GPU
+    /// path, so the device copy stays consistent with the master).
+    pub token_embed_device: CudaTensor,
     pub blocks: Vec<CudaBlockMasters>,
-    pub lm_head: CudaTensor,
 }
 
 impl CudaModel {
     /// Copy every parameter tensor from a CPU `Model` into device
-    /// memory. The embed table is cloned (kept on CPU); blocks +
-    /// lm_head go H->D. Done once per session; subsequent forwards
-    /// reuse the cached device-resident weights.
+    /// memory. The embed table is cloned to CPU (for the gather) AND
+    /// to device (for the tied LM-head matmul). Per-step rebuild
+    /// pattern in the training path keeps the two copies in sync.
     pub fn from_cpu(model: &crate::model::Model) -> Self {
         let blocks = model
             .blocks
@@ -820,12 +1761,13 @@ impl CudaModel {
                 CudaBlockMasters { heads, ffn }
             })
             .collect();
-        let lm_head = CudaTensor::from_cpu(&model.lm_head).expect("H->D lm_head failed");
+        let token_embed_device =
+            CudaTensor::from_cpu(&model.token_embed).expect("H->D token_embed failed");
         Self {
             config: model.config,
             token_embed_cpu: model.token_embed.clone(),
+            token_embed_device,
             blocks,
-            lm_head,
         }
     }
 
@@ -837,12 +1779,14 @@ impl CudaModel {
     ///   3. Generic `block_inference<CudaTensor>` per block, all
     ///      device-resident (no intermediate H<->D bouncing).
     ///   4. Final RMSNorm.
-    ///   5. `matmul(lm_head)` -> `[seq, vocab]` logits.
+    ///   5. `matmul(token_embed_device.transpose())` -> `[seq, vocab]` logits.
+    ///      Tied embeddings since v0.17 / BNT5; the LM-head weight is the
+    ///      transposed token-embed table.
     ///
     /// Inference-only path. No BitNet quantisation in Phase 3; weights
     /// are used as their raw f32 masters.
     pub fn forward(&self, ids: &[usize]) -> CudaTensor {
-        use crate::device::{MatMul, RmsNorm, block_inference};
+        use crate::device::{MatMul, RmsNorm, Transpose2D, block_inference};
         assert!(
             ids.len() <= self.config.max_seq_len,
             "forward: seq_len {} exceeds max_seq_len {}",
@@ -866,8 +1810,321 @@ impl CudaModel {
         for block in &self.blocks {
             x = block_inference(&x, &block.heads, &block.ffn, self.config.head_dim);
         }
-        // Steps 4 + 5.
-        x.rmsnorm().matmul(&self.lm_head)
+        // Steps 4 + 5. Tied LM head: matmul against the transposed
+        // device-resident token_embed.
+        let lm_head_w = self.token_embed_device.transpose_2d();
+        x.rmsnorm().matmul(&lm_head_w)
+    }
+
+    /// Phase 4 chunk 4.5.e: end-to-end forward+backward for one
+    /// training window. Returns `(grads, loss)` matching the CPU
+    /// `compute_grads_for_window` signature so the existing training
+    /// loop can opt in via a single boolean flag.
+    ///
+    /// **Important caveat**: this path is **f32 throughout** - it does
+    /// NOT apply BitNet ternary STE quantisation in either forward or
+    /// backward. On a model built from `Model::new(...)` and trained
+    /// via this path, the gradient flow goes through full-precision
+    /// matmuls, so the resulting weights are f32 (not ternary). Phase 5
+    /// will add ternary tensor-core kernels that restore the
+    /// BitNet-style training semantics on the GPU. Until then, this
+    /// path is useful for f32 ablations, GPU-perf measurements, and
+    /// integration tests; it is **not** a drop-in replacement for the
+    /// production CPU `compute_grads_for_window` if you want the
+    /// ternary-quantised semantics.
+    ///
+    /// Output gradient ordering matches `Model::for_each_grad`'s
+    /// canonical visitor order (v0.17, tied embeddings):
+    ///   1. token_embed - accumulates contributions from BOTH the embed
+    ///      gather (scatter-add per input id) and the LM-head matmul
+    ///      backward (transposed [vocab, hidden] grad slab)
+    ///   2. for each block: per-head q/k/v/o, then ffn_gate, ffn_up,
+    ///      ffn_down
+    /// (No trailing lm_head: tied to token_embed.)
+    pub fn compute_grads_for_window(
+        &self,
+        input_ids: &[usize],
+        target_ids: &[usize],
+    ) -> (Vec<Tensor>, f32) {
+        use crate::device::{
+            BlockSaved, MatMul, RmsNorm, RmsNormBackward, Transpose2D, block_forward_save,
+            block_backward, cross_entropy_backward, cross_entropy_forward_save, matmul_backward,
+        };
+        assert_eq!(
+            input_ids.len(),
+            target_ids.len(),
+            "compute_grads: input/target length mismatch"
+        );
+        assert!(
+            input_ids.len() <= self.config.max_seq_len,
+            "compute_grads: seq_len {} exceeds max_seq_len {}",
+            input_ids.len(),
+            self.config.max_seq_len,
+        );
+        let seq = input_ids.len();
+        let h = self.config.hidden_dim;
+        let vocab = self.config.vocab_size;
+        let head_dim = self.config.head_dim;
+
+        // ---- Forward, saving every intermediate the backward needs. ----
+
+        // Step 1: CPU embed gather + H->D.
+        let table = &self.token_embed_cpu.data;
+        let mut slab: Vec<f32> = Vec::with_capacity(seq * h);
+        for &id in input_ids {
+            assert!(id < vocab, "compute_grads: id {id} >= vocab {vocab}");
+            slab.extend_from_slice(&table[id * h..(id + 1) * h]);
+        }
+        let x_cpu = Tensor::from_vec(slab, vec![seq, h]);
+        let x_post_embed = CudaTensor::from_cpu(&x_cpu).expect("H->D embed");
+
+        // Step 2: walk blocks, accumulating block_inputs[i] = input to
+        // block i (so block_inputs[0] = x_post_embed, block_inputs[i+1]
+        // = block_forward_save(block_inputs[i]).out).
+        let n_blocks = self.blocks.len();
+        let mut block_inputs: Vec<CudaTensor> = Vec::with_capacity(n_blocks + 1);
+        let mut block_saveds: Vec<BlockSaved<CudaTensor>> = Vec::with_capacity(n_blocks);
+        block_inputs.push(x_post_embed);
+        for (i, block) in self.blocks.iter().enumerate() {
+            let (out, saved) =
+                block_forward_save(&block_inputs[i], &block.heads, &block.ffn, head_dim);
+            block_saveds.push(saved);
+            block_inputs.push(out);
+        }
+        // final_x = block_inputs[n_blocks]; pre_lm_head = rmsnorm(final_x).
+        // Tied LM head: matmul against transposed device-resident token_embed.
+        let final_x = &block_inputs[n_blocks];
+        let pre_lm_head = final_x.rmsnorm();
+        let lm_head_w = self.token_embed_device.transpose_2d(); // [hidden, vocab]
+        let logits = pre_lm_head.matmul(&lm_head_w);
+
+        // Step 3: cross-entropy fused softmax + loss.
+        let (loss, softmax_saved) = cross_entropy_forward_save(&logits, target_ids);
+
+        // ---- Backward chain. ----
+
+        let grad_logits = cross_entropy_backward(&softmax_saved, target_ids, seq);
+        // logits = pre_lm_head @ lm_head_w (= token_embed_device.T)
+        let (grad_pre_lm_head, grad_lm_head_w) =
+            matmul_backward(&grad_logits, &pre_lm_head, &lm_head_w);
+        // grad through the transpose: [hidden, vocab] -> [vocab, hidden].
+        // This is the LM-head's contribution to the tied token_embed grad;
+        // it gets summed into the embed-gather contribution further down.
+        let grad_token_embed_from_lm =
+            grad_lm_head_w.transpose_2d().to_cpu().expect("D->H grad_lm");
+        // pre_lm_head = rmsnorm(final_x)
+        let grad_final_x = grad_pre_lm_head.rmsnorm_backward(final_x);
+
+        // Walk blocks in reverse, accumulating per-block grad bundles.
+        let mut grad_x = grad_final_x;
+        let mut block_grads_rev: Vec<crate::device::BlockGrads<CudaTensor>> =
+            Vec::with_capacity(n_blocks);
+        for i in (0..n_blocks).rev() {
+            let bg = block_backward(
+                &grad_x,
+                &block_inputs[i],
+                &block_saveds[i],
+                &self.blocks[i].heads,
+                &self.blocks[i].ffn,
+                head_dim,
+            );
+            // grad_x for the previous-block iteration is this block's
+            // grad_x. Clone is one D->D memcpy per block (cheap at
+            // v0.13 sizes) and lets the BlockGrads bundle keep
+            // ownership of its grad_x for later inspection if needed.
+            grad_x = bg.grad_x.clone();
+            block_grads_rev.push(bg);
+        }
+        let block_grads: Vec<crate::device::BlockGrads<CudaTensor>> =
+            block_grads_rev.into_iter().rev().collect();
+
+        // Embed backward: scatter-add the gradient flowing into the
+        // first block back into a CPU `grad_token_embed` table. We then
+        // sum in `grad_token_embed_from_lm` (the LM-head contribution
+        // computed above) - tied embeddings means both paths feed into
+        // the same parameter slot.
+        let grad_x_pre_blocks_cpu = grad_x.to_cpu().expect("D->H grad_x_pre_blocks");
+        let mut grad_token_embed = vec![0.0_f32; vocab * h];
+        for (pos, &id) in input_ids.iter().enumerate() {
+            let dst_start = id * h;
+            let src_start = pos * h;
+            for c in 0..h {
+                grad_token_embed[dst_start + c] += grad_x_pre_blocks_cpu.data[src_start + c];
+            }
+        }
+        debug_assert_eq!(grad_token_embed_from_lm.data.len(), grad_token_embed.len());
+        for (g, &lm) in grad_token_embed
+            .iter_mut()
+            .zip(&grad_token_embed_from_lm.data)
+        {
+            *g += lm;
+        }
+        let grad_token_embed_t = Tensor {
+            data: grad_token_embed,
+            shape: vec![vocab, h],
+        };
+
+        // ---- Flatten gradients in canonical visitor order. ----
+        // No trailing lm_head: tied to token_embed since v0.17 / BNT5.
+
+        let mut grads: Vec<Tensor> = Vec::new();
+        grads.push(grad_token_embed_t);
+        for bg in &block_grads {
+            for hg in &bg.head_grads {
+                grads.push(hg.grad_w_q.to_cpu().expect("D->H w_q"));
+                grads.push(hg.grad_w_k.to_cpu().expect("D->H w_k"));
+                grads.push(hg.grad_w_v.to_cpu().expect("D->H w_v"));
+                grads.push(hg.grad_w_o.to_cpu().expect("D->H w_o"));
+            }
+            grads.push(bg.grad_w_gate.to_cpu().expect("D->H w_gate"));
+            grads.push(bg.grad_w_up.to_cpu().expect("D->H w_up"));
+            grads.push(bg.grad_w_down.to_cpu().expect("D->H w_down"));
+        }
+
+        (grads, loss)
+    }
+
+    /// Phase 5.a: BitNet end-to-end forward+backward on the GPU. Same
+    /// pipeline as `compute_grads_for_window` but every learnable-
+    /// weight matmul (per-head Q/K/V/O, FFN gate/up/down, lm_head)
+    /// goes through `bit_linear` (quantise_acts_ste(x) @
+    /// quantise_weights_ste(w)). Matches `Var::cross_entropy(model.forward(...))`
+    /// in the autograd CPU training path.
+    ///
+    /// Returns `(Vec<Tensor>, f32)` in the **canonical visitor order**
+    /// matching `Model::for_each_grad`, drop-in compatible with the
+    /// existing CPU optimiser.
+    pub fn compute_grads_for_window_bitnet(
+        &self,
+        input_ids: &[usize],
+        target_ids: &[usize],
+    ) -> (Vec<Tensor>, f32) {
+        use crate::device::{
+            BitLinear, BlockSaved, RmsNorm, RmsNormBackward, Transpose2D, bit_linear_backward,
+            block_backward_bitnet, block_forward_save_bitnet, cross_entropy_backward,
+            cross_entropy_forward_save,
+        };
+        assert_eq!(
+            input_ids.len(),
+            target_ids.len(),
+            "compute_grads_bitnet: input/target length mismatch"
+        );
+        assert!(
+            input_ids.len() <= self.config.max_seq_len,
+            "compute_grads_bitnet: seq_len {} exceeds max_seq_len {}",
+            input_ids.len(),
+            self.config.max_seq_len,
+        );
+        let seq = input_ids.len();
+        let h = self.config.hidden_dim;
+        let vocab = self.config.vocab_size;
+        let head_dim = self.config.head_dim;
+
+        // Step 1: CPU embed gather + H->D.
+        let table = &self.token_embed_cpu.data;
+        let mut slab: Vec<f32> = Vec::with_capacity(seq * h);
+        for &id in input_ids {
+            assert!(id < vocab, "compute_grads_bitnet: id {id} >= vocab {vocab}");
+            slab.extend_from_slice(&table[id * h..(id + 1) * h]);
+        }
+        let x_cpu = Tensor::from_vec(slab, vec![seq, h]);
+        let x_post_embed = CudaTensor::from_cpu(&x_cpu).expect("H->D embed");
+
+        // Step 2: blocks via the bitnet variants.
+        let n_blocks = self.blocks.len();
+        let mut block_inputs: Vec<CudaTensor> = Vec::with_capacity(n_blocks + 1);
+        let mut block_saveds: Vec<BlockSaved<CudaTensor>> = Vec::with_capacity(n_blocks);
+        block_inputs.push(x_post_embed);
+        for (i, block) in self.blocks.iter().enumerate() {
+            let (out, saved) = block_forward_save_bitnet(
+                &block_inputs[i], &block.heads, &block.ffn, head_dim,
+            );
+            block_saveds.push(saved);
+            block_inputs.push(out);
+        }
+        let final_x = &block_inputs[n_blocks];
+        let pre_lm_head = final_x.rmsnorm();
+        // Tied LM head: bit_linear over the transposed token_embed device
+        // copy. The bit_linear path quantises both the rmsnorm activations
+        // (per-row INT8 absmax) and the weight (ternary absmean) on the
+        // fly, so the f32 master tensor we feed in is dequantised back to
+        // ternary semantics matching the autograd Var path exactly.
+        let lm_head_w = self.token_embed_device.transpose_2d(); // [hidden, vocab]
+        let logits = pre_lm_head.bit_linear(&lm_head_w);
+
+        // Step 3: cross-entropy.
+        let (loss, softmax_saved) = cross_entropy_forward_save(&logits, target_ids);
+
+        // ---- Backward chain. ----
+        let grad_logits = cross_entropy_backward(&softmax_saved, target_ids, seq);
+        // logits = bit_linear(pre_lm_head, lm_head_w = token_embed_device.T)
+        let (grad_pre_lm_head, grad_lm_head_w) =
+            bit_linear_backward(&grad_logits, &pre_lm_head, &lm_head_w);
+        // Tied-embedding gradient contribution: transpose [hidden, vocab]
+        // -> [vocab, hidden], pulled to host so we can sum it into the
+        // embed-gather gradient below.
+        let grad_token_embed_from_lm =
+            grad_lm_head_w.transpose_2d().to_cpu().expect("D->H grad_lm");
+        let grad_final_x = grad_pre_lm_head.rmsnorm_backward(final_x);
+
+        let mut grad_x = grad_final_x;
+        let mut block_grads_rev: Vec<crate::device::BlockGrads<CudaTensor>> =
+            Vec::with_capacity(n_blocks);
+        for i in (0..n_blocks).rev() {
+            let bg = block_backward_bitnet(
+                &grad_x,
+                &block_inputs[i],
+                &block_saveds[i],
+                &self.blocks[i].heads,
+                &self.blocks[i].ffn,
+                head_dim,
+            );
+            grad_x = bg.grad_x.clone();
+            block_grads_rev.push(bg);
+        }
+        let block_grads: Vec<crate::device::BlockGrads<CudaTensor>> =
+            block_grads_rev.into_iter().rev().collect();
+
+        // Embed scatter-add (CPU side), then sum in the LM-head's
+        // tied-embedding contribution.
+        let grad_x_pre_blocks_cpu = grad_x.to_cpu().expect("D->H grad_x_pre_blocks");
+        let mut grad_token_embed = vec![0.0_f32; vocab * h];
+        for (pos, &id) in input_ids.iter().enumerate() {
+            let dst_start = id * h;
+            let src_start = pos * h;
+            for c in 0..h {
+                grad_token_embed[dst_start + c] += grad_x_pre_blocks_cpu.data[src_start + c];
+            }
+        }
+        debug_assert_eq!(grad_token_embed_from_lm.data.len(), grad_token_embed.len());
+        for (g, &lm) in grad_token_embed
+            .iter_mut()
+            .zip(&grad_token_embed_from_lm.data)
+        {
+            *g += lm;
+        }
+        let grad_token_embed_t = Tensor {
+            data: grad_token_embed,
+            shape: vec![vocab, h],
+        };
+
+        // Flatten in canonical visitor order. No trailing lm_head: tied
+        // to token_embed since v0.17 / BNT5.
+        let mut grads: Vec<Tensor> = Vec::new();
+        grads.push(grad_token_embed_t);
+        for bg in &block_grads {
+            for hg in &bg.head_grads {
+                grads.push(hg.grad_w_q.to_cpu().expect("D->H w_q"));
+                grads.push(hg.grad_w_k.to_cpu().expect("D->H w_k"));
+                grads.push(hg.grad_w_v.to_cpu().expect("D->H w_v"));
+                grads.push(hg.grad_w_o.to_cpu().expect("D->H w_o"));
+            }
+            grads.push(bg.grad_w_gate.to_cpu().expect("D->H w_gate"));
+            grads.push(bg.grad_w_up.to_cpu().expect("D->H w_up"));
+            grads.push(bg.grad_w_down.to_cpu().expect("D->H w_down"));
+        }
+
+        (grads, loss)
     }
 }
 
@@ -1540,5 +2797,173 @@ mod tests {
                 "attention drift at idx {i}: cpu = {c}, cuda = {g}"
             );
         }
+    }
+
+    /// Phase 5.a quant cross-backend agreement. STE quant is a fixed
+    /// transform per row / per tensor, so CPU and GPU outputs should
+    /// match to within f32 round-off (the only source of drift is
+    /// the order in which the per-row absmax / per-tensor abs-sum
+    /// reduction sums its terms; for non-pathological inputs this is
+    /// negligible).
+    #[test]
+    fn quantise_weights_ste_cpu_and_cuda_agree_within_tolerance() {
+        if cuda_state().is_err() {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        }
+        use crate::device::QuantiseWeightsSTE;
+        // Prime dimensions with a wide value range to exercise both
+        // round-to-zero and round-to-+/-1 cases.
+        let m = 17usize;
+        let n = 23usize;
+        let w_data: Vec<f32> = (0..m * n)
+            .map(|i| (i as f32 * 0.13).sin() * 1.5 + 0.4)
+            .collect();
+        let w_cpu = Tensor::from_vec(w_data.clone(), vec![m, n]);
+        let w_gpu = CudaTensor::from_cpu(&w_cpu).expect("H->D");
+        let q_cpu = w_cpu.quantise_weights_ste();
+        let q_gpu = w_gpu.quantise_weights_ste().to_cpu().expect("D->H");
+        assert_eq!(q_cpu.shape, q_gpu.shape);
+        for (i, (&c, &g)) in q_cpu.data.iter().zip(&q_gpu.data).enumerate() {
+            assert!(
+                (c - g).abs() <= 1e-5 + 1e-5 * c.abs(),
+                "weight quant drift at idx {i}: cpu = {c}, cuda = {g}"
+            );
+        }
+    }
+
+    #[test]
+    fn quantise_acts_ste_cpu_and_cuda_agree_within_tolerance() {
+        if cuda_state().is_err() {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        }
+        use crate::device::QuantiseActsSTE;
+        let m = 13usize;
+        let n = 19usize;
+        let x_data: Vec<f32> = (0..m * n)
+            .map(|i| (i as f32 * 0.071).cos() * 2.0 + 0.3)
+            .collect();
+        let x_cpu = Tensor::from_vec(x_data.clone(), vec![m, n]);
+        let x_gpu = CudaTensor::from_cpu(&x_cpu).expect("H->D");
+        let q_cpu = x_cpu.quantise_acts_ste();
+        let q_gpu = x_gpu.quantise_acts_ste().to_cpu().expect("D->H");
+        assert_eq!(q_cpu.shape, q_gpu.shape);
+        for (i, (&c, &g)) in q_cpu.data.iter().zip(&q_gpu.data).enumerate() {
+            assert!(
+                (c - g).abs() <= 1e-5 + 1e-5 * c.abs(),
+                "act quant drift at idx {i}: cpu = {c}, cuda = {g}"
+            );
+        }
+    }
+
+    /// Phase 5.b headline test: the int8 cublasGemmEx BitLinear path
+    /// on `CudaTensor` agrees with the CPU `BitLinear` (which is
+    /// `quantise_acts_ste(x) @ quantise_weights_ste(w)` via f32
+    /// sgemm) within FP tolerance. Both compute the same algebraic
+    /// quantity; the int8 path keeps the matmul in int32 (exact for
+    /// integer multiplies) and dequantises once at the end, so the
+    /// two paths can disagree only at f32 round-off scale.
+    #[test]
+    fn bit_linear_int8_matches_cpu_within_tolerance() {
+        if cuda_state().is_err() {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        }
+        use crate::device::BitLinear;
+        // v0.13-shape attention Q matmul: [seq, hidden] @ [hidden,
+        // head_dim] = [64, 192] @ [192, 16]. Multiples of 16 - the
+        // int8 tensor-core path can be used by cuBLAS without
+        // dimension padding.
+        let m = 64usize;
+        let k = 192usize;
+        let n = 16usize;
+        let x_data: Vec<f32> = (0..m * k)
+            .map(|i| (i as f32 * 0.041).sin() * 0.5 + 0.1)
+            .collect();
+        let w_data: Vec<f32> = (0..k * n)
+            .map(|i| (i as f32 * 0.073).cos() * 0.4)
+            .collect();
+        let x_cpu = Tensor::from_vec(x_data.clone(), vec![m, k]);
+        let w_cpu = Tensor::from_vec(w_data.clone(), vec![k, n]);
+        let x_gpu = CudaTensor::from_cpu(&x_cpu).expect("H->D x");
+        let w_gpu = CudaTensor::from_cpu(&w_cpu).expect("H->D w");
+        let y_cpu = x_cpu.bit_linear(&w_cpu);
+        let y_gpu = x_gpu.bit_linear(&w_gpu).to_cpu().expect("D->H y");
+        assert_eq!(y_cpu.shape, y_gpu.shape);
+        // Tolerance: the CPU path runs the matmul in f32 across
+        // dequantised values; the GPU path runs it in int32 across
+        // raw int8 values then dequantises once. Both produce the
+        // same algebraic quantity, but the order in which f32
+        // multiplications occur differs, so the last few mantissa
+        // bits diverge. Per-cell relative tolerance of ~1% absorbs
+        // this without masking real bugs.
+        for (i, (&c, &g)) in y_cpu.data.iter().zip(&y_gpu.data).enumerate() {
+            let abs = (c - g).abs();
+            assert!(
+                abs <= 5e-3 + 5e-3 * c.abs(),
+                "bit_linear int8 drift at idx {i}: cpu = {c}, cuda = {g}"
+            );
+        }
+    }
+
+    /// **Headline test of Phase 4 chunk 4.5.e.** End-to-end gradient
+    /// computation on the GPU. Asserts:
+    /// - loss is finite and positive (cross-entropy on random init
+    ///   should give ~log(vocab));
+    /// - gradient count matches `model.param_shapes().len()`;
+    /// - per-gradient shapes match the canonical visitor order;
+    /// - every gradient tensor is finite (no NaN / inf);
+    /// - the gradient norm is non-zero (a fully-zero set would mean
+    ///   the chain dropped a branch somewhere).
+    /// Together with chunks 4.5.a-d's correctness gates, this is
+    /// enough sanity that the orchestration is right; tighter
+    /// validation lives in chunk 4.5.f's "loss decreases when we
+    /// train one step" test.
+    #[test]
+    fn cuda_model_compute_grads_for_window_smoke() {
+        if cuda_state().is_err() {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        }
+        use crate::model::{Model, ModelConfig};
+        let config = ModelConfig {
+            vocab_size: 17,
+            hidden_dim: 32,
+            n_heads: 4,
+            head_dim: 8,
+            ffn_dim: 64,
+            max_seq_len: 16,
+            n_blocks: 2,
+        };
+        let model = Model::new(&config, 42);
+        let input: Vec<usize> = vec![0, 3, 7, 11, 5, 1, 9];
+        let target: Vec<usize> = vec![3, 7, 11, 5, 1, 9, 14];
+
+        let cuda_model = CudaModel::from_cpu(&model);
+        let (grads, loss) = cuda_model.compute_grads_for_window(&input, &target);
+
+        assert!(loss.is_finite(), "loss not finite: {loss}");
+        assert!(loss > 0.0, "loss should be positive on random init");
+        let shapes = model.param_shapes();
+        assert_eq!(
+            grads.len(),
+            shapes.len(),
+            "gradient count mismatch: got {} expected {}",
+            grads.len(),
+            shapes.len()
+        );
+        let mut total_norm_sq = 0.0_f64;
+        for (i, (g, s)) in grads.iter().zip(&shapes).enumerate() {
+            assert_eq!(&g.shape, s, "gradient shape mismatch at param {i}");
+            for &v in &g.data {
+                assert!(v.is_finite(), "non-finite gradient cell in param {i}");
+                total_norm_sq += (v as f64) * (v as f64);
+            }
+        }
+        assert!(
+            total_norm_sq > 0.0,
+            "all-zero gradient set: chain probably dropped a branch"
+        );
     }
 }

@@ -1,12 +1,24 @@
-//! Full BitNet language model - token embedding + N transformer blocks + LM head.
+//! Full BitNet language model - token embedding + N transformer blocks +
+//! tied LM head.
 //!
 //! Structure:
-//!     Model { token_embed, blocks: Vec<BlockMasters>, lm_head, config }
+//!     Model { token_embed, blocks: Vec<BlockMasters>, config }
 //!
 //! Position information arrives via RoPE inside attention (see `autograd::rope`
 //! and `attention::head_output`) - there is no learned absolute position
 //! embedding tensor. RoPE is parameter-free, so the model carries one fewer
 //! tensor than a typical transformer.
+//!
+//! **Tied embeddings (v0.17 / BNT5):** the LM head re-uses `token_embed` as
+//! its weight matrix, transposed at op-build time. The same master tensor is
+//! gradient-updated from both the embed-lookup path (gather backward) and
+//! the LM-head path (matmul backward through STE quantisation). This drops
+//! `vocab_size * hidden_dim` parameters (e.g. 65 * 256 = ~17k for the
+//! shakespeare_large config) and acts as a strong regulariser - input and
+//! output now share a single semantic vocabulary representation. Standard
+//! practice in GPT-2 / LLaMA / etc; the BitNet paper itself doesn't tie,
+//! but at small scales the regularisation win usually beats the rare cases
+//! where decoupled paths help.
 //!
 //! Training cycle (one step):
 //!     tape   = Tape::new()
@@ -70,20 +82,22 @@ pub struct BlockMasters {
 }
 
 /// Top-level model. Owns every trainable tensor.
+///
+/// Since v0.17 the LM head is tied to `token_embed` (transposed at op-build
+/// time inside `forward`), so there is no separate `lm_head` tensor.
 #[derive(Debug, Clone)]
 pub struct Model {
-    pub token_embed: Tensor, // [vocab, hidden]
+    pub token_embed: Tensor, // [vocab, hidden]; doubles as the LM-head weight
     pub blocks: Vec<BlockMasters>,
-    pub lm_head: Tensor, // [hidden, vocab]
     pub config: ModelConfig,
 }
 
 /// Tape-side mirror of `Model`: every master tensor registered as a leaf.
-/// Lifetime `'t` ties this to a specific `Tape` instance.
+/// Lifetime `'t` ties this to a specific `Tape` instance. No `lm_head` field
+/// since v0.17 - the LM-head matmul reads `token_embed` (transposed) directly.
 pub struct ModelLeaves<'t> {
     pub token_embed: Var<'t>,
     pub blocks: Vec<BlockWeights<'t>>,
-    pub lm_head: Var<'t>,
 }
 
 /// Tiny linear congruential generator - Numerical Recipes constants.
@@ -122,18 +136,25 @@ impl Model {
         let d = config.head_dim;
         let f = config.ffn_dim;
 
-        // Token embedding init: small constant scale (~0.02) keeps initial
-        // logits in a sensible range so cross-entropy starts ≈ log(vocab_size).
-        // No learned positional embedding: position information is injected
-        // via RoPE inside attention (see `autograd::rope`).
-        let token_embed = rng.fill_tensor(vec![config.vocab_size, h], 0.02);
+        // Token embedding init: scale `1/√hidden_dim`. This is also the
+        // LM-head's effective scale since v0.17 (tied embeddings); a 1/√h
+        // init gives decisive output logits at random init even at tiny
+        // test scales, where GPT-2's flat 0.02 would produce near-tied
+        // logits (the residual-stream depth needed to amplify 0.02-scale
+        // weights into a decisive logit gap is several blocks; toy tests
+        // use 1-2 blocks). For production-scale configs (h = 192-256)
+        // this is 0.06-0.07, very close to 0.02 anyway, so the change
+        // doesn't meaningfully shift the trained-model dynamics. No
+        // learned positional embedding: RoPE injects position info inside
+        // attention (see `autograd::rope`).
+        let scale_embed = 1.0 / (h as f32).sqrt();
+        let token_embed = rng.fill_tensor(vec![config.vocab_size, h], scale_embed);
 
         // Linear-layer inits: scale by 1/√fan_in (a poor man's Kaiming).
         let scale_h_d = 1.0 / (h as f32).sqrt();
         let scale_d_h = 1.0 / (d as f32).sqrt();
         let scale_h_f = 1.0 / (h as f32).sqrt();
         let scale_f_h = 1.0 / (f as f32).sqrt();
-        let scale_h_v = 1.0 / (h as f32).sqrt();
 
         let blocks = (0..config.n_blocks)
             .map(|_| {
@@ -154,18 +175,18 @@ impl Model {
             })
             .collect();
 
-        let lm_head = rng.fill_tensor(vec![h, config.vocab_size], scale_h_v);
-
         Self {
             token_embed,
             blocks,
-            lm_head,
             config: *config,
         }
     }
 
     /// Register every master tensor on the given tape as a fresh leaf.
     /// Returns the bundle of leaf handles you'll pass to `forward` / `apply_grads`.
+    /// `token_embed` is registered once but used twice in the graph (once for
+    /// the embed lookup, once for the LM-head matmul via transpose) - the tape
+    /// accumulates gradient contributions from both paths automatically.
     pub fn register_leaves<'t>(&self, tape: &'t Tape) -> ModelLeaves<'t> {
         use crate::block::AttentionHeadVars;
         ModelLeaves {
@@ -189,7 +210,6 @@ impl Model {
                     ffn_down_w: Var::leaf(tape, b.ffn_down_w.clone()),
                 })
                 .collect(),
-            lm_head: Var::leaf(tape, self.lm_head.clone()),
         }
     }
 
@@ -207,7 +227,7 @@ impl Model {
         // Embed tokens. Position information is added inside attention via
         // RoPE (`autograd::rope`), not here - so the input to the block stack
         // is just the token-embedding lookup, no learned positional add.
-        let mut x = leaves.token_embed.embed(ids);
+        let mut x = leaves.token_embed.clone().embed(ids);
 
         // Stack of transformer blocks.
         for bw in &leaves.blocks {
@@ -217,10 +237,12 @@ impl Model {
         // Final pre-norm before the LM head, same RMSNorm pattern as inside blocks.
         let x = x.rmsnorm();
 
-        // LM head as BitLinear: ternary weights, INT8 activations, just like every
-        // other weight matrix in the model. Paper-faithful and consistent.
+        // LM head as BitLinear: tied to `token_embed`, transposed. Backward
+        // through transpose + STE accumulates a [vocab, hidden] gradient
+        // contribution into `token_embed`'s grad slot, on top of the gather
+        // gradient from the embed-lookup path above.
         x.quantise_acts_ste()
-            .matmul(leaves.lm_head.quantise_weights_ste())
+            .matmul(leaves.token_embed.clone().transpose_2d().quantise_weights_ste())
     }
 
     /// SGD update: `master -= lr · master.grad()`. Reads gradient from each
@@ -241,10 +263,13 @@ impl Model {
     /// they don't need to know the model's internal layout.
     ///
     /// Order: token_embed, then per block (each head's q, k, v, o followed by
-    /// ffn_gate, ffn_up, ffn_down), finally lm_head. The `optim::AdamW` state
-    /// vectors are sized to match - changing the order here breaks resume.
-    /// (Pre-v0.12 the order included `pos_embed` after `token_embed`; RoPE
-    /// retired that tensor, hence the order change and the `BNT4` magic.)
+    /// ffn_gate, ffn_up, ffn_down). Since v0.17 there is no separate lm_head
+    /// at the tail - the LM-head matmul reads `token_embed` (transposed), so
+    /// its gradient already accumulates into the first slot. The `optim::AdamW`
+    /// state vectors are sized to match - changing the order here breaks
+    /// resume. (Pre-v0.12 the order included `pos_embed` after `token_embed`;
+    /// RoPE retired that tensor and bumped magic to `BNT4`. Tied embeddings
+    /// drops the trailing `lm_head` slot and bumps magic to `BNT5`.)
     pub fn for_each_param_with_grad<F>(&mut self, leaves: &ModelLeaves<'_>, mut f: F)
     where
         F: FnMut(&mut Tensor, &Tensor),
@@ -261,7 +286,6 @@ impl Model {
             f(&mut mb.ffn_up_w, &lb.ffn_up_w.grad());
             f(&mut mb.ffn_down_w, &lb.ffn_down_w.grad());
         }
-        f(&mut self.lm_head, &leaves.lm_head.grad());
     }
 
     /// Iterate every master parameter (mutable, no leaf grad). Used by the
@@ -285,7 +309,6 @@ impl Model {
             f(&mut mb.ffn_up_w);
             f(&mut mb.ffn_down_w);
         }
-        f(&mut self.lm_head);
     }
 
     /// Iterate every leaf-gradient (read-only). Used by tests + grad-clip
@@ -304,7 +327,6 @@ impl Model {
             f(&lb.ffn_up_w.grad());
             f(&lb.ffn_down_w.grad());
         }
-        f(&leaves.lm_head.grad());
     }
 
     /// Canonical parameter shapes, in the same order as the visitors above.
@@ -323,7 +345,6 @@ impl Model {
             out.push(b.ffn_up_w.shape.clone());
             out.push(b.ffn_down_w.shape.clone());
         }
-        out.push(self.lm_head.shape.clone());
         out
     }
 }
@@ -380,8 +401,11 @@ mod tests {
         tape.backward(loss.id);
 
         let has_nonzero = |t: &Tensor| t.data.iter().any(|&v| v.abs() > 1e-10);
+        // token_embed receives gradient from BOTH the embed-lookup path (gather
+        // backward, scatter-adds onto rows for tokens used in `ids`) AND the
+        // LM-head matmul (transpose backward routes a [vocab, hidden] grad
+        // contribution back). Tied since v0.17.
         assert!(has_nonzero(&leaves.token_embed.grad()), "token_embed");
-        assert!(has_nonzero(&leaves.lm_head.grad()), "lm_head");
         for (i, b) in leaves.blocks.iter().enumerate() {
             for (j, h) in b.heads.iter().enumerate() {
                 assert!(has_nonzero(&h.w_q.grad()), "block {} head {} w_q", i, j);

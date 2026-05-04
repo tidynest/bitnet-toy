@@ -7,6 +7,22 @@
 //! O(H^2 * blocks); for a 200-token sample over a 6-token prompt that is a
 //! ~50-100x wall-clock improvement at inference time.
 //!
+//! **Sliding-window semantics.** The cache holds at most `model.config.max_seq_len`
+//! rows per head. Once full, the next forward step evicts the oldest K and V
+//! row before appending. This matches the non-cached `inference::generate_with_mode`
+//! path, which feeds the *last* `max_seq_len` tokens through `Model::forward`
+//! every step. Without sliding, the cache would feed RoPE positions past the
+//! trained range and the output collapses to gibberish (observed in the v0.16
+//! KV-cache path during the Phase 5.b first GPU training run).
+//!
+//! **RoPE under sliding.** RoPE is applied at *attention-score time* using each
+//! cached K row's logical (in-cache) position, not its original absolute
+//! position. The just-projected K is stored *unrotated* and gets rotated on
+//! every step as long as it lives in the cache; once it falls out, it is
+//! gone. This is the only correct way to keep RoPE positions in the trained
+//! `[0, max_seq_len - 1]` range across an unbounded generation length without
+//! storing a separate "rotation phase" per cached row.
+//!
 //! **Architectural correctness against training.** This module mirrors the
 //! training-time forward exactly:
 //!   - RMSNorm before each block (and before the lm_head).
@@ -17,9 +33,8 @@
 //!   - Multi-head attention sum-of-projections: each head's contribution is
 //!     summed into the block output.
 //!   - SwiGLU FFN: `silu(x · W_gate) ⊙ (x · W_up) · W_down`.
-//!   - RoPE applied to Q and K (not V) at the absolute position of the
-//!     current token. Cached K rows are stored *after* RoPE so they need
-//!     no further rotation; only the new K and Q rows are rotated each step.
+//!   - RoPE applied to Q and K (not V) at the *logical* position of the
+//!     current token (cache-relative).
 //!
 //! No autograd. No `Var`. No tape. Pure Tensor + Vec<f32> math, callable in
 //! a tight loop.
@@ -30,10 +45,11 @@ use crate::inference::SamplingMode;
 use crate::model::Model;
 use crate::tensor::Tensor;
 
-/// One head's running state: the K and V rows seen so far at this point in
-/// the generation. Shapes: `[seq_pos, head_dim]`. Each row corresponds to
-/// the *post*-quant + post-projection (and, for K, post-RoPE) state of one
-/// past token at this layer.
+/// One head's running state: the K and V rows that fit within the
+/// sliding window. Shapes: `[active_len, head_dim]` where `active_len <=
+/// max_seq_len`. K rows are stored *unrotated* (RoPE is applied per-row at
+/// attention-score time using the row's current logical index in the cache);
+/// V rows are stored as-is.
 #[derive(Debug, Clone)]
 pub struct HeadKVCache {
     pub k: Tensor,
@@ -205,16 +221,33 @@ fn append_row_inplace(cache: &mut Tensor, row: &[f32]) {
     cache.shape[0] += 1;
 }
 
+/// Drop the oldest row of a `[t, head_dim]` cache tensor. Used when the cache
+/// hits `max_seq_len` and a new row is about to be appended. O(t * head_dim)
+/// per call (memmove); rare relative to the matmul cost.
+fn evict_first_row(cache: &mut Tensor) {
+    let row_len = cache.shape[1];
+    debug_assert!(cache.shape[0] >= 1);
+    cache.data.drain(0..row_len);
+    cache.shape[0] -= 1;
+}
+
 // ---- forward step ----
 
 /// Process a single token through the model with cache state. Returns the
-/// next-token logits as a `[vocab]` vector. Updates `cache` in place: each
-/// head's K and V grow by one row, and `cache.seq_pos` increments by one.
+/// next-token logits as a `[vocab]` vector. Updates `cache` in place:
+///   - each head's K and V grow by one row, unless the cache is already at
+///     `max_seq_len` rows, in which case the oldest row is evicted before
+///     the new one is appended (sliding window);
+///   - `cache.seq_pos` increments by one (counts total `forward_step` calls,
+///     not active cache size).
 ///
-/// `position` is the absolute token index used for RoPE. For prefill this
-/// is `0, 1, ..., len(prompt) - 1`; for generation it continues from there.
-pub fn forward_step(model: &Model, token: usize, position: usize, cache: &mut KVCache) -> Vec<f32> {
+/// RoPE is applied at attention-score time using each cached K row's
+/// *logical* position (its current index in the cache), so positions stay
+/// in `[0, max_seq_len - 1]` for the entire run regardless of how many
+/// tokens have been generated.
+pub fn forward_step(model: &Model, token: usize, cache: &mut KVCache) -> Vec<f32> {
     let head_dim = model.config.head_dim;
+    let max_seq_len = model.config.max_seq_len;
     let scale = 1.0 / (head_dim as f32).sqrt();
 
     // Token embedding lookup: hidden-dim vector for this token.
@@ -236,38 +269,53 @@ pub fn forward_step(model: &Model, token: usize, position: usize, cache: &mut KV
             let w_v = quantise_weights_dequant(&head.w_v);
             let w_o = quantise_weights_dequant(&head.w_o);
 
-            // Project to per-head Q, K, V at the current token.
+            // Project to per-head Q, K, V at the current token. K is stored
+            // *unrotated*; RoPE is applied per cached row in the score loop
+            // below, so cached rows always sit at logical positions in the
+            // trained `[0, max_seq_len - 1]` range.
             let q = matvec(&x_eff, &w_q);
             let k = matvec(&x_eff, &w_k);
             let v = matvec(&x_eff, &w_v);
 
-            // Apply RoPE to Q and K (not V) at this absolute position.
-            let q_rope = rope_row(&q, position);
-            let k_rope = rope_row(&k, position);
-
-            // Append rotated K and unrotated V to this head's cache.
+            // Slide the window. Evict the oldest row when the cache is full
+            // so the new row brings the active count back to `max_seq_len`.
             let head_cache = &mut cache.blocks[block_idx].heads[head_idx];
-            append_row_inplace(&mut head_cache.k, &k_rope);
+            if head_cache.k.shape[0] == max_seq_len {
+                evict_first_row(&mut head_cache.k);
+                evict_first_row(&mut head_cache.v);
+            }
+            append_row_inplace(&mut head_cache.k, &k);
             append_row_inplace(&mut head_cache.v, &v);
 
-            // Attention scores: q (1 x d) · K_cached^T (d x t+1) -> [t+1].
-            let t_plus_1 = head_cache.k.shape[0];
-            let mut scores = vec![0.0_f32; t_plus_1];
-            for ti in 0..t_plus_1 {
+            // Q's logical position is the index of the just-appended K row
+            // (the most recent token in the cache).
+            let active_len = head_cache.k.shape[0];
+            let q_logical_pos = active_len - 1;
+            let q_rope = rope_row(&q, q_logical_pos);
+
+            // Attention scores: q (1 x d) · K_cached^T (d x active_len)
+            // -> [active_len]. Each cached K row is RoPE-rotated on the fly
+            // at its logical index in the cache.
+            let mut scores = vec![0.0_f32; active_len];
+            for ti in 0..active_len {
+                let k_row = &head_cache.k.data[ti * head_dim..(ti + 1) * head_dim];
+                let k_rope = rope_row(k_row, ti);
                 let mut acc = 0.0_f32;
                 for d in 0..head_dim {
-                    acc += q_rope[d] * head_cache.k.data[ti * head_dim + d];
+                    acc += q_rope[d] * k_rope[d];
                 }
                 scores[ti] = acc * scale;
             }
-            // No causal mask needed: q only sees positions 0..=position.
+            // No causal mask needed: q only sees the cached positions
+            // (which are by construction <= q's logical position).
 
             // Softmax over keys.
             let weights = softmax_1d(&scores);
 
-            // Context: weights (1 x t+1) · V_cached (t+1 x head_dim) -> [head_dim].
+            // Context: weights (1 x active_len) · V_cached (active_len x head_dim)
+            // -> [head_dim].
             let mut ctx = vec![0.0_f32; head_dim];
-            for ti in 0..t_plus_1 {
+            for ti in 0..active_len {
                 let w_t = weights[ti];
                 for d in 0..head_dim {
                     ctx[d] += w_t * head_cache.v.data[ti * head_dim + d];
@@ -306,10 +354,12 @@ pub fn forward_step(model: &Model, token: usize, position: usize, cache: &mut KV
         }
     }
 
-    // Final norm + lm_head BitLinear -> logits.
+    // Final norm + lm_head BitLinear -> logits. Tied embeddings since
+    // v0.17 / BNT5: lm_head reads `token_embed` transposed, then ternary-
+    // quantises the result on the fly. Same math the autograd path runs.
     let x_final = rmsnorm_row(&x);
     let x_eff = quantise_acts_row(&x_final);
-    let lm_head_dq = quantise_weights_dequant(&model.lm_head);
+    let lm_head_dq = quantise_weights_dequant(&model.token_embed.transpose_2d());
     let logits = matvec(&x_eff, &lm_head_dq);
 
     cache.seq_pos += 1;
@@ -431,18 +481,20 @@ pub fn generate_with_cache(
 
     // Prefill: feed every prompt token through forward_step. The last
     // forward also produces logits we could sample from; use them as the
-    // first generated token's distribution.
+    // first generated token's distribution. Sliding logic inside
+    // `forward_step` handles prompts longer than `max_seq_len` (the early
+    // tokens just fall out of the cache before we sample).
     let mut last_logits: Vec<f32> = Vec::new();
-    for (i, &id) in ids.iter().enumerate() {
-        last_logits = forward_step(model, id, i, &mut cache);
+    for &id in &ids {
+        last_logits = forward_step(model, id, &mut cache);
     }
 
-    // Generate.
+    // Generate. Logical positions clamp at `max_seq_len - 1` because the
+    // cache slides; output stays coherent past `max_seq_len` tokens.
     for _ in 0..max_new_tokens {
         let next = sample_from_logits(&last_logits, &mode, rng);
         ids.push(next);
-        let pos = cache.seq_pos; // next absolute position is the current seq_pos
-        last_logits = forward_step(model, next, pos, &mut cache);
+        last_logits = forward_step(model, next, &mut cache);
     }
 
     vocab.decode(&ids)
@@ -470,7 +522,7 @@ mod tests {
         let cfg = tiny_model_config();
         let model = Model::new(&cfg, 7);
         let mut cache = KVCache::new(&model);
-        let logits = forward_step(&model, 3, 0, &mut cache);
+        let logits = forward_step(&model, 3, &mut cache);
         assert_eq!(logits.len(), cfg.vocab_size);
         for (i, &v) in logits.iter().enumerate() {
             assert!(v.is_finite(), "logit[{}] = {} not finite", i, v);
@@ -491,7 +543,7 @@ mod tests {
         let model = Model::new(&cfg, 11);
         let mut cache = KVCache::new(&model);
         for pos in 0..5 {
-            forward_step(&model, pos % cfg.vocab_size, pos, &mut cache);
+            forward_step(&model, pos % cfg.vocab_size, &mut cache);
         }
         assert_eq!(cache.seq_pos, 5);
         for b in &cache.blocks {
@@ -526,8 +578,8 @@ mod tests {
         // Cached forward: feed the same prefix through forward_step.
         let mut cache = KVCache::new(&model);
         let mut kv_logits: Vec<f32> = Vec::new();
-        for (pos, &id) in ids.iter().enumerate() {
-            kv_logits = forward_step(&model, id, pos, &mut cache);
+        for &id in &ids {
+            kv_logits = forward_step(&model, id, &mut cache);
         }
 
         // Argmax must match - that's the inference-correctness signal.
@@ -563,5 +615,97 @@ mod tests {
                 diff
             );
         }
+    }
+
+    #[test]
+    fn kv_cache_caps_at_max_seq_len_when_more_tokens_arrive() {
+        // Once the cache is full, every subsequent forward_step must keep
+        // the active cache size at exactly `max_seq_len` (oldest row evicted
+        // before the new one is appended). seq_pos still tracks total
+        // forward_step calls and is allowed to exceed max_seq_len.
+        let cfg = tiny_model_config();
+        let model = Model::new(&cfg, 19);
+        let mut cache = KVCache::new(&model);
+
+        let total = cfg.max_seq_len + 5;
+        for step in 0..total {
+            forward_step(&model, step % cfg.vocab_size, &mut cache);
+        }
+        assert_eq!(cache.seq_pos, total);
+        for b in &cache.blocks {
+            for h in &b.heads {
+                assert_eq!(
+                    h.k.shape,
+                    vec![cfg.max_seq_len, cfg.head_dim],
+                    "K cache should cap at max_seq_len rows"
+                );
+                assert_eq!(
+                    h.v.shape,
+                    vec![cfg.max_seq_len, cfg.head_dim],
+                    "V cache should cap at max_seq_len rows"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cached_forward_stays_in_distribution_past_max_seq_len() {
+        // Headline correctness check for the v0.16 KV-cache fix. Before the
+        // fix, generation past `max_seq_len` rotated K via RoPE at positions
+        // outside the trained `[0, max_seq_len - 1]` range; the resulting
+        // attention scores collapsed the softmax to a degenerate distribution
+        // and the sampled tokens were gibberish. After the fix the cache
+        // slides, RoPE is reapplied at logical positions, and logits stay in
+        // a sensible distribution indefinitely.
+        //
+        // We do *not* compare against a fresh Var-forward over the last
+        // `max_seq_len` ids: a sliding KV cache is by design an approximation
+        // of that quantity (the early cached rows were projected when the
+        // surrounding window was different, so the residual-stream history
+        // diverges after the first eviction). The right invariant is that
+        // logits stay finite and non-degenerate.
+
+        let cfg = tiny_model_config();
+        let model = Model::new(&cfg, 23);
+        let total = 2 * cfg.max_seq_len;
+        let ids: Vec<usize> = (0..total).map(|i| (i * 3 + 1) % cfg.vocab_size).collect();
+
+        let mut cache = KVCache::new(&model);
+        let mut kv_logits: Vec<f32> = Vec::new();
+        for &id in &ids {
+            kv_logits = forward_step(&model, id, &mut cache);
+        }
+
+        // (i) every logit finite.
+        for (i, &v) in kv_logits.iter().enumerate() {
+            assert!(v.is_finite(), "logit[{}] = {} not finite past slide", i, v);
+        }
+        // (ii) absolute magnitude bounded - catches catastrophic blowup from
+        // an untrained-RoPE-rotation regression. Pre-fix v0.16 generations
+        // saw scores spike enough to push softmax past >0.999 single-token
+        // mass (the gibberish symptom); a few-units cap on |logit| is well
+        // outside the healthy regime.
+        let max_abs = kv_logits
+            .iter()
+            .copied()
+            .map(f32::abs)
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_abs < 50.0,
+            "logits blew up past slide: max |logit| = {}",
+            max_abs
+        );
+        // (iii) softmax-of-logits should not have collapsed to one token;
+        // top-1 probability staying below 0.95 means the distribution still
+        // has at least a few alternatives left, which is what the sampler
+        // needs to produce non-degenerate text.
+        let probs = softmax_1d(&kv_logits);
+        let top_p = probs.iter().copied().fold(0.0_f32, f32::max);
+        assert!(
+            top_p < 0.95,
+            "softmax collapsed past slide: top-1 prob = {}, probs = {:?}",
+            top_p,
+            probs
+        );
     }
 }

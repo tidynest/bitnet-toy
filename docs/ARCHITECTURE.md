@@ -120,12 +120,19 @@ output agreement within tight FP tolerance on every shared call site.
   graph each step (slow but matches training-time behaviour
   exactly).
 
-- **`inference_kv.rs`** (v0.16) is the KV-cached generator: per-block
-  per-head K and V tensors grow by one row per step instead of being
-  recomputed. ~50-100x faster per-token generation. Pure
-  `Tensor` + `Vec<f32>` math, no autograd, no tape. Shape parity
-  with the autograd path is asserted by
-  `cached_forward_matches_var_forward_to_within_floating_point_drift`.
+- **`inference_kv.rs`** (v0.16; sliding window since v0.16.1) is the
+  KV-cached generator: per-block per-head K and V tensors grow by one
+  row per step instead of being recomputed, capped at `max_seq_len`
+  rows (oldest row evicted when full). K is stored *unrotated*; RoPE
+  is applied at attention-score time using each row's logical
+  (in-cache) position so positions stay in the trained `[0,
+  max_seq_len - 1]` range for arbitrarily long generations. ~50-100x
+  faster per-token generation. Pure `Tensor` + `Vec<f32>` math, no
+  autograd, no tape. Shape parity with the autograd path is asserted
+  by `cached_forward_matches_var_forward_to_within_floating_point_drift`
+  (no-eviction regime); the sliding regime is gated by
+  `kv_cache_caps_at_max_seq_len_when_more_tokens_arrive` and
+  `cached_forward_stays_in_distribution_past_max_seq_len`.
 
 - **`data.rs`** stands alone. Vocab, sliding windows, file reader, LCG,
   shuffler. No upstream dependencies on anything except `std`.
@@ -311,13 +318,42 @@ produces matching outputs within FP tolerance - 1e-3 for
 end-to-end `CudaModel::forward`. The per-op tolerances are tighter
 (~1e-4 absolute, often much less in practice).
 
-This is **inference-only**: the generic helpers do not interact with
-autograd. The existing `Var`-based CPU forward path in `attention.rs`,
-`ffn.rs`, and `block.rs` continues to drive training; Phase 4 will add
-GPU autograd by writing per-op backward kernels and a tape-equivalent
-for `CudaTensor`.
+This is **forward-only** for the existing helpers: they do not
+interact with autograd. The `Var`-based CPU forward path in
+`attention.rs`, `ffn.rs`, and `block.rs` still drives training. Phase
+4 is incrementally adding generic backward helpers on the same trait
+surface.
 
-## CUDA back-end (Phases 1-3)
+Chunk 4.1 landed `matmul_backward<T: MatMul + Transpose2D>(grad_c, a,
+b) -> (grad_a, grad_b)` with zero new kernels - pure composition of
+existing matmul + transpose ops. Chunk 4.2 added `add_backward<T:
+Clone>`, `mul_backward<T: Mul>`, `mul_scalar_backward<T: MulScalar>`
+(all kernel-free) and a new `SiluBackward` trait with a fused
+`silu_backward_f32` NVRTC kernel. Chunk 4.3 added `SoftmaxBackward`
+(per-row JVP `dot_i + cell-wise update`) and `CausalMaskBackward`
+(lower-triangle pass-through), both with new fused kernels. Chunk
+4.4 added `RmsNormBackward` (per-row coupled JVP through the
+`dot * inv_rms^3 / n` factor) and `RopeBackward` (inverse rotation
+with `sin` flipped), again both with new fused kernels. Chunk
+4.5.a then composed all of the above into
+`attention_head_forward_save<T>` + `attention_head_backward<T>` -
+the first hand-traced backward chain on the trait surface, validated
+against `Var`-based autograd as ground truth at `1e-4` per cell and
+across backends at `1e-2`. Chunk 4.5.b mirrored the recipe for the
+SwiGLU FFN with `ffn_forward_save<T>` + `ffn_backward<T>`. Chunk 4.5.c
+composed both into `block_forward_save<T>` + `block_backward<T>` (one
+full pre-norm transformer block). Chunk 4.5.d added cross-entropy
+forward+backward (fused softmax + log-sum-exp loss + the closed-form
+`(softmax - onehot) / seq` gradient). Chunk 4.5.e tied everything
+together in `CudaModel::compute_grads_for_window(input, target) -> (Vec<Tensor>, f32)`
+matching the CPU `compute_grads_for_window` signature exactly. Chunk
+4.5.f added a `cuda-train-demo` CLI subcommand that runs 100 training
+steps end-to-end on GPU (loss 3.0 -> 1.3, ~4 ms/step on the 7940HS +
+RTX 4070 Laptop). **Phase 4 is functionally complete.** The path is
+f32 throughout; Phase 5 (tensor-core ternary kernels) restores BitNet
+semantics on the GPU.
+
+## CUDA back-end (Phases 1-3, plus Phase 4 chunks 4.1-4.5.f, plus Phase 5.a + 5.b)
 
 Optional, gated behind `--features cuda`. Default `cargo build` stays
 dependency-free; CUDA work uses `cudarc 0.19` with `dynamic-loading`

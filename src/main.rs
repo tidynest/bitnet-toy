@@ -265,6 +265,23 @@ pub struct TrainConfig {
     /// giving a smooth tail from previous-run-LR down to floor at the end
     /// of the new run.
     pub cosine_total_steps: Option<usize>,
+    /// Phase 5.a: route gradient computation through the GPU
+    /// `CudaModel::compute_grads_for_window_bitnet` instead of the CPU
+    /// autograd `compute_grads_for_window`. Both paths produce
+    /// gradients in the same canonical visitor order; the GPU path
+    /// applies BitNet ternary STE quantisation matching the autograd
+    /// CPU path's math (`Var::quantise_acts_ste` +
+    /// `Var::quantise_weights_ste`). Requires the binary to be built
+    /// with `--features cuda`; if the flag is set without the feature
+    /// the training loop exits with a clear error.
+    ///
+    /// Default: `false` (CPU autograd path, the v0.1-v0.18 behaviour).
+    /// Performance is dominated by `CudaModel::from_cpu(&model)`
+    /// rebuild per training step (the CPU master weights mutate after
+    /// each AdamW update, so the device-resident copy must be
+    /// refreshed); a follow-up `CudaModel::sync_from_cpu` would skip
+    /// the alloc cost.
+    pub use_cuda_backward: bool,
 }
 
 impl TrainConfig {
@@ -309,6 +326,7 @@ impl TrainConfig {
             start_from_optim: None,
             start_step_offset: 0,
             cosine_total_steps: None,
+            use_cuda_backward: false,
         }
     }
 
@@ -378,6 +396,7 @@ impl TrainConfig {
             start_from_optim: None,
             start_step_offset: 0,
             cosine_total_steps: None,
+            use_cuda_backward: false,
         }
     }
 
@@ -411,6 +430,21 @@ impl TrainConfig {
             max_seq_len: 128,
             n_blocks: 8,
         };
+        // Tuning carried forward from v0.16.x lessons:
+        //   - At seq_len 128 individual per-window gradients carry 2x the
+        //     attention noise of seq_len 64 (more positions, more entropy in
+        //     the softmax during early training). Bumping `batch_size` from
+        //     4 to 16 averages that out at ~4x compute per step but reduces
+        //     gradient variance enough that the same n_steps reaches a
+        //     better val_ppl. n_workers stays at 4 - the GPU path serialises
+        //     workers anyway, and the CPU path's matmul threading is the
+        //     productive parallelism layer at this scale.
+        //   - Warmup 200 -> 500. The bigger model has more parameters whose
+        //     adamw moments need to settle; a longer warmup ramp avoids
+        //     early-step LR overshoot that the v0.13 config got away with at
+        //     ~5M params but starts to bite at ~8.5M.
+        cfg.batch_size = 16;
+        cfg.warmup_steps = 500;
         cfg
     }
 }
@@ -523,6 +557,69 @@ fn compute_batched_grads(
         }
         total_loss += other_loss;
     }
+    for g in avg_grads.iter_mut() {
+        for v in g.data.iter_mut() {
+            *v /= n;
+        }
+    }
+    (avg_grads, total_loss / n)
+}
+
+/// Phase 5.a: CUDA-backed batched gradient computation. Mirrors
+/// `compute_batched_grads`'s signature (averaged grads + mean loss
+/// over `batch_size` windows) but each per-window forward+backward
+/// runs through `CudaModel::compute_grads_for_window_bitnet` instead
+/// of the CPU `Var`-based autograd path.
+///
+/// Implementation notes:
+/// - Rebuilds the device-resident `CudaModel` once per training step
+///   from the current CPU master weights. The CPU weights mutate after
+///   each AdamW update, so the device copy must be refreshed; the
+///   rebuild is one H->D copy per weight tensor (no allocations on the
+///   hot path beyond what `cudarc` does internally).
+/// - Runs windows serially - the GPU is the parallelism layer here.
+///   Spawning multiple CPU threads to dispatch CUDA kernels would just
+///   serialise on the default stream anyway.
+/// - The same window-index sampler (`Lcg::gen_range`) is used as the
+///   CPU path, so swapping `use_cuda_backward` between two runs
+///   preserves training-data ordering for an apples-to-apples
+///   comparison at the same seed.
+#[cfg(feature = "cuda")]
+fn compute_batched_grads_cuda_bitnet(
+    model: &crate::model::Model,
+    windows: &[(Vec<usize>, Vec<usize>)],
+    rng: &mut crate::data::Lcg,
+    batch_size: usize,
+) -> (Vec<crate::tensor::Tensor>, f32) {
+    use crate::cuda::CudaModel;
+    assert!(batch_size >= 1, "batch_size must be >= 1");
+
+    // Rebuild CudaModel once per training step (master weights moved
+    // last step). H->D cost is amortised across the batch.
+    let cuda_model = CudaModel::from_cpu(model);
+
+    // Sample all window indices up front so changing batch_size does
+    // not change which windows the run sees at the same RNG state.
+    let indices: Vec<usize> = (0..batch_size).map(|_| rng.gen_range(windows.len())).collect();
+
+    // Average gradients across the batch. Start from the first
+    // result's tensors (move out, no clone) and sum the rest into them.
+    let first_idx = indices[0];
+    let (input, target) = &windows[first_idx];
+    let (mut avg_grads, mut total_loss) =
+        cuda_model.compute_grads_for_window_bitnet(input, target);
+    for &idx in &indices[1..] {
+        let (input, target) = &windows[idx];
+        let (other_grads, other_loss) =
+            cuda_model.compute_grads_for_window_bitnet(input, target);
+        for (a, b) in avg_grads.iter_mut().zip(&other_grads) {
+            for (av, bv) in a.data.iter_mut().zip(&b.data) {
+                *av += bv;
+            }
+        }
+        total_loss += other_loss;
+    }
+    let n = batch_size as f32;
     for g in avg_grads.iter_mut() {
         for v in g.data.iter_mut() {
             *v /= n;
@@ -734,13 +831,22 @@ fn train_bitnet_lm(
         );
         opt.lr = lr;
 
-        let (mut grads, batch_loss) = compute_batched_grads(
-            &model,
-            &windows,
-            &mut rng,
-            batch_size,
-            n_workers,
-        );
+        let (mut grads, batch_loss) = if cfg.use_cuda_backward {
+            #[cfg(feature = "cuda")]
+            {
+                compute_batched_grads_cuda_bitnet(&model, &windows, &mut rng, batch_size)
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                eprintln!(
+                    "error: TrainConfig.use_cuda_backward = true but the binary was built\n       \
+                     without the `cuda` feature. Rebuild with: cargo build --release --features cuda"
+                );
+                std::process::exit(2);
+            }
+        } else {
+            compute_batched_grads(&model, &windows, &mut rng, batch_size, n_workers)
+        };
         if batch_loss < min_loss {
             min_loss = batch_loss;
         }
@@ -820,12 +926,23 @@ fn models_path(filename: &str) -> std::path::PathBuf {
 /// `cargo run --release -- shakespeare [resume_path]`. Trains (or continues
 /// training) a larger BitNet on the full TinyShakespeare corpus, exports all
 /// three formats, and generates samples in greedy + two temperature modes.
-fn run_shakespeare_training(resume_path: Option<std::path::PathBuf>, large: bool) {
+fn run_shakespeare_training(
+    resume_path: Option<std::path::PathBuf>,
+    large: bool,
+    use_cuda: bool,
+) {
     let mut cfg = if large {
         TrainConfig::shakespeare_large()
     } else {
         TrainConfig::shakespeare()
     };
+    cfg.use_cuda_backward = use_cuda;
+    if use_cuda {
+        // GPU is the parallelism layer; running multiple threads to
+        // dispatch CUDA kernels would just serialise on the default
+        // stream. Force serial-batched mode.
+        cfg.n_workers = 1;
+    }
     let path_present = cfg
         .corpus_path
         .as_ref()
@@ -897,90 +1014,7 @@ fn run_shakespeare_training(resume_path: Option<std::path::PathBuf>, large: bool
         min_seen / initial
     );
 
-    println!("\n-- greedy generation --");
-    for prompt in ["ROMEO:", "To be ", "King "] {
-        let g = inference::generate(&model, &vocab, prompt, 200);
-        println!("\nprompt: {:?}\n{}", prompt, g);
-    }
-
-    // Sampling modes: temperature alone (raw distribution shaped), top-k
-    // (capped candidate set), top-p / nucleus (adaptive cumulative-probability
-    // cutoff). Each call uses the same RNG so re-runs can be compared.
-    let mut rng = data::Lcg::new(0xCAFEF00D);
-
-    println!("\n-- temperature sampling (T=0.8) --");
-    for prompt in ["ROMEO:", "To be ", "King "] {
-        let g = inference::generate_with_mode(
-            &model,
-            &vocab,
-            prompt,
-            200,
-            inference::SamplingMode::Temperature { temperature: 0.8 },
-            &mut rng,
-        );
-        println!("\nprompt: {:?}\n{}", prompt, g);
-    }
-
-    println!("\n-- top-k sampling (k=10, T=0.8) --");
-    for prompt in ["ROMEO:", "To be ", "King "] {
-        let g = inference::generate_with_mode(
-            &model,
-            &vocab,
-            prompt,
-            200,
-            inference::SamplingMode::TopK {
-                k: 10,
-                temperature: 0.8,
-            },
-            &mut rng,
-        );
-        println!("\nprompt: {:?}\n{}", prompt, g);
-    }
-
-    println!("\n-- top-p / nucleus sampling (p=0.9, T=0.8) --");
-    for prompt in ["ROMEO:", "To be ", "King "] {
-        let g = inference::generate_with_mode(
-            &model,
-            &vocab,
-            prompt,
-            200,
-            inference::SamplingMode::TopP {
-                p: 0.9,
-                temperature: 0.8,
-            },
-            &mut rng,
-        );
-        println!("\nprompt: {:?}\n{}", prompt, g);
-    }
-
-    // KV-cache top-p (v0.16). Same architecture, same sampling mode, but the
-    // forward path keeps a per-head cache of (K, V) rows that grows by one
-    // entry per generated token. Per-step compute drops from O(t * H^2 *
-    // blocks) to O(H^2 * blocks) - a ~50-100x wall-clock speedup at this
-    // model size for 200-token samples. Output diverges slightly from the
-    // Var path due to f32 summation order in attention; the argmax of each
-    // step's logits matches the Var path, but downstream sampling pulls
-    // different tokens once the small drift accumulates.
-    println!("\n-- KV-cache top-p (p=0.9, T=0.8; v0.16 fast path) --");
-    let kv_t0 = std::time::Instant::now();
-    for prompt in ["ROMEO:", "To be ", "King "] {
-        let g = inference_kv::generate_with_cache(
-            &model,
-            &vocab,
-            prompt,
-            200,
-            inference::SamplingMode::TopP {
-                p: 0.9,
-                temperature: 0.8,
-            },
-            &mut rng,
-        );
-        println!("\nprompt: {:?}\n{}", prompt, g);
-    }
-    println!(
-        "\n(KV-cache top-p generated 3 x 200 tokens in {:.2}s)",
-        kv_t0.elapsed().as_secs_f32()
-    );
+    print_generation_samples(&model, &vocab);
 
     // Two artefacts side by side, each carrying only what its role needs:
     //
@@ -1017,6 +1051,193 @@ fn run_shakespeare_training(resume_path: Option<std::path::PathBuf>, large: bool
         path.display(),
         packed.len() as f32 / 1024.0
     );
+}
+
+/// Print the same five generation passes the trainer prints at the end
+/// of a run: greedy, temperature, top-k, top-p, and KV-cache top-p. Used
+/// both by `run_shakespeare_training` (post-train tail) and the standalone
+/// `sample` subcommand below.
+fn print_generation_samples(model: &crate::model::Model, vocab: &data::Vocab) {
+    println!("\n-- greedy generation --");
+    for prompt in ["ROMEO:", "To be ", "King "] {
+        let g = inference::generate(model, vocab, prompt, 200);
+        println!("\nprompt: {:?}\n{}", prompt, g);
+    }
+
+    // Sampling modes: temperature alone (raw distribution shaped), top-k
+    // (capped candidate set), top-p / nucleus (adaptive cumulative-probability
+    // cutoff). Each call uses the same RNG so re-runs can be compared.
+    let mut rng = data::Lcg::new(0xCAFEF00D);
+
+    println!("\n-- temperature sampling (T=0.8) --");
+    for prompt in ["ROMEO:", "To be ", "King "] {
+        let g = inference::generate_with_mode(
+            model,
+            vocab,
+            prompt,
+            200,
+            inference::SamplingMode::Temperature { temperature: 0.8 },
+            &mut rng,
+        );
+        println!("\nprompt: {:?}\n{}", prompt, g);
+    }
+
+    println!("\n-- top-k sampling (k=10, T=0.8) --");
+    for prompt in ["ROMEO:", "To be ", "King "] {
+        let g = inference::generate_with_mode(
+            model,
+            vocab,
+            prompt,
+            200,
+            inference::SamplingMode::TopK {
+                k: 10,
+                temperature: 0.8,
+            },
+            &mut rng,
+        );
+        println!("\nprompt: {:?}\n{}", prompt, g);
+    }
+
+    println!("\n-- top-p / nucleus sampling (p=0.9, T=0.8) --");
+    for prompt in ["ROMEO:", "To be ", "King "] {
+        let g = inference::generate_with_mode(
+            model,
+            vocab,
+            prompt,
+            200,
+            inference::SamplingMode::TopP {
+                p: 0.9,
+                temperature: 0.8,
+            },
+            &mut rng,
+        );
+        println!("\nprompt: {:?}\n{}", prompt, g);
+    }
+
+    // Lower-temperature top-p pass. Tightens the distribution to favour
+    // the model's high-confidence completions; tends to produce more
+    // syntactically grammatical output at the cost of variety. At
+    // small char-LM scales the model has learnt local Shakespeare
+    // patterns much more reliably than long-range coherence, so a
+    // lower T often surfaces the cleaner short clauses without the
+    // hallucinated words that T=0.8 produces.
+    println!("\n-- top-p / nucleus sampling (p=0.9, T=0.5) --");
+    for prompt in ["ROMEO:", "To be ", "King "] {
+        let g = inference::generate_with_mode(
+            model,
+            vocab,
+            prompt,
+            200,
+            inference::SamplingMode::TopP {
+                p: 0.9,
+                temperature: 0.5,
+            },
+            &mut rng,
+        );
+        println!("\nprompt: {:?}\n{}", prompt, g);
+    }
+
+    // KV-cache top-p (v0.16; sliding-window since v0.16.1). Same
+    // architecture, same sampling mode, but the forward path keeps a
+    // per-head cache of (K, V) rows. K is stored unrotated; RoPE is
+    // applied at attention-score time using each row's logical (in-cache)
+    // index. Cache caps at `max_seq_len` rows and slides (oldest evicted)
+    // so positions stay in the trained range for arbitrarily long
+    // generations. Per-step compute drops from O(t * H^2 * blocks) to
+    // O(H^2 * blocks) - a ~50-100x wall-clock speedup. Output diverges
+    // slightly from the Var path due to f32 summation order in attention.
+    println!("\n-- KV-cache top-p (p=0.9, T=0.8; v0.16.1 sliding fast path) --");
+    let kv_t0 = std::time::Instant::now();
+    for prompt in ["ROMEO:", "To be ", "King "] {
+        let g = inference_kv::generate_with_cache(
+            model,
+            vocab,
+            prompt,
+            200,
+            inference::SamplingMode::TopP {
+                p: 0.9,
+                temperature: 0.8,
+            },
+            &mut rng,
+        );
+        println!("\nprompt: {:?}\n{}", prompt, g);
+    }
+    println!(
+        "\n(KV-cache top-p generated 3 x 200 tokens in {:.2}s)",
+        kv_t0.elapsed().as_secs_f32()
+    );
+}
+
+/// Standalone "sample only" entry point. Loads a checkpoint
+/// (`.f32.bin` or `.ternary*.bin`), reconstructs the vocab from the
+/// training corpus on disk, and prints the same five generation passes
+/// the trainer prints. Lets the user verify a model's generation quality
+/// without paying the ~50-minute cost of a fresh training run; especially
+/// useful for verifying inference-path bug fixes (e.g. the v0.16.1
+/// KV-cache sliding-window fix) against an existing checkpoint.
+fn run_sample_only(path: std::path::PathBuf) {
+    use crate::data::{Vocab, read_corpus};
+
+    if !path.exists() {
+        eprintln!("checkpoint not found: {}", path.display());
+        std::process::exit(1);
+    }
+    let corpus_path = std::path::PathBuf::from("data/tinyshakespeare.txt");
+    if !corpus_path.exists() {
+        eprintln!(
+            "Could not find {} (needed to rebuild the same vocab the model was trained against).\n\
+             Download it with:\n  \
+             curl -sSL https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt \\\n    \
+             -o data/tinyshakespeare.txt",
+            corpus_path.display()
+        );
+        std::process::exit(1);
+    }
+
+    let mut f = match std::fs::File::open(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("could not open checkpoint {}: {}", path.display(), e);
+            std::process::exit(1);
+        }
+    };
+    let (model, fmt, _optim) = match export::import(&mut f) {
+        Ok(triple) => triple,
+        Err(e) => {
+            eprintln!("could not parse checkpoint {}: {}", path.display(), e);
+            std::process::exit(1);
+        }
+    };
+    println!("loaded {:?}-format checkpoint from {}", fmt, path.display());
+    println!(
+        "model        = hidden {}, ffn {}, n_heads {}, head_dim {}, blocks {}, seq_len {}",
+        model.config.hidden_dim,
+        model.config.ffn_dim,
+        model.config.n_heads,
+        model.config.head_dim,
+        model.config.n_blocks,
+        model.config.max_seq_len
+    );
+
+    let corpus = match read_corpus(&corpus_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("could not read {}: {}", corpus_path.display(), e);
+            std::process::exit(1);
+        }
+    };
+    let vocab = Vocab::from_text(&corpus);
+    if vocab.size() != model.config.vocab_size {
+        eprintln!(
+            "vocab size mismatch: corpus has {} chars, checkpoint expects {}.\n\
+             The corpus on disk has drifted from the one this model was trained on.",
+            vocab.size(),
+            model.config.vocab_size
+        );
+        std::process::exit(1);
+    }
+
+    print_generation_samples(&model, &vocab);
 }
 
 /// End-to-end CPU vs GPU model forward benchmark. Builds a tiny model
@@ -1116,7 +1337,8 @@ fn run_cuda_forward_bench() {
                 };
                 x = block_inference(&x, &heads, &ffn, model.config.head_dim);
             }
-            x.rmsnorm().matmul(&model.lm_head)
+            // Tied LM head: same tensor as token_embed, transposed.
+            x.rmsnorm().matmul(&model.token_embed.transpose_2d())
         };
 
         // Build the GPU model once (weights stay resident across all
@@ -1288,6 +1510,133 @@ fn run_cuda_demo() {
     );
 }
 
+/// Phase 4 chunk 4.5.f: end-to-end GPU training proof-of-concept.
+/// Builds a small model from random init, trains it for `n_steps`
+/// using `CudaModel::compute_grads_for_window` for the forward+
+/// backward pass, applies AdamW updates on CPU. Verifies that loss
+/// decreases meaningfully so the entire Phase 4 stack is exercised
+/// in a real training context.
+///
+/// **Important caveat**: this path is **f32 throughout** - no BitNet
+/// ternary STE quantisation in either forward or backward. Trains an
+/// f32 transformer, NOT a ternary BitNet. Phase 5 (ternary tensor
+/// cores) restores BitNet semantics on the GPU. Until then, treat
+/// this as a Phase 4 wiring proof, not a production training path.
+///
+/// Per-step cost analysis (v0.13-shape demo, 7940HS + RTX 4070 Laptop):
+///   - rebuild CudaModel from CPU weights: H->D copy of every weight
+///     tensor every step. At v0.13 scale (~5M params, ~20 MB f32) the
+///     PCIe Gen4 round-trip is ~1 ms per rebuild.
+///   - forward+backward through one block stack: tens of kernel
+///     launches at ~10-30 us each (mostly launch overhead, not
+///     kernel time). Several ms per window at v0.13 scale.
+///   - optimiser update on CPU: linear in param count, ~few ms.
+///
+/// The rebuild cost is the obvious next perf target: a follow-up
+/// chunk should add `CudaModel::sync_from_cpu(&Model)` that overwrites
+/// existing device buffers in place via `memcpy_htod`, so allocation
+/// overhead is paid once at startup instead of every step.
+#[cfg(feature = "cuda")]
+fn run_cuda_train_demo() {
+    use crate::cuda::{CudaModel, cuda_state};
+    use crate::data::{Lcg, TINY_CORPUS, Vocab, make_windows};
+    use crate::model::{Model, ModelConfig};
+    use crate::optim::{AdamW, clip_grad_norm_tensors};
+    use std::time::Instant;
+
+    if cuda_state().is_err() {
+        eprintln!(
+            "error: cuda_state() failed - is the CUDA runtime available? \
+             try: PATH=/opt/cuda/bin:$PATH CUDA_PATH=/opt/cuda \\\n             \
+             cargo run --release --features cuda -- cuda-train-demo"
+        );
+        std::process::exit(2);
+    }
+    println!("── cuda-train-demo: end-to-end GPU forward+backward + CPU optimiser ──");
+    println!("    (Phase 4 chunk 4.5.f wiring proof - f32 throughout, no ternary STE)\n");
+
+    // Tiny config so the demo finishes in a few seconds. Same vocab
+    // size as TINY_CORPUS produces, small attention + FFN dims so
+    // each window's GPU forward+backward is dominated by launch
+    // overhead but still runs end-to-end.
+    let vocab = Vocab::from_text(TINY_CORPUS);
+    let model_cfg = ModelConfig {
+        vocab_size: vocab.size(),
+        hidden_dim: 32,
+        n_heads: 4,
+        head_dim: 8,
+        ffn_dim: 64,
+        max_seq_len: 16,
+        n_blocks: 2,
+    };
+    let mut model = Model::new(&model_cfg, 1337);
+    let n_steps = 100usize;
+    let peak_lr = 5e-3_f32;
+
+    let ids = vocab.encode(TINY_CORPUS);
+    let windows = make_windows(&ids, model_cfg.max_seq_len);
+    assert!(!windows.is_empty(), "TINY_CORPUS produced no windows");
+    let mut rng = Lcg::new(1337);
+
+    let mut opt = AdamW::new_for(&model, peak_lr);
+
+    println!(
+        "config: hidden={}  n_heads={}  ffn={}  blocks={}  seq={}  vocab={}",
+        model_cfg.hidden_dim,
+        model_cfg.n_heads,
+        model_cfg.ffn_dim,
+        model_cfg.n_blocks,
+        model_cfg.max_seq_len,
+        vocab.size(),
+    );
+    println!("running {n_steps} steps with peak_lr = {peak_lr:.4}\n");
+
+    let mut min_loss: f32 = f32::INFINITY;
+    let mut initial_loss: f32 = f32::NAN;
+    let t0 = Instant::now();
+    for step in 0..n_steps {
+        let idx = rng.gen_range(windows.len());
+        let (input, target) = &windows[idx];
+        // Rebuild CudaModel from current CPU weights every step (CPU
+        // weights mutated by previous opt step). Cost is bearable at
+        // demo scale; production wiring would mutate in place.
+        let cuda_model = CudaModel::from_cpu(&model);
+        let (mut grads, loss) = cuda_model.compute_grads_for_window(input, target);
+        if step == 0 {
+            initial_loss = loss;
+        }
+        if loss < min_loss {
+            min_loss = loss;
+        }
+        let _pre_clip = clip_grad_norm_tensors(&mut grads, 1.0);
+        opt.step_with_grads(&mut model, &grads);
+        if step % 10 == 0 || step == n_steps - 1 {
+            println!("step {:>4}   loss = {:.4}   min_seen = {:.4}", step, loss, min_loss);
+        }
+    }
+    let elapsed = t0.elapsed();
+    println!(
+        "\ndone: {n_steps} steps in {:.1}s  ({:.1} ms/step)",
+        elapsed.as_secs_f32(),
+        elapsed.as_secs_f32() * 1000.0 / n_steps as f32,
+    );
+    println!(
+        "  initial_loss = {:.4}   final-window_loss = (last printed line)   min_seen = {:.4}",
+        initial_loss, min_loss,
+    );
+    if min_loss < initial_loss * 0.7 {
+        println!(
+            "  loss decreased {:.1}% from initial - Phase 4 GPU training stack works.",
+            (1.0 - min_loss / initial_loss) * 100.0
+        );
+    } else {
+        println!(
+            "  loss decreased {:.1}% from initial. Consider longer run / different hyperparameters.",
+            (1.0 - min_loss / initial_loss) * 100.0
+        );
+    }
+}
+
 fn main() {
     // CLI dispatch:
     //   cargo run --release                                       -- runs M4-M10 demo
@@ -1295,7 +1644,13 @@ fn main() {
     //   cargo run --release -- shakespeare <resume_path>          -- resume ~5M
     //   cargo run --release -- shakespeare-large                  -- fresh ~8.5M training (seq 128)
     //   cargo run --release -- shakespeare-large <resume_path>    -- resume ~8.5M
+    //   cargo run --release -- sample <checkpoint_path>           -- skip training; just print generation samples
+    //   cargo run --release --features cuda -- cuda-shakespeare           -- fresh ~5M GPU bitnet training
+    //   cargo run --release --features cuda -- cuda-shakespeare <path>    -- resume ~5M on GPU
+    //   cargo run --release --features cuda -- cuda-shakespeare-large     -- fresh ~8.5M GPU bitnet
     //   cargo run --release --features cuda -- cuda-demo          -- CPU vs CUDA matmul timings
+    //   cargo run --release --features cuda -- cuda-forward-bench -- end-to-end CudaModel forward bench
+    //   cargo run --release --features cuda -- cuda-train-demo    -- Phase 4 GPU forward+backward proof
     let args: Vec<String> = std::env::args().collect();
     if args.len() > 1 && (args[1] == "shakespeare" || args[1] == "shakespeare-large") {
         let large = args[1] == "shakespeare-large";
@@ -1303,8 +1658,42 @@ fn main() {
             .get(2)
             .map(|s| std::path::PathBuf::from(s))
             .filter(|p| p.exists());
-        run_shakespeare_training(resume_path, large);
+        run_shakespeare_training(resume_path, large, /*use_cuda=*/ false);
         return;
+    }
+    if args.len() > 1 && args[1] == "sample" {
+        let path = match args.get(2) {
+            Some(s) => std::path::PathBuf::from(s),
+            None => {
+                eprintln!(
+                    "usage: cargo run --release -- sample <checkpoint_path>\n\
+                     example: cargo run --release -- sample models/shakespeare.f32.bin"
+                );
+                std::process::exit(2);
+            }
+        };
+        run_sample_only(path);
+        return;
+    }
+    if args.len() > 1 && (args[1] == "cuda-shakespeare" || args[1] == "cuda-shakespeare-large") {
+        #[cfg(feature = "cuda")]
+        {
+            let large = args[1] == "cuda-shakespeare-large";
+            let resume_path = args
+                .get(2)
+                .map(|s| std::path::PathBuf::from(s))
+                .filter(|p| p.exists());
+            run_shakespeare_training(resume_path, large, /*use_cuda=*/ true);
+            return;
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            eprintln!(
+                "error: this binary was built without the `cuda` feature.\n       \
+                 rebuild with: cargo build --release --features cuda"
+            );
+            std::process::exit(2);
+        }
     }
     #[cfg(feature = "cuda")]
     if args.len() > 1 && args[1] == "cuda-demo" {
@@ -1316,8 +1705,17 @@ fn main() {
         run_cuda_forward_bench();
         return;
     }
+    #[cfg(feature = "cuda")]
+    if args.len() > 1 && args[1] == "cuda-train-demo" {
+        run_cuda_train_demo();
+        return;
+    }
     #[cfg(not(feature = "cuda"))]
-    if args.len() > 1 && (args[1] == "cuda-demo" || args[1] == "cuda-forward-bench") {
+    if args.len() > 1
+        && (args[1] == "cuda-demo"
+            || args[1] == "cuda-forward-bench"
+            || args[1] == "cuda-train-demo")
+    {
         eprintln!("error: this binary was built without the `cuda` feature.");
         eprintln!("       rebuild with: cargo build --release --features cuda");
         std::process::exit(2);

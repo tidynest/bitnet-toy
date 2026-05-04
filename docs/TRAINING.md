@@ -496,6 +496,452 @@ sync. Stripping cut the med config from ~7x slower to ~4x slower
 (the tiny config barely moved because launch overhead, not sync,
 dominates there).
 
+### CUDA back-end (Phase 4 chunk 4.1: matmul backward)
+
+The first Phase 4 chunk lands a generic backward helper for matmul on
+the existing trait surface, with zero new kernels:
+
+```rust
+// src/device.rs
+pub fn matmul_backward<T: MatMul + Transpose2D>(
+    grad_c: &T, a: &T, b: &T,
+) -> (T, T) {
+    let grad_a = grad_c.matmul(&b.transpose_2d());
+    let grad_b = a.transpose_2d().matmul(grad_c);
+    (grad_a, grad_b)
+}
+```
+
+This is the same closed-form identity the CPU `Var::matmul` backward
+closure uses (`autograd.rs:253-260`). Because it composes only
+existing traits, both `Tensor` and `CudaTensor` already satisfy the
+bounds; no GPU autograd machinery is needed yet.
+
+Two test patterns established here that later Phase 4 chunks (silu,
+mul, softmax, rmsnorm, rope) will mirror per op:
+
+1. **CPU finite-difference check.** Pick a small case with non-trivial
+   upstream gradient `grad_c`, compute analytic gradients via the
+   helper, central-difference check every cell against
+   `f(A, B) = sum(grad_c * (A @ B))`. Catches math bugs in the helper
+   *and* drift in the underlying ops.
+2. **Cross-backend agreement.** Same generic helper monomorphised for
+   `Tensor` and `CudaTensor` over identical input bytes; gradient
+   tensors agree within `1e-4 + 1e-4 * |val|` for matmul-backward,
+   looser tolerances for chained chunks.
+
+### CUDA back-end (Phase 4 chunk 4.2: elementwise backwards)
+
+Chunk 4.2 landed the four elementwise backwards the FFN + residual
+paths need. Three are pure trait composition (zero new kernels); the
+fourth (`Silu`) gets one fused kernel.
+
+```rust
+// src/device.rs
+pub fn add_backward<T: Clone>(grad_c: &T) -> (T, T) {
+    (grad_c.clone(), grad_c.clone())
+}
+
+pub fn mul_backward<T: Mul>(grad_c: &T, a: &T, b: &T) -> (T, T) {
+    (grad_c.mul(b), grad_c.mul(a))
+}
+
+pub fn mul_scalar_backward<T: MulScalar>(grad_c: &T, s: f32) -> T {
+    grad_c.mul_scalar(s)
+}
+
+pub trait SiluBackward {
+    fn silu_backward(&self, x: &Self) -> Self;   // self = grad_y
+}
+pub fn silu_backward<T: SiluBackward>(grad_y: &T, x: &T) -> T {
+    grad_y.silu_backward(x)
+}
+```
+
+The `silu_backward_f32` NVRTC kernel reads `grad_y[i]` and `x[i]`,
+computes `sig = 1/(1 + exp(-x[i]))` once, writes `grad_y[i] * sig *
+(1 + x[i] * (1 - sig))`. Same per-cell formula the CPU
+`Var::silu` closure uses. One thread per element; same launch shape
+as forward `silu_f32`.
+
+`CudaTensor` is now `Clone` via `clone_dtod` (device-to-device
+memcpy). The `add_backward` cross-backend test arm doubles as the
+only test of `CudaTensor::clone()`, so a regression in `clone_dtod`
+will surface there.
+
+### CUDA back-end (Phase 4 chunk 4.3: softmax + causal-mask backwards)
+
+Chunk 4.3 lands two fused NVRTC kernels for the attention-shape
+backwards:
+
+```rust
+// src/device.rs
+pub trait SoftmaxBackward {
+    fn softmax_backward(&self, s_out: &Self) -> Self;  // self = grad_y
+}
+pub trait CausalMaskBackward {
+    fn causal_mask_backward(&self) -> Self;            // self = grad_y
+}
+pub fn softmax_backward<T: SoftmaxBackward>(grad_y: &T, s_out: &T) -> T;
+pub fn causal_mask_backward<T: CausalMaskBackward>(grad_y: &T) -> T;
+```
+
+The softmax JVP collapses to one row reduction plus a per-cell
+update:
+
+```
+dot_i             = sum_k grad_y[i, k] * s_out[i, k]
+grad_in[i, j]     = s_out[i, j] * (grad_y[i, j] - dot_i)
+```
+
+Critically, `s_out` is the saved softmax **output**, not the input -
+the autograd `Var::softmax` saves output for exactly this reason
+(autograd.rs:618-621), and the trait method follows suit. Both new
+kernels load out of the same NVRTC module as the existing op kernels
+(no extra `compile_ptx` cost):
+
+- `softmax_backward_row_f32`: one thread per row matching forward
+  `softmax_row_f32`'s launch shape; two passes per row (compute dot,
+  then per-cell update).
+- `causal_mask_backward_f32`: 2-D 16x16 grid mirroring forward
+  `causal_mask_f32`'s shape; one thread per output cell. The kernel
+  is purely copy-or-zero, so cross-backend agreement is byte-
+  identical, not approximate.
+
+Test pattern note: the causal-mask backward uses a structural check
+(identity below diagonal, zero above) rather than finite differences,
+because the forward writes `-inf` into the upper triangle, which
+would make `sum(grad_y * forward(x))` itself non-finite.
+
+### CUDA back-end (Phase 4 chunk 4.4: rmsnorm + rope backwards)
+
+Chunk 4.4 closes the per-op backward set. After this chunk every
+forward op the model uses has a generic backward helper on the trait
+surface.
+
+```rust
+// src/device.rs
+pub trait RmsNormBackward {
+    fn rmsnorm_backward(&self, x_saved: &Self) -> Self;  // self = grad_y
+}
+pub trait RopeBackward {
+    fn rope_backward(&self) -> Self;                     // self = grad_y
+}
+pub fn rmsnorm_backward<T: RmsNormBackward>(grad_y: &T, x_saved: &T) -> T;
+pub fn rope_backward<T: RopeBackward>(grad_y: &T) -> T;
+```
+
+RMSNorm backward couples every cell of a row through the shared
+`rms_i` scalar:
+
+```
+inv_rms_i        = 1 / sqrt(mean_j(x_saved[i, j]^2) + EPS)        # EPS = 1e-5
+dot_i            = sum_j x_saved[i, j] * grad_y[i, j]
+factor_i         = dot_i * inv_rms_i^3 / n
+grad_in[i, j]    = grad_y[i, j] * inv_rms_i - x_saved[i, j] * factor_i
+```
+
+The kernel recomputes `rms_i` from `x_saved` rather than carrying a
+separate `[m]` saved-norms tensor across the trait surface (cost: one
+extra row pass; benefit: API stays symmetric with
+`softmax_backward(grad_y, s_out)`).
+
+RoPE backward is parameter-free - the angles depend only on shape -
+so the trait method is single-arg. Per `(pos, pair)` it applies the
+inverse rotation: same trig table as forward with `sin` flipped,
+because each per-pair rotation is orthogonal:
+
+```
+grad_in[pos, 2i]   =  grad_y[pos, 2i]   * cos + grad_y[pos, 2i+1] * sin
+grad_in[pos, 2i+1] = -grad_y[pos, 2i]   * sin + grad_y[pos, 2i+1] * cos
+```
+
+Both new kernels (`rmsnorm_backward_row_f32`,
+`rope_backward_f32`) load out of the same NVRTC module as the existing
+op kernels - no extra `compile_ptx` cost. Launch shapes mirror the
+forwards exactly (rmsnorm: one thread per row; rope: 2-D 16x16 over
+`(pair, pos)`).
+
+Tolerance note: the cross-backend RoPE test runs at one order of
+magnitude looser than the rmsnorm arm (`1e-3` vs `1e-4`) because
+`cos`, `sin`, and `powf` differ in the last few mantissa bits between
+CPU libm and CUDA's intrinsics, the same trade-off the forward-RoPE
+test absorbs.
+
+### CUDA back-end (Phase 4 chunk 4.5.a: attention-head forward+backward)
+
+Chunk 4.5.a wires the chunk-4.1-4.4 op-level backwards into a hand-
+traced backward chain for one attention head, expressed against the
+trait surface (so it runs on either backend without modification):
+
+```rust
+// src/device.rs
+pub struct AttentionHeadSaved<T> { pub q: T, pub k: T, pub v: T,
+                                   pub attn: T, pub ctx: T }
+pub struct AttentionHeadGrads<T>  { pub grad_x: T, pub grad_w_q: T,
+                                    pub grad_w_k: T, pub grad_w_v: T,
+                                    pub grad_w_o: T }
+
+pub fn attention_head_forward_save<T>(...) -> (T, AttentionHeadSaved<T>)
+where T: MatMul + MulScalar + Transpose2D + Softmax + CausalMask + Rope;
+
+pub fn attention_head_backward<T>(grad_out, x, saved, w_q, w_k, w_v, w_o,
+                                  head_dim) -> AttentionHeadGrads<T>
+where T: MatMul + Add + MulScalar + Transpose2D
+       + SoftmaxBackward + CausalMaskBackward + RopeBackward;
+```
+
+Two design notes:
+
+- **Saved-tensor selection follows kernel needs.** Matmul backward
+  needs both operands; softmax backward needs the saved output;
+  RoPE / causal-mask / mul_scalar backwards are shape-only. So the
+  Saved struct holds exactly five intermediates - `q`, `k`
+  (post-RoPE), `v`, `attn`, `ctx`. Pre-mask / pre-mul_scalar /
+  pre-softmax tensors are not saved because their backwards are
+  shape-only.
+- **No `TransposeBackward` trait.** The matmul `q @ k.T` backward
+  gives `grad_q_post` and `grad_kt`; we recover `grad_k_post` by
+  transposing `grad_kt` again, since transpose is its own inverse
+  for rank-2 tensors. This avoids inflating the trait surface.
+
+The hand-traced chain runs the autograd graph in reverse-creation
+order, calling each chunk-4.1-4.4 helper in turn. `grad_x` ends up
+as the residual sum of three branches (Q / K / V matmuls all
+consume `x`), built via two `Add` calls.
+
+Validation strategy that the rest of chunk 4.5 will mirror:
+
+1. **Autograd ground-truth test.** Build the same head two ways:
+   path A via the project's pre-Phase-4 `Var`-based autograd
+   (`tape.backward(out.id)` seeds with ones); path B via the new
+   helpers on plain `Tensor`. Path B passes `Tensor::ones(out.shape)`
+   as `grad_out` for a like-for-like compare. Asserts forward
+   equality at `1e-5 + 1e-5 * |val|` and gradient equality at
+   `1e-4 + 1e-4 * |val|`. **Strongest correctness gate** - any bug
+   in any chunk-4.1-4.4 backward kernel or any wiring mistake in
+   the chain shows up here.
+2. **Cross-backend test.** Same helper monomorphised for `Tensor`
+   and `CudaTensor` over identical inputs. Tolerances loosen to
+   `5e-3` forward / `1e-2` backward because the chain composes 5
+   matmuls + softmax + 2 ropes + transpose + 3-branch residual sum,
+   accumulating drift from cuBLAS / NVRTC parallel-reduction f32
+   sums. **First test that exercises every Phase 4 backward kernel
+   in one chain on the GPU.**
+
+### CUDA back-end (Phase 4 chunk 4.5.b: SwiGLU FFN forward+backward)
+
+Chunk 4.5.b mirrors the chunk-4.5.a recipe for the FFN:
+
+```rust
+// src/device.rs
+pub struct FfnSaved<T> { pub gate_pre: T, pub gate: T, pub up: T,
+                         pub h: T }
+pub struct FfnGrads<T>  { pub grad_x: T, pub grad_w_gate: T,
+                          pub grad_w_up: T, pub grad_w_down: T }
+
+pub fn ffn_forward_save<T>(x, w_gate, w_up, w_down) -> (T, FfnSaved<T>)
+where T: MatMul + Silu + Mul;
+
+pub fn ffn_backward<T>(grad_y, x, saved, w_gate, w_up, w_down) -> FfnGrads<T>
+where T: MatMul + Mul + Add + Transpose2D + SiluBackward;
+```
+
+Saved-tensor selection follows the chunk-4.5.a rule:
+
+- `gate_pre` is the input to silu, needed for `silu_backward`.
+- `gate` is the silu output, needed for `mul_backward(grad_h, gate, up)`.
+- `up` is the second mul operand.
+- `h = gate * up` is the input to the final matmul, needed for
+  `matmul_backward(grad_y, h, w_down)`.
+
+Trait bounds are notably **shorter** than chunk 4.5.a's set: no
+softmax / causal-mask / RoPE / RMSNorm pieces, since the FFN
+backward is its own neat island in the trait graph. The cross-
+backend test uses **tighter tolerances** than 4.5.a (`1e-3`
+forward, `5e-3` backward) because the chain is shorter (3 matmuls
++ silu + mul vs 5 matmuls + softmax + 2 ropes + transpose +
+3-branch sum), so less drift accumulates from cuBLAS / NVRTC
+parallel-reduction f32 sums.
+
+### CUDA back-end (Phase 5.b: tensor-core int8 GEMM behind BitLinear)
+
+Phase 5.b rewrites the `BitLinear` trait impl on `CudaTensor` to run
+the matmul in INT32 on Ada tensor cores via `cublasGemmEx`:
+
+```
+y[m, n] = (alpha[m] * gamma / 127) * sum_k x_q[m, k] * w_q[k, n]
+```
+
+where `x_q` is INT8 in `[-128, 127]` (per-row scale `alpha[m]`),
+`w_q` is INT8 in `{-1, 0, +1}` (scalar scale `gamma`). cuBLAS
+arguments: `CUDA_R_8I` for both inputs, `CUDA_R_32I` for the
+output, `CUBLAS_COMPUTE_32I` compute type,
+`CUBLAS_GEMM_DEFAULT_TENSOR_OP` algo. Same row-major-via-column-
+major adapter as the f32 `MatMul` impl.
+
+Three new NVRTC kernels: `quantise_weights_int8_apply_f32`,
+`quantise_acts_int8_apply_f32`, `scale_int32_to_f32`. The reduction
+kernels (`quantise_weights_ste_partial_abs_sum_f32`,
+`quantise_acts_ste_row_absmax_f32`) are reused from Phase 5.a; only
+the apply kernels (which write INT8 instead of dequantised f32) and
+the final scale kernel are new.
+
+**Shape fallback**: `cublasGemmEx` int8 GEMM requires `lda` and
+`ldb` to be multiples of 4 (the int8 kernel reads 32-bit chunks).
+In our adapter that means `n` and `k` must both be multiples of 4.
+The only project matmul that violates this is lm_head with
+`n = vocab = 65`; the `BitLinear` impl checks alignment up front
+and falls through to the Phase 5.a f32 path when it fails. Both
+paths are algebraically identical so output values match within
+f32 round-off.
+
+**Empirical reality check** on the 7940HS + RTX 4070 Laptop at
+v0.13 scale (~5M params): Phase 5.b cuda-shakespeare runs at
+~300 ms/step; CPU shakespeare is ~180 ms/step. **GPU is currently
+slower than CPU** because per-step launch overhead dominates -
+each training step does ~3000+ kernel launches (~50 bit_linear
+calls per window x 4 windows in batch x 6 quant + GEMM + scale
+launches per bit_linear x 2 for forward + backward). At 10-30 us
+launch overhead per kernel that is 30-90 ms of pure overhead per
+step; the int8 GEMM kernel runs in microseconds on tensor cores
+so the actual matmul work is dwarfed.
+
+Three orthogonal post-Phase-5.b optimisations to realise the
+tensor-core speedup:
+- **Kernel fusion**: collapse the 4 quant kernels per bit_linear
+  (per-row reduction + per-cell apply, for both x and w) into 1-2
+  launches.
+- **CUDA graphs**: capture a full training-step launch sequence
+  once and replay it. cudarc 0.19 has graph support.
+- **Larger batches / longer sequences**: amortise launch overhead
+  across more matmul work. `shakespeare-large` (~8.5M params,
+  seq_len 128) is the obvious test target.
+
+### CUDA back-end (Phase 5.a: real BitNet ternary GPU training)
+
+Phase 5.a wraps the chunk-4.5 GPU training pipeline with BitNet b1.58
+STE quantisation, producing real ternary checkpoints on the GPU.
+
+```rust
+// src/device.rs
+pub trait QuantiseWeightsSTE { fn quantise_weights_ste(&self) -> Self; }
+pub trait QuantiseActsSTE    { fn quantise_acts_ste(&self) -> Self;   }
+pub trait BitLinear          { fn bit_linear(&self, rhs: &Self) -> Self; }
+pub fn bit_linear_backward<T: ...>(grad_y: &T, x: &T, w: &T) -> (T, T);
+```
+
+`bit_linear(x, w) = quantise_acts_ste(x) @ quantise_weights_ste(w)`.
+STE makes both quants identity in backward, so `bit_linear_backward`
+just re-quantises x and w on the fly and calls regular
+`matmul_backward`. Re-quantising during backward is cheaper than
+carrying extra saved tensors across the trait surface.
+
+Four new NVRTC kernels (per-row reduction + per-cell apply for both
+weights and activations). Edge case: a row of all zeros has alpha = 0;
+the act-apply kernel writes zero directly to avoid NaN.
+
+`_bitnet` variants of every chunk-4.5.x layer helper (`attention_head_*`,
+`ffn_*`, `block_*`) swap learnable-weight matmuls for `bit_linear`;
+internal act-against-act matmuls (Q @ K.T, attn @ V) stay unquantised
+- matches the autograd `attention::head_output` recipe in
+`attention.rs` byte-for-byte.
+
+`CudaModel::compute_grads_for_window_bitnet` is the bitnet sibling of
+chunk-4.5.e's `compute_grads_for_window`. New
+`compute_batched_grads_cuda_bitnet` in `main.rs` mirrors the existing
+`compute_batched_grads`'s averaged-batch behaviour; new
+`TrainConfig.use_cuda_backward` flag dispatches `train_bitnet_lm`
+through it. New CLI subcommands:
+
+```sh
+PATH=/opt/cuda/bin:$PATH CUDA_PATH=/opt/cuda \
+    cargo run --release --features cuda -- cuda-shakespeare
+PATH=/opt/cuda/bin:$PATH CUDA_PATH=/opt/cuda \
+    cargo run --release --features cuda -- cuda-shakespeare-large
+PATH=/opt/cuda/bin:$PATH CUDA_PATH=/opt/cuda \
+    cargo run --release --features cuda -- cuda-shakespeare \
+    models/shakespeare.v0.13.30k-resumed.f32.bin
+```
+
+The CUDA training subcommand reuses the entire existing CPU
+training loop - val_ppl tracking, AdamW, lossless `.f32.bin` +
+compact `.ternary_packed.bin` export, four sampling-mode generation
+passes, resume support sharing the same on-disk format. Output
+checkpoints are real BitNet 1.58-bit-per-weight artefacts.
+
+Per-step cost decomposition (Phase 5.a, v0.13 ~5M-param config):
+- `CudaModel::from_cpu(&model)` rebuild: ~1 ms (H->D copy of every
+  weight tensor + allocation). Done once per training step. Removable
+  via `CudaModel::sync_from_cpu(&Model)` (queued).
+- Quant kernels (per learnable matmul): per-row reduction + per-cell
+  apply. Microsecond range each.
+- cuBLAS sgemm: still f32 internally (Phase 5.b will replace with
+  tensor-core int8 GEMM for the ~10-50x speedup).
+- Backward chain: regular `matmul_backward` (cuBLAS sgemm again) +
+  the chunk-4.1-4.4 backward kernels.
+- AdamW step on CPU: linear in param count.
+
+Headline correctness gate:
+`attention_head_backward_bitnet_matches_autograd_ground_truth` builds
+the same head two ways - autograd `Var` with explicit
+`quantise_acts_ste`/`quantise_weights_ste` wrappers (matching
+`attention::head_output` byte-for-byte) vs the chunk-5.a helpers -
+and asserts every gradient cell agrees at `1e-4`.
+
+### CUDA back-end (Phase 4 chunks 4.5.c-f: end-to-end GPU training)
+
+Chunks 4.5.c through 4.5.f compose the per-op and per-layer
+backwards into a runnable training step:
+
+- **4.5.c `block_forward_save<T>` + `block_backward<T>`**: full
+  pre-norm transformer block. Composes attention + FFN + 2 RMSNorms
+  + 2 residual `Add` backwards. The Add backwards are identity
+  (Clone); each residual splits its incoming gradient along both
+  branches. Multi-head sum-of-projections means each head's
+  `attention_head_backward` receives the same upstream gradient and
+  per-head input gradients accumulate.
+- **4.5.d `CrossEntropy` + `CrossEntropyBackward` traits**: fused
+  softmax + per-row loss in `cross_entropy_forward_save`; closed-form
+  `(softmax - onehot) / seq` gradient in `cross_entropy_backward`.
+  Two new NVRTC kernels (`cross_entropy_softmax_loss_f32` for
+  forward; `cross_entropy_backward_f32` for backward).
+- **4.5.e `CudaModel::compute_grads_for_window(input, target)
+  -> (Vec<Tensor>, f32)`**: the integration. Embed gather (CPU) +
+  H->D + chained `block_forward_save` + final RMSNorm + lm_head
+  matmul -> logits -> cross-entropy fwd. Backward runs the chain
+  in reverse, scatters the embed-input gradient into a CPU
+  `grad_token_embed` table, and flattens every device-side gradient
+  to CPU in canonical visitor order. Drop-in compatible with the
+  CPU `compute_grads_for_window` signature.
+- **4.5.f `cuda-train-demo` CLI subcommand**:
+  ```
+  cargo run --release --features cuda -- cuda-train-demo
+  ```
+  Builds a tiny model from `TINY_CORPUS`, runs 100 training steps
+  on GPU + AdamW updates on CPU, prints loss trajectory. Empirical:
+  loss 3.0015 -> 1.3106 in 100 steps, 0.4 s wall-clock on the
+  7940HS + RTX 4070 Laptop.
+
+The path is **f32 throughout** - BitNet ternary STE quantisation is
+not applied. Phase 5 (tensor-core ternary kernels) restores BitNet
+semantics on the GPU. Until then, the GPU training path trains an
+f32 transformer (which is still useful for ablations + perf
+measurements + Phase 4 wiring proof) but is not a drop-in
+replacement for the CPU path's BitNet ternary semantics.
+
+Per-step cost decomposition (v0.13 demo scale):
+- `CudaModel::from_cpu(&model)` rebuild: ~1 ms (H->D copy of every
+  weight tensor + allocation). Done once per training step because
+  CPU weights mutate after each AdamW update. Removable in a
+  follow-up via `CudaModel::sync_from_cpu(&Model)` that overwrites
+  existing device buffers in place.
+- Forward + backward through one block stack: tens of kernel
+  launches at ~10-30 us each. Dominated by launch overhead at this
+  model scale; production-scale kernels (v0.13 hidden=192) would
+  shift to compute-bound.
+- AdamW step on CPU: linear in param count; ms range.
+
 ### CUDA back-end (preflight)
 
 Phase 3 surfaced a class of bugs that the silent-skip pattern in

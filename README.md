@@ -7,16 +7,26 @@ inference, binary export. No third-party ML dependencies.
 
 ## Status
 
-- **123** tests passing on `cargo test`; **143** with `cargo test --features cuda`.
+- **137** tests passing on `cargo test`; **169** with `cargo test --features cuda`.
 - **0** warnings on `cargo build --release` (or `--features cuda`).
 - `cargo audit` clean for the default build (stdlib-only); the optional
   `cuda` feature pulls `cudarc` and its small dynamic-loading deps.
 - Trains end-to-end on the full TinyShakespeare corpus in ~8-15
   minutes on CPU (v0.13 ~5M-param config); current best **val_ppl
   4.869** at 30k cumulative steps.
-- End-to-end model forward runs on the GPU through `CudaModel`
-  (Phase 3); training stays on CPU until Phase 4 lands per-op
-  backward kernels.
+- **Real BitNet ternary training runs on the GPU through Ada
+  tensor cores.** Phase 5.a added STE quant kernels and a
+  `BitLinear` trait; Phase 5.b rewrote the `CudaTensor` impl to
+  use `cublasGemmEx` int8 GEMM (CUDA_R_8I / CUDA_R_32I /
+  CUBLAS_COMPUTE_32I / CUBLAS_GEMM_DEFAULT_TENSOR_OP) with a
+  shape-fallback to f32 sgemm when stride alignment fails (only
+  hit by lm_head's `n = vocab = 65`). All Phase 5.a tests pass
+  with the int8 path active; cuda-shakespeare runs end-to-end at
+  v0.13 scale (loss trajectory matches CPU). Empirically GPU is
+  ~300 ms/step vs CPU ~180 ms/step at v0.13 scale: per-step
+  launch overhead dominates (~3000+ kernel launches per step).
+  Kernel fusion + CUDA graphs + larger batches are the
+  follow-ups to actually realise tensor-core throughput.
 
 ## Quick start
 
@@ -70,8 +80,12 @@ cargo run --release -- shakespeare                        # fresh Shakespeare tr
 cargo run --release -- shakespeare <path>                 # resume ~5M training from checkpoint
 cargo run --release -- shakespeare-large                  # fresh ~8.5M training (seq_len 128)
 cargo run --release -- shakespeare-large <path>           # resume ~8.5M training from checkpoint
+cargo run --release -- sample <path>                      # skip training; print generation samples from a checkpoint
 cargo run --release --features cuda -- cuda-demo          # CPU-vs-cuBLAS matmul microbench
 cargo run --release --features cuda -- cuda-forward-bench # CPU-vs-CudaModel end-to-end forward bench
+cargo run --release --features cuda -- cuda-train-demo    # Phase 4 end-to-end GPU training proof-of-concept
+cargo run --release --features cuda -- cuda-shakespeare    # Phase 5.a real BitNet ternary training on GPU
+cargo run --release --features cuda -- cuda-shakespeare-large  # Phase 5.a, ~8.5M-param config, seq_len 128
 ```
 
 ## Project layout
@@ -184,8 +198,11 @@ This is a learning project, not a production library:
   `cargo run --release --features cuda -- cuda-forward-bench` shows
   the end-to-end CPU-vs-GPU benchmark.
 - KV cache for inference (`src/inference_kv.rs`) gives roughly 50-100x
-  faster per-token generation; the older `inference::generate_with_mode`
-  recomputes the full forward each step and is kept for parity testing.
+  faster per-token generation. Sliding-window since v0.16.1 (cache
+  capped at `max_seq_len` rows; RoPE reapplied at logical position so
+  output stays coherent for arbitrarily long generations). The older
+  `inference::generate_with_mode` recomputes the full forward each
+  step and is kept for parity testing.
 
 For production needs, use [Burn](https://burn.dev), [candle](https://github.com/huggingface/candle),
 or [tch-rs](https://github.com/LaurentMazare/tch-rs).

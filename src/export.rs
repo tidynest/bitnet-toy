@@ -61,11 +61,16 @@ use std::io::{self, ErrorKind, Read, Write};
 //         payload no longer carries `pos_embed`; only `token_embed`,
 //         then per block, then `lm_head`. `max_seq_len` stays in the header
 //         (still useful for the assertion in `Model::forward`).
+//   BNT5: tied input-output embeddings. The trailing `lm_head` payload
+//         entry is gone; the LM-head matmul reads `token_embed` (transposed
+//         at op-build time) directly. Visitor / param_shape order drops the
+//         trailing lm_head slot; AdamW state in the OPTM payload is
+//         correspondingly one slot shorter.
 // Each bump invalidates older checkpoints fail-fast rather than letting the
 // importer slide off into garbage payload bytes. The header layout is
 // unchanged (magic + format + 7 u32 fields = 33 bytes); the difference at
 // each version is the payload shape.
-const MAGIC: &[u8; 4] = b"BNT4";
+const MAGIC: &[u8; 4] = b"BNT5";
 const HEADER_SIZE: usize = 4 + 1 + 7 * 4; // magic + format byte + 7 u32 fields = 33
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -366,7 +371,7 @@ pub fn export_f32<W: Write>(
         total += write_f32_tensor(w, &b.ffn_up_w)?;
         total += write_f32_tensor(w, &b.ffn_down_w)?;
     }
-    total += write_f32_tensor(w, &model.lm_head)?;
+    // No trailing lm_head: tied to token_embed since BNT5 / v0.17.
     if let Some(state) = optim {
         total += write_optim_state(w, state)?;
     }
@@ -391,8 +396,9 @@ pub fn export_ternary<W: Write>(
         total += write_ternary_tensor(w, &b.ffn_up_w)?;
         total += write_ternary_tensor(w, &b.ffn_down_w)?;
     }
-    // LM head is also a BitLinear, so it's ternary too.
-    total += write_ternary_tensor(w, &model.lm_head)?;
+    // No trailing lm_head: tied to token_embed since BNT5 / v0.17. The LM-head
+    // matmul reads the (f32) token_embed at inference and ternary-quantises it
+    // on the fly, identical to the training-time forward.
     if let Some(state) = optim {
         total += write_optim_state(w, state)?;
     }
@@ -418,7 +424,7 @@ pub fn export_ternary_packed<W: Write>(
         total += write_ternary_packed_tensor(w, &b.ffn_up_w)?;
         total += write_ternary_packed_tensor(w, &b.ffn_down_w)?;
     }
-    total += write_ternary_packed_tensor(w, &model.lm_head)?;
+    // No trailing lm_head: tied to token_embed since BNT5 / v0.17.
     if let Some(state) = optim {
         total += write_optim_state(w, state)?;
     }
@@ -463,16 +469,10 @@ pub fn import<R: Read>(r: &mut R) -> io::Result<(Model, Format, Option<OptimStat
         });
     }
 
-    let lm_head = match fmt {
-        Format::Float32 => read_f32_tensor(r, vec![h, cfg.vocab_size])?,
-        Format::Ternary => read_ternary_tensor(r, vec![h, cfg.vocab_size])?,
-        Format::TernaryPacked => read_ternary_packed_tensor(r, vec![h, cfg.vocab_size])?,
-    };
-
+    // No lm_head payload to read: tied to token_embed since BNT5 / v0.17.
     let model = Model {
         token_embed,
         blocks,
-        lm_head,
         config: cfg,
     };
 
@@ -507,15 +507,15 @@ mod tests {
 
     #[test]
     fn f32_export_size_matches_total_param_count() {
-        // Total entries (BNT4: pos_embed dropped, RoPE injects position info):
+        // Total entries (BNT5: pos_embed dropped via RoPE, lm_head dropped via
+        // tied embeddings; the LM-head matmul reads token_embed at op-build):
         //   token_embed   : 8 * 4 = 32
         //   per block     : 2 heads * 4 * (4*2) + 3 FFN tensors (gate/up/down)
         //                 = 64 + 96 = 160 entries per block
         //   2 blocks      : 320
-        //   lm_head       : 4 * 8 = 32
-        //   total         : 32 + 320 + 32 = 384 floats
-        // Header (33) + 384 floats × 4 = 33 + 1536 = 1569 bytes.
-        let expected = HEADER_SIZE + 384 * 4;
+        //   total         : 32 + 320 = 352 floats
+        // Header (33) + 352 floats × 4 = 33 + 1408 = 1441 bytes.
+        let expected = HEADER_SIZE + 352 * 4;
         let mut buf = Vec::new();
         let bytes = export_f32(&tiny_model(), &mut buf, None).unwrap();
         assert_eq!(bytes, expected);
@@ -524,16 +524,16 @@ mod tests {
 
     #[test]
     fn ternary_export_size_matches_expected_layout() {
-        // BNT4 layout: token_embed only (no pos_embed) + ternary blocks + lm_head.
-        // Header (33) + token_embed f32 (32 floats * 4 = 128) +
+        // BNT5 layout: token_embed only (no pos_embed) + ternary blocks
+        // (lm_head dropped via tied embeddings). Header (33) +
+        //   token_embed f32 (32 floats * 4 = 128) +
         //   per block: 11 ternary tensors (4 per head * 2 heads + gate + up + down)
         //              each carries a 4-byte gamma + 1 byte per i8 entry
         //              gammas: 11 * 4 = 44, i8 entries: 160
         //              per-block bytes: 204
         //   2 blocks: 408
-        //   lm_head ternary: 4-byte gamma + 32 i8 entries = 36
-        // Total: 33 + 128 + 408 + 36 = 605.
-        let expected = HEADER_SIZE + 128 + 408 + 36;
+        // Total: 33 + 128 + 408 = 569.
+        let expected = HEADER_SIZE + 128 + 408;
         let mut buf = Vec::new();
         let bytes = export_ternary(&tiny_model(), &mut buf, None).unwrap();
         assert_eq!(bytes, expected);
@@ -565,7 +565,9 @@ mod tests {
         assert_eq!(fmt, Format::Float32);
         assert_eq!(loaded.config.vocab_size, model.config.vocab_size);
         assert_eq!(loaded.token_embed.data, model.token_embed.data);
-        assert_eq!(loaded.lm_head.data, model.lm_head.data);
+        // No separate lm_head field since BNT5 / v0.17; the LM-head weight
+        // is `token_embed` itself, transposed at op-build time, and is
+        // checked above.
         assert_eq!(loaded.blocks.len(), model.blocks.len());
         for (lb, mb) in loaded.blocks.iter().zip(&model.blocks) {
             // Spot-check head 0's Q projection plus the FFN weights. The full
@@ -799,10 +801,10 @@ mod tests {
         assert_eq!(fmt, Format::Float32);
         let loaded_state = loaded_optim.expect("optim state must round-trip");
 
-        // Token embedding and lm_head are full f32 in this format.
-        // (No pos_embed since v0.12: RoPE replaced it.)
+        // Token embedding is full f32 in this format. (No pos_embed since
+        // v0.12: RoPE replaced it. No lm_head since v0.17: tied to
+        // token_embed.)
         assert_eq!(loaded_model.token_embed.data, model.token_embed.data);
-        assert_eq!(loaded_model.lm_head.data, model.lm_head.data);
 
         // Every block's master weights survive byte-identical. Walking every
         // head's Q/K/V/O and every FFN tensor catches any silent drop or

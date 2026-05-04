@@ -623,6 +623,56 @@ impl Tensor {
         }
     }
 
+    /// Per-row softmax backward (Phase 4 chunk 4.3). `self` is the
+    /// upstream gradient `grad_y`, `s_out` is the saved softmax
+    /// forward output. Implements the JVP of `J = diag(s) - s s^T`:
+    ///
+    ///     dot_i             = sum_k grad_y[i, k] * s_out[i, k]
+    ///     grad_in[i, j]     = s_out[i, j] * (grad_y[i, j] - dot_i)
+    ///
+    /// Matches the `Var::softmax` closure (autograd.rs:618-621)
+    /// cell-for-cell.
+    pub fn softmax_backward(&self, s_out: &Tensor) -> Tensor {
+        assert_eq!(self.ndim(), 2, "softmax_backward: rank-2 only, got rank {}", self.ndim());
+        assert_eq!(self.shape, s_out.shape, "softmax_backward: shape mismatch");
+        let (m, n) = (self.shape[0], self.shape[1]);
+        let mut grad_in = vec![0.0_f32; m * n];
+        for i in 0..m {
+            let dot: f32 = (0..n)
+                .map(|k| self.data[i * n + k] * s_out.data[i * n + k])
+                .sum();
+            for j in 0..n {
+                grad_in[i * n + j] =
+                    s_out.data[i * n + j] * (self.data[i * n + j] - dot);
+            }
+        }
+        Tensor {
+            data: grad_in,
+            shape: vec![m, n],
+        }
+    }
+
+    /// Causal-mask backward (Phase 4 chunk 4.3). `self` is the upstream
+    /// gradient. Lower triangle (`j <= i`) passes through unchanged;
+    /// upper triangle is zeroed (the forward overwrote those cells with
+    /// `-inf`, so they contribute no gradient to the input). No saved
+    /// tensor is needed - the mask pattern is shape-determined.
+    /// Matches `Var::causal_mask` (autograd.rs:805-811).
+    pub fn causal_mask_backward(&self) -> Tensor {
+        assert_eq!(self.ndim(), 2, "causal_mask_backward: rank-2 only, got rank {}", self.ndim());
+        let (m, n) = (self.shape[0], self.shape[1]);
+        let mut grad_in = vec![0.0_f32; m * n];
+        for i in 0..m {
+            for j in 0..(i + 1).min(n) {
+                grad_in[i * n + j] = self.data[i * n + j];
+            }
+        }
+        Tensor {
+            data: grad_in,
+            shape: vec![m, n],
+        }
+    }
+
     /// Per-row RMS normalisation (no learnable gain). Input `[m, n]`,
     /// output same shape. Each row gets divided by its RMS magnitude:
     ///     rms_i = sqrt(mean_j(x[i, j]^2) + EPS),    EPS = 1e-5
@@ -667,6 +717,30 @@ impl Tensor {
         }
     }
 
+    /// SiLU backward (Phase 4 chunk 4.2). `self` is the upstream
+    /// gradient `grad_y`; `x` is the saved forward input. Per-cell
+    /// derivative `d(silu)/dx = sig * (1 + x * (1 - sig))` matches the
+    /// CPU `Var::silu` closure (autograd.rs:579-590) byte-for-byte.
+    pub fn silu_backward(&self, x: &Tensor) -> Tensor {
+        assert_eq!(
+            self.shape, x.shape,
+            "silu_backward: grad_y and x shape mismatch"
+        );
+        let data: Vec<f32> = self
+            .data
+            .iter()
+            .zip(&x.data)
+            .map(|(&grad, &xv)| {
+                let sig = 1.0_f32 / (1.0 + (-xv).exp());
+                grad * sig * (1.0 + xv * (1.0 - sig))
+            })
+            .collect();
+        Tensor {
+            data,
+            shape: self.shape.clone(),
+        }
+    }
+
     /// Rotary Position Embedding (RoPE). Input shape `[seq, head_dim]`;
     /// `head_dim` must be even. For each `(pos, i)` rotates the 2-D
     /// vector `(x[pos, 2i], x[pos, 2i+1])` by `pos * 10000^(-2i/head_dim)`.
@@ -692,6 +766,173 @@ impl Tensor {
         }
         Tensor {
             data: y,
+            shape: vec![seq, head_dim],
+        }
+    }
+
+    /// Per-row RMSNorm backward (Phase 4 chunk 4.4). `self` is the
+    /// upstream gradient `grad_y`; `x_saved` is the saved forward
+    /// input. Recomputes `rms_i` from `x_saved` rather than carrying
+    /// a separate `[m]` tensor of saved row norms (cost: one extra
+    /// row pass; benefit: keeps the API symmetric with the other
+    /// "saved-tensor" backwards). Per-cell formula matches
+    /// `Var::rmsnorm` (autograd.rs:702-758) byte-for-byte.
+    pub fn rmsnorm_backward(&self, x_saved: &Tensor) -> Tensor {
+        assert_eq!(self.ndim(), 2, "rmsnorm_backward: rank-2 only");
+        assert_eq!(self.shape, x_saved.shape, "rmsnorm_backward: shape mismatch");
+        let (m, n) = (self.shape[0], self.shape[1]);
+        let n_f = n as f32;
+        const EPS: f32 = 1e-5;
+        let mut grad_in = vec![0.0_f32; m * n];
+        for i in 0..m {
+            let mean_sq: f32 =
+                (0..n).map(|j| x_saved.data[i * n + j].powi(2)).sum::<f32>() / n_f;
+            let inv_rms = 1.0_f32 / (mean_sq + EPS).sqrt();
+            let dot: f32 = (0..n)
+                .map(|j| x_saved.data[i * n + j] * self.data[i * n + j])
+                .sum();
+            let factor = dot * inv_rms.powi(3) / n_f;
+            for j in 0..n {
+                grad_in[i * n + j] =
+                    self.data[i * n + j] * inv_rms - x_saved.data[i * n + j] * factor;
+            }
+        }
+        Tensor {
+            data: grad_in,
+            shape: vec![m, n],
+        }
+    }
+
+    /// BitNet absmean-ternary weight quantisation, STE forward
+    /// (Phase 5.a). Output is the **dequantised** tensor `gamma * W_q`
+    /// where `W_q` is in {-1, 0, +1} and `gamma = mean(|W|)`. Same f32
+    /// shape as input. Matches `Var::quantise_weights_ste`
+    /// (autograd.rs:404-436) byte-for-byte. Backward is identity (the
+    /// STE), so callers route the upstream gradient straight through
+    /// the original (pre-quant) weight without a separate backward
+    /// op.
+    pub fn quantise_weights_ste(&self) -> Tensor {
+        let (w_q, gamma) = crate::bitlinear::absmean_ternary(self);
+        let data: Vec<f32> = w_q.data.iter().map(|v| v * gamma).collect();
+        Tensor {
+            data,
+            shape: self.shape.clone(),
+        }
+    }
+
+    /// BitNet absmax-INT8 per-row activation quantisation, STE
+    /// forward (Phase 5.a). Output is `(alpha[i] / 127) * x_q[i, j]`
+    /// where `x_q` lives on the INT8 grid `[-128, 127]`. Matches
+    /// `Var::quantise_acts_ste` (autograd.rs:438-474). Backward is
+    /// identity (STE).
+    pub fn quantise_acts_ste(&self) -> Tensor {
+        let (x_q, alpha) = crate::bitlinear::absmax_int8(self);
+        let (m, n) = (x_q.shape[0], x_q.shape[1]);
+        let inv_127 = 1.0_f32 / 127.0;
+        let mut data = vec![0.0_f32; m * n];
+        for i in 0..m {
+            let row_scale = alpha.data[i] * inv_127;
+            for j in 0..n {
+                data[i * n + j] = x_q.data[i * n + j] * row_scale;
+            }
+        }
+        Tensor {
+            data,
+            shape: vec![m, n],
+        }
+    }
+
+    /// Fused softmax + cross-entropy forward (Phase 4 chunk 4.5.d).
+    /// `self` is the logits `[seq, vocab]`; `targets` is the per-row
+    /// class index. Returns `(loss_scalar, softmax_output)` in one
+    /// pass over the data. Matches `Var::cross_entropy` (autograd.rs:
+    /// 1025-1115) byte-for-byte (subtract-max log-sum-exp trick,
+    /// mean-over-seq loss).
+    pub fn cross_entropy_forward_save(&self, targets: &[usize]) -> (f32, Tensor) {
+        assert_eq!(self.ndim(), 2, "cross_entropy: rank-2 logits required");
+        let (seq, vocab) = (self.shape[0], self.shape[1]);
+        assert_eq!(targets.len(), seq, "cross_entropy: target len mismatch");
+        let mut softmax = vec![0.0_f32; seq * vocab];
+        let mut total_loss = 0.0_f32;
+        for i in 0..seq {
+            let row = &self.data[i * vocab..(i + 1) * vocab];
+            let row_max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mut denom = 0.0_f32;
+            for j in 0..vocab {
+                let e = (row[j] - row_max).exp();
+                softmax[i * vocab + j] = e;
+                denom += e;
+            }
+            let log_denom = row_max + denom.ln();
+            let inv = 1.0_f32 / denom;
+            for v in &mut softmax[i * vocab..(i + 1) * vocab] {
+                *v *= inv;
+            }
+            assert!(targets[i] < vocab, "cross_entropy: target {} >= vocab {}", targets[i], vocab);
+            total_loss += -(self.data[i * vocab + targets[i]] - log_denom);
+        }
+        let loss = total_loss / seq as f32;
+        (
+            loss,
+            Tensor {
+                data: softmax,
+                shape: vec![seq, vocab],
+            },
+        )
+    }
+
+    /// Cross-entropy backward (Phase 4 chunk 4.5.d). `self` is the
+    /// saved softmax output from `cross_entropy_forward_save`.
+    /// Per-cell formula `(softmax - onehot) / seq` matches the
+    /// autograd closure (autograd.rs:1093-1106) with `g_scalar = 1`.
+    pub fn cross_entropy_backward(&self, targets: &[usize], seq: usize) -> Tensor {
+        assert_eq!(self.ndim(), 2, "cross_entropy_backward: rank-2 softmax required");
+        let (seq_chk, vocab) = (self.shape[0], self.shape[1]);
+        assert_eq!(seq, seq_chk, "cross_entropy_backward: seq mismatch");
+        assert_eq!(targets.len(), seq, "cross_entropy_backward: target len mismatch");
+        let inv_seq = 1.0_f32 / seq as f32;
+        let mut grad = self.data.clone();
+        for i in 0..seq {
+            grad[i * vocab + targets[i]] -= 1.0;
+        }
+        for v in grad.iter_mut() {
+            *v *= inv_seq;
+        }
+        Tensor {
+            data: grad,
+            shape: vec![seq, vocab],
+        }
+    }
+
+    /// RoPE backward (Phase 4 chunk 4.4). `self` is the upstream
+    /// gradient. Inverse rotation: same trig table with `sin` flipped
+    /// because each per-pair rotation is orthogonal. No saved tensor:
+    /// the angles depend only on shape. Matches `Var::rope`
+    /// (autograd.rs:902-925).
+    pub fn rope_backward(&self) -> Tensor {
+        assert_eq!(self.ndim(), 2, "rope_backward: expected rank-2");
+        let (seq, head_dim) = (self.shape[0], self.shape[1]);
+        assert!(
+            head_dim % 2 == 0,
+            "rope_backward: head_dim ({}) must be even",
+            head_dim
+        );
+        let half = head_dim / 2;
+        let mut grad_in = vec![0.0_f32; seq * head_dim];
+        for pos in 0..seq {
+            for i in 0..half {
+                let theta_i = 10000_f32.powf(-(2.0 * i as f32) / head_dim as f32);
+                let angle = pos as f32 * theta_i;
+                let c = angle.cos();
+                let s = angle.sin();
+                let ga = self.data[pos * head_dim + 2 * i];
+                let gb = self.data[pos * head_dim + 2 * i + 1];
+                grad_in[pos * head_dim + 2 * i] = ga * c + gb * s;
+                grad_in[pos * head_dim + 2 * i + 1] = -ga * s + gb * c;
+            }
+        }
+        Tensor {
+            data: grad_in,
             shape: vec![seq, head_dim],
         }
     }
@@ -746,6 +987,69 @@ impl crate::device::Rope for Tensor {
 impl crate::device::Silu for Tensor {
     fn silu(&self) -> Self {
         Tensor::silu(self)
+    }
+}
+
+impl crate::device::SiluBackward for Tensor {
+    fn silu_backward(&self, x: &Self) -> Self {
+        Tensor::silu_backward(self, x)
+    }
+}
+
+impl crate::device::SoftmaxBackward for Tensor {
+    fn softmax_backward(&self, s_out: &Self) -> Self {
+        Tensor::softmax_backward(self, s_out)
+    }
+}
+
+impl crate::device::CausalMaskBackward for Tensor {
+    fn causal_mask_backward(&self) -> Self {
+        Tensor::causal_mask_backward(self)
+    }
+}
+
+impl crate::device::RmsNormBackward for Tensor {
+    fn rmsnorm_backward(&self, x_saved: &Self) -> Self {
+        Tensor::rmsnorm_backward(self, x_saved)
+    }
+}
+
+impl crate::device::RopeBackward for Tensor {
+    fn rope_backward(&self) -> Self {
+        Tensor::rope_backward(self)
+    }
+}
+
+impl crate::device::CrossEntropy for Tensor {
+    fn cross_entropy_forward_save(&self, targets: &[usize]) -> (f32, Self) {
+        Tensor::cross_entropy_forward_save(self, targets)
+    }
+}
+
+impl crate::device::CrossEntropyBackward for Tensor {
+    fn cross_entropy_backward(&self, targets: &[usize], seq: usize) -> Self {
+        Tensor::cross_entropy_backward(self, targets, seq)
+    }
+}
+
+impl crate::device::QuantiseWeightsSTE for Tensor {
+    fn quantise_weights_ste(&self) -> Self {
+        Tensor::quantise_weights_ste(self)
+    }
+}
+
+impl crate::device::QuantiseActsSTE for Tensor {
+    fn quantise_acts_ste(&self) -> Self {
+        Tensor::quantise_acts_ste(self)
+    }
+}
+
+impl crate::device::BitLinear for Tensor {
+    fn bit_linear(&self, rhs: &Self) -> Self {
+        // Forward via the existing matmul on quantised inputs.
+        let x_eff = Tensor::quantise_acts_ste(self);
+        let w_eff = Tensor::quantise_weights_ste(rhs);
+        x_eff.matmul(&w_eff)
     }
 }
 
