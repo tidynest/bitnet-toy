@@ -164,6 +164,31 @@ extern "C" __global__ void mul_f32(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) out[idx] = a[idx] * b[idx];
 }
+
+extern "C" __global__ void rmsnorm_row_f32(
+    const float* __restrict__ x,
+    float* __restrict__ out,
+    int m, int n)
+{
+    // One thread per row. Two passes: sum-of-squares then normalise.
+    // EPS = 1e-5 matches the CPU helper exactly so checkpoints trained
+    // with one path are numerically valid through the other.
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= m) return;
+    const float* xr = x + row * n;
+    float* yr = out + row * n;
+
+    float sum_sq = 0.0f;
+    for (int j = 0; j < n; ++j) {
+        float v = xr[j];
+        sum_sq += v * v;
+    }
+    float mean_sq = sum_sq / (float)n;
+    float inv_rms = 1.0f / sqrtf(mean_sq + 1.0e-5f);
+    for (int j = 0; j < n; ++j) {
+        yr[j] = xr[j] * inv_rms;
+    }
+}
 "#;
 
 #[cfg(test)]
@@ -230,6 +255,7 @@ pub struct CudaContextHolder {
     pub rope_fn: CudaFunction,
     pub silu_fn: CudaFunction,
     pub mul_fn: CudaFunction,
+    pub rmsnorm_row_fn: CudaFunction,
 
     /// Hand-rolled tile-based GEMM kernel from `MATMUL_KERNEL_SRC`.
     /// Test-only - the production matmul path uses cuBLAS sgemm (much
@@ -276,6 +302,7 @@ pub fn cuda_state() -> Result<&'static CudaContextHolder, String> {
         let rope_fn = load("rope_f32")?;
         let silu_fn = load("silu_f32")?;
         let mul_fn = load("mul_f32")?;
+        let rmsnorm_row_fn = load("rmsnorm_row_f32")?;
 
         #[cfg(test)]
         let matmul_fn = {
@@ -300,6 +327,7 @@ pub fn cuda_state() -> Result<&'static CudaContextHolder, String> {
             rope_fn,
             silu_fn,
             mul_fn,
+            rmsnorm_row_fn,
             #[cfg(test)]
             matmul_fn,
         })
@@ -640,6 +668,33 @@ impl crate::device::Silu for CudaTensor {
     }
 }
 
+impl crate::device::RmsNorm for CudaTensor {
+    fn rmsnorm(&self) -> Self {
+        assert_eq!(self.shape.len(), 2, "rmsnorm: rank-2 only, got {:?}", self.shape);
+        let s = cuda_state().expect("cuda_state failed");
+        let m = self.shape[0];
+        let n = self.shape[1];
+        let m_i = i32::try_from(m).expect("m exceeds i32");
+        let n_i = i32::try_from(n).expect("n exceeds i32");
+        let mut out = s.stream.alloc_zeros::<f32>(m * n).expect("alloc_zeros failed");
+        let cfg = LaunchConfig {
+            grid_dim: ((m_i as u32).div_ceil(256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut l = s.stream.launch_builder(&s.rmsnorm_row_fn);
+        l.arg(&self.data);
+        l.arg(&mut out);
+        l.arg(&m_i);
+        l.arg(&n_i);
+        // Safety: signature (const float*, float*, int, int) matches
+        // the four args; both buffers sized m*n.
+        unsafe { l.launch(cfg) }.expect("rmsnorm_row_f32 launch failed");
+        s.stream.synchronize().expect("synchronize failed");
+        Self { data: out, shape: vec![m, n] }
+    }
+}
+
 impl crate::device::Mul for CudaTensor {
     fn mul(&self, rhs: &Self) -> Self {
         assert_eq!(
@@ -716,7 +771,7 @@ pub fn cuda_matmul(lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, String> {
 mod tests {
     use super::*;
     use crate::device::{
-        Add, CausalMask, MatMul, Mul, MulScalar, Rope, Silu, Softmax, Transpose2D,
+        Add, CausalMask, MatMul, Mul, MulScalar, RmsNorm, Rope, Silu, Softmax, Transpose2D,
     };
 
     /// Maximum acceptable absolute error per cell from a CPU-vs-CUDA
@@ -1043,6 +1098,111 @@ mod tests {
             .to_cpu()
             .unwrap();
         assert_close(&gpu, &cpu);
+    }
+
+    #[test]
+    fn rmsnorm_cpu_vs_cuda_matches() {
+        if cuda_state().is_err() {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        }
+        let a = random_tensor(13, 31, 1.5);
+        let cpu = <Tensor as RmsNorm>::rmsnorm(&a);
+        let gpu = CudaTensor::from_cpu(&a)
+            .unwrap()
+            .rmsnorm()
+            .to_cpu()
+            .unwrap();
+        assert_close(&gpu, &cpu);
+        // Each row must end up at unit RMS magnitude (within tolerance):
+        // sum(y^2) / n must equal 1 + EPS_norm. The headline correctness
+        // property of RMSNorm.
+        let n = gpu.shape[1];
+        let n_f = n as f32;
+        for i in 0..gpu.shape[0] {
+            let row = &gpu.data[i * n..(i + 1) * n];
+            let mean_sq: f32 = row.iter().map(|v| v * v).sum::<f32>() / n_f;
+            assert!(
+                (mean_sq - 1.0).abs() < 1e-3,
+                "GPU row {i} mean_sq = {mean_sq} (expected ~1)"
+            );
+        }
+    }
+
+    /// **The headline test of Chunk 2.4.** Full transformer block
+    /// (pre-norm, multi-head attention with residual, FFN with
+    /// residual) runs on both backends from the same source line and
+    /// the outputs agree within tolerance. This is also the smallest
+    /// test that exercises every Phase 2 trait at least once.
+    #[test]
+    fn block_inference_cpu_vs_cuda_matches() {
+        if cuda_state().is_err() {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        }
+        use crate::device::{FfnWeights, HeadWeights, block_inference};
+        let seq = 16usize;
+        let n_heads = 3usize;
+        let head_dim = 8usize;
+        let hidden = n_heads * head_dim;
+        let ffn = 64usize;
+
+        // Build identical weights on both backends from the same source
+        // tensors. Per-head offset prevents two heads being numerically
+        // identical (same trick the autograd-side block test uses).
+        let x_cpu = random_tensor(seq, hidden, 3.0);
+        let cpu_heads: Vec<HeadWeights<Tensor>> = (0..n_heads)
+            .map(|h| {
+                let off = 0.001 * (h as f32);
+                HeadWeights {
+                    w_q: random_tensor(hidden, head_dim, 3.1 + off),
+                    w_k: random_tensor(hidden, head_dim, 3.2 + off),
+                    w_v: random_tensor(hidden, head_dim, 3.3 + off),
+                    w_o: random_tensor(head_dim, hidden, 3.4 + off),
+                }
+            })
+            .collect();
+        let cpu_ffn = FfnWeights {
+            w_gate: random_tensor(hidden, ffn, 3.5),
+            w_up: random_tensor(hidden, ffn, 3.6),
+            w_down: random_tensor(ffn, hidden, 3.7),
+        };
+        let cpu_out = block_inference::<Tensor>(&x_cpu, &cpu_heads, &cpu_ffn, head_dim);
+
+        // Same source, on the GPU. Take ownership of CPU tensors when
+        // copying since the helper signature is `block_inference<T>(&T,
+        // &[HeadWeights<T>], ...)` and we need a `Vec<HeadWeights<CudaTensor>>`.
+        let x_gpu = CudaTensor::from_cpu(&x_cpu).unwrap();
+        let gpu_heads: Vec<HeadWeights<CudaTensor>> = cpu_heads
+            .iter()
+            .map(|h| HeadWeights {
+                w_q: CudaTensor::from_cpu(&h.w_q).unwrap(),
+                w_k: CudaTensor::from_cpu(&h.w_k).unwrap(),
+                w_v: CudaTensor::from_cpu(&h.w_v).unwrap(),
+                w_o: CudaTensor::from_cpu(&h.w_o).unwrap(),
+            })
+            .collect();
+        let gpu_ffn = FfnWeights {
+            w_gate: CudaTensor::from_cpu(&cpu_ffn.w_gate).unwrap(),
+            w_up: CudaTensor::from_cpu(&cpu_ffn.w_up).unwrap(),
+            w_down: CudaTensor::from_cpu(&cpu_ffn.w_down).unwrap(),
+        };
+        let gpu_out =
+            block_inference::<CudaTensor>(&x_gpu, &gpu_heads, &gpu_ffn, head_dim)
+                .to_cpu()
+                .unwrap();
+
+        assert_eq!(cpu_out.shape, gpu_out.shape, "block output shape mismatch");
+        // The block chains rmsnorm -> attention -> add -> rmsnorm ->
+        // ffn -> add. That is roughly 12-15 sequential ops; widen the
+        // tolerance to 5e-3 to absorb the accumulated drift.
+        for (i, (&c, &g)) in cpu_out.data.iter().zip(&gpu_out.data).enumerate() {
+            let abs = (c - g).abs();
+            assert!(
+                abs <= 5e-3 + 5e-3 * c.abs(),
+                "block drift at idx {i}: cpu = {c}, cuda = {g}"
+            );
+        }
     }
 
     /// **The headline test of Chunk 2.3.** Matches the Chunk 2.2

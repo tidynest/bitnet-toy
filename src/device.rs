@@ -32,6 +32,84 @@ pub fn chained_matmul<T: MatMul>(a: &T, b: &T, c: &T) -> T {
     a.matmul(b).matmul(c)
 }
 
+/// Per-head attention weight bundle, generic over the backend storage.
+/// One bundle per attention head. Owns its tensors (the field types
+/// are `T`, not `&T`) so a `Vec<HeadWeights<Tensor>>` and a
+/// `Vec<HeadWeights<CudaTensor>>` are independent storage on each
+/// backend.
+#[allow(dead_code)]
+pub struct HeadWeights<T> {
+    pub w_q: T,
+    pub w_k: T,
+    pub w_v: T,
+    pub w_o: T,
+}
+
+/// SwiGLU FFN weight bundle, generic over the backend storage. Three
+/// tensors per block: gate, up (both `[hidden, ffn]`), down (`[ffn,
+/// hidden]`).
+#[allow(dead_code)]
+pub struct FfnWeights<T> {
+    pub w_gate: T,
+    pub w_up: T,
+    pub w_down: T,
+}
+
+/// Generic multi-head attention forward, sum-of-projections form.
+/// Each head's output (already projected to `[seq, hidden]` by its
+/// `w_o`) is summed elementwise into a running total. Mathematically
+/// equivalent to the canonical "concat heads then project once with a
+/// wide W_o" formulation but does not need a `concat` op.
+#[allow(dead_code)]
+pub fn multi_head_attention_inference<T>(x: &T, heads: &[HeadWeights<T>], head_dim: usize) -> T
+where
+    T: MatMul + Add + MulScalar + Transpose2D + Softmax + CausalMask + Rope,
+{
+    assert!(!heads.is_empty(), "multi_head_attention requires at least one head");
+    let mut combined = attention_head_inference(
+        x, &heads[0].w_q, &heads[0].w_k, &heads[0].w_v, &heads[0].w_o, head_dim,
+    );
+    for h in &heads[1..] {
+        let head_out =
+            attention_head_inference(x, &h.w_q, &h.w_k, &h.w_v, &h.w_o, head_dim);
+        combined = combined.add(&head_out);
+    }
+    combined
+}
+
+/// Generic transformer block forward (pre-norm, LLaMA / BitNet style):
+///     x1 = x  + attention(rmsnorm(x))
+///     x2 = x1 + ffn(rmsnorm(x1))
+///
+/// Compiles for any `T` that implements the full trait set. The
+/// inference-only path (no quant, no autograd) - this is the chunk-2.4
+/// surface that Phase 3 wires into a `CudaModel` for end-to-end
+/// device-resident forward / sampling.
+#[allow(dead_code)]
+pub fn block_inference<T>(
+    x: &T,
+    heads: &[HeadWeights<T>],
+    ffn: &FfnWeights<T>,
+    head_dim: usize,
+) -> T
+where
+    T: MatMul
+        + Add
+        + MulScalar
+        + Transpose2D
+        + Softmax
+        + CausalMask
+        + Rope
+        + RmsNorm
+        + Silu
+        + Mul,
+{
+    let attn_out = multi_head_attention_inference(&x.rmsnorm(), heads, head_dim);
+    let x1 = x.add(&attn_out);
+    let ffn_out = ffn_inference(&x1.rmsnorm(), &ffn.w_gate, &ffn.w_up, &ffn.w_down);
+    x1.add(&ffn_out)
+}
+
 /// Generic SwiGLU FFN forward pass, written against the trait surface.
 /// Same math as the autograd `ffn::ffn` (LLaMA / BitNet b1.58 form):
 ///
@@ -163,6 +241,16 @@ pub trait Silu {
 /// Used by SwiGLU's gate * up step inside the FFN.
 pub trait Mul {
     fn mul(&self, rhs: &Self) -> Self;
+}
+
+/// Per-row RMS normalisation (no learnable gain). Input `[m, n]`,
+/// output same shape. For each row:
+///     rms = sqrt(mean_j(x[i, j]^2) + EPS)     # EPS = 1e-5
+///     y[i, j] = x[i, j] / rms
+/// LLaMA / BitNet b1.58 convention. Pre-normalises every sublayer
+/// input inside a transformer block.
+pub trait RmsNorm {
+    fn rmsnorm(&self) -> Self;
 }
 
 #[cfg(test)]

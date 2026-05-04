@@ -623,6 +623,33 @@ impl Tensor {
         }
     }
 
+    /// Per-row RMS normalisation (no learnable gain). Input `[m, n]`,
+    /// output same shape. Each row gets divided by its RMS magnitude:
+    ///     rms_i = sqrt(mean_j(x[i, j]^2) + EPS),    EPS = 1e-5
+    ///     y[i, j] = x[i, j] / rms_i
+    /// Matches the autograd `Var::rmsnorm` math exactly so checkpoints
+    /// trained with the existing CPU forward stay numerically valid
+    /// when later evaluated through the trait-based path.
+    pub fn rmsnorm(&self) -> Tensor {
+        assert_eq!(self.ndim(), 2, "rmsnorm: rank-2 only, got rank {}", self.ndim());
+        let (m, n) = (self.shape[0], self.shape[1]);
+        let n_f = n as f32;
+        const EPS: f32 = 1e-5;
+        let mut y = vec![0.0_f32; m * n];
+        for i in 0..m {
+            let mean_sq: f32 =
+                (0..n).map(|j| self.data[i * n + j].powi(2)).sum::<f32>() / n_f;
+            let inv = 1.0_f32 / (mean_sq + EPS).sqrt();
+            for j in 0..n {
+                y[i * n + j] = self.data[i * n + j] * inv;
+            }
+        }
+        Tensor {
+            data: y,
+            shape: vec![m, n],
+        }
+    }
+
     /// Sigmoid Linear Unit activation: `silu(x) = x / (1 + exp(-x))`.
     /// Smooth, differentiable everywhere. Used as SwiGLU's gate branch.
     pub fn silu(&self) -> Tensor {
@@ -725,6 +752,12 @@ impl crate::device::Silu for Tensor {
 impl crate::device::Mul for Tensor {
     fn mul(&self, rhs: &Self) -> Self {
         Tensor::mul(self, rhs)
+    }
+}
+
+impl crate::device::RmsNorm for Tensor {
+    fn rmsnorm(&self) -> Self {
+        Tensor::rmsnorm(self)
     }
 }
 
