@@ -1,9 +1,14 @@
 //! Binary export and import of trained model weights.
 //!
-//! Two formats:
-//!   - `Format::Float32`  every weight as raw f32 (4 bytes per value). Baseline.
-//!   - `Format::Ternary`  embeddings stay f32; every BitLinear weight (block
-//!                        weights and the LM head) becomes `(γ f32, ternary i8/value)`.
+//! Three formats:
+//!   - `Format::Float32`        every weight as raw f32 (4 bytes per value).
+//!                              Lossless: BitLinear masters survive byte-identical
+//!                              through save+load, so resuming training picks up
+//!                              exactly where it left off (no `step 0 val_ppl`
+//!                              spike from a re-quantised master). This is the
+//!                              recommended format for `--resume` checkpoints.
+//!   - `Format::Ternary`        embeddings stay f32; every BitLinear weight (block
+//!                              weights and the LM head) becomes `(γ f32, ternary i8/value)`.
 //!
 //! On-disk layout starts with a 33-byte header so importers can sanity-check
 //! the file and reconstruct a `ModelConfig` without external metadata.
@@ -52,16 +57,24 @@ use std::io::{self, ErrorKind, Read, Write};
 //   BNT2: multi-head attention, ReLU FFN (added n_heads to header).
 //   BNT3: multi-head attention, SwiGLU FFN (added ffn_gate_w as a third
 //         FFN weight per block, written between the heads and ffn_up_w).
+//   BNT4: RoPE replaces learned absolute position embedding. Top-level
+//         payload no longer carries `pos_embed`; only `token_embed`,
+//         then per block, then `lm_head`. `max_seq_len` stays in the header
+//         (still useful for the assertion in `Model::forward`).
 // Each bump invalidates older checkpoints fail-fast rather than letting the
 // importer slide off into garbage payload bytes. The header layout is
-// unchanged from BNT2 (magic + format + 7 u32 fields = 33 bytes); the
-// difference lives entirely in the per-block payload.
-const MAGIC: &[u8; 4] = b"BNT3";
+// unchanged (magic + format + 7 u32 fields = 33 bytes); the difference at
+// each version is the payload shape.
+const MAGIC: &[u8; 4] = b"BNT4";
 const HEADER_SIZE: usize = 4 + 1 + 7 * 4; // magic + format byte + 7 u32 fields = 33
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
-    /// Every weight as raw f32 (4 bytes per value).
+    /// Every weight as raw f32 (4 bytes per value). The "with masters" format:
+    /// BitLinear master weights are saved verbatim instead of being projected
+    /// onto `γ · W_q`, so a save+load cycle is a true identity on the masters.
+    /// Use this for resume checkpoints; pair with `Ternary` / `TernaryPacked`
+    /// for the compact deployment artefact.
     Float32,
     /// BitLinear weights as `(γ f32, one i8 per ternary)`. Embeddings stay f32.
     /// Round-trippable via `xxd` for debugging.
@@ -118,8 +131,9 @@ fn read_header<R: Read>(r: &mut R) -> io::Result<(Format, ModelConfig)> {
     if &magic != MAGIC {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "not a BNT3 file (bad magic - BNT1 single-head and BNT2 \
-             ReLU-FFN checkpoints are no longer compatible; retrain)",
+            "not a BNT4 file (bad magic - BNT1/BNT2/BNT3 checkpoints \
+             are no longer compatible; v0.12 retired learned pos_embed \
+             in favour of RoPE, so the payload layout changed; retrain)",
         ));
     }
     let mut fb = [0u8; 1];
@@ -341,7 +355,6 @@ pub fn export_f32<W: Write>(
 ) -> io::Result<usize> {
     let mut total = write_header(w, &model.config, Format::Float32)?;
     total += write_f32_tensor(w, &model.token_embed)?;
-    total += write_f32_tensor(w, &model.pos_embed)?;
     for b in &model.blocks {
         for h in &b.heads {
             total += write_f32_tensor(w, &h.w_q)?;
@@ -367,7 +380,6 @@ pub fn export_ternary<W: Write>(
 ) -> io::Result<usize> {
     let mut total = write_header(w, &model.config, Format::Ternary)?;
     total += write_f32_tensor(w, &model.token_embed)?;
-    total += write_f32_tensor(w, &model.pos_embed)?;
     for b in &model.blocks {
         for h in &b.heads {
             total += write_ternary_tensor(w, &h.w_q)?;
@@ -395,7 +407,6 @@ pub fn export_ternary_packed<W: Write>(
 ) -> io::Result<usize> {
     let mut total = write_header(w, &model.config, Format::TernaryPacked)?;
     total += write_f32_tensor(w, &model.token_embed)?;
-    total += write_f32_tensor(w, &model.pos_embed)?;
     for b in &model.blocks {
         for h in &b.heads {
             total += write_ternary_packed_tensor(w, &h.w_q)?;
@@ -427,7 +438,6 @@ pub fn import<R: Read>(r: &mut R) -> io::Result<(Model, Format, Option<OptimStat
     let f = cfg.ffn_dim;
 
     let token_embed = read_f32_tensor(r, vec![cfg.vocab_size, h])?;
-    let pos_embed = read_f32_tensor(r, vec![cfg.max_seq_len, h])?;
 
     let mut blocks = Vec::with_capacity(cfg.n_blocks);
     for _ in 0..cfg.n_blocks {
@@ -461,7 +471,6 @@ pub fn import<R: Read>(r: &mut R) -> io::Result<(Model, Format, Option<OptimStat
 
     let model = Model {
         token_embed,
-        pos_embed,
         blocks,
         lm_head,
         config: cfg,
@@ -498,16 +507,15 @@ mod tests {
 
     #[test]
     fn f32_export_size_matches_total_param_count() {
-        // Total entries:
+        // Total entries (BNT4: pos_embed dropped, RoPE injects position info):
         //   token_embed   : 8 * 4 = 32
-        //   pos_embed     : 4 * 4 = 16
         //   per block     : 2 heads * 4 * (4*2) + 3 FFN tensors (gate/up/down)
         //                 = 64 + 96 = 160 entries per block
         //   2 blocks      : 320
         //   lm_head       : 4 * 8 = 32
-        //   total         : 48 + 320 + 32 = 400 floats
-        // Header (33) + 400 floats × 4 = 33 + 1600 = 1633 bytes.
-        let expected = HEADER_SIZE + 400 * 4;
+        //   total         : 32 + 320 + 32 = 384 floats
+        // Header (33) + 384 floats × 4 = 33 + 1536 = 1569 bytes.
+        let expected = HEADER_SIZE + 384 * 4;
         let mut buf = Vec::new();
         let bytes = export_f32(&tiny_model(), &mut buf, None).unwrap();
         assert_eq!(bytes, expected);
@@ -516,15 +524,16 @@ mod tests {
 
     #[test]
     fn ternary_export_size_matches_expected_layout() {
-        // Header (33) + embeddings (48 floats * 4 = 192) +
+        // BNT4 layout: token_embed only (no pos_embed) + ternary blocks + lm_head.
+        // Header (33) + token_embed f32 (32 floats * 4 = 128) +
         //   per block: 11 ternary tensors (4 per head * 2 heads + gate + up + down)
         //              each carries a 4-byte gamma + 1 byte per i8 entry
         //              gammas: 11 * 4 = 44, i8 entries: 160
         //              per-block bytes: 204
         //   2 blocks: 408
         //   lm_head ternary: 4-byte gamma + 32 i8 entries = 36
-        // Total: 33 + 192 + 408 + 36 = 669.
-        let expected = HEADER_SIZE + 192 + 408 + 36;
+        // Total: 33 + 128 + 408 + 36 = 605.
+        let expected = HEADER_SIZE + 128 + 408 + 36;
         let mut buf = Vec::new();
         let bytes = export_ternary(&tiny_model(), &mut buf, None).unwrap();
         assert_eq!(bytes, expected);
@@ -735,6 +744,92 @@ mod tests {
             assert_eq!(lt.data, st.data);
         }
         for (lt, st) in loaded.v.iter().zip(&v) {
+            assert_eq!(lt.shape, st.shape);
+            assert_eq!(lt.data, st.data);
+        }
+    }
+
+    #[test]
+    fn f32_round_trip_preserves_every_master_and_optim_byte_identical() {
+        // The Finding-A guarantee: a Float32 save+load is a true identity on
+        // every master tensor AND on the AdamW optim state. If this test ever
+        // breaks, resuming from a `.f32.bin` checkpoint will silently
+        // re-introduce the "step 0 val_ppl spike" failure mode. The previous
+        // `f32_round_trip_preserves_every_weight_exactly` only spot-checked
+        // a single head and one FFN tensor; this one walks every parameter.
+        use crate::optim::OptimState;
+
+        let model = tiny_model();
+        let shapes = model.param_shapes();
+        let m: Vec<Tensor> = shapes
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let n: usize = s.iter().product();
+                let data: Vec<f32> =
+                    (0..n).map(|j| (i * 7 + j) as f32 * 1.234e-3).collect();
+                Tensor {
+                    data,
+                    shape: s.clone(),
+                }
+            })
+            .collect();
+        let v: Vec<Tensor> = shapes
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let n: usize = s.iter().product();
+                let data: Vec<f32> =
+                    (0..n).map(|j| (i * 11 + j) as f32 * 5.678e-5).collect();
+                Tensor {
+                    data,
+                    shape: s.clone(),
+                }
+            })
+            .collect();
+        let saved = OptimState {
+            step_count: 9_999,
+            m: m.clone(),
+            v: v.clone(),
+        };
+
+        let mut buf = Vec::new();
+        export_f32(&model, &mut buf, Some(&saved)).unwrap();
+        let (loaded_model, fmt, loaded_optim) = import(&mut Cursor::new(&buf)).unwrap();
+        assert_eq!(fmt, Format::Float32);
+        let loaded_state = loaded_optim.expect("optim state must round-trip");
+
+        // Token embedding and lm_head are full f32 in this format.
+        // (No pos_embed since v0.12: RoPE replaced it.)
+        assert_eq!(loaded_model.token_embed.data, model.token_embed.data);
+        assert_eq!(loaded_model.lm_head.data, model.lm_head.data);
+
+        // Every block's master weights survive byte-identical. Walking every
+        // head's Q/K/V/O and every FFN tensor catches any silent drop or
+        // dequantisation in the f32 path.
+        assert_eq!(loaded_model.blocks.len(), model.blocks.len());
+        for (lb, mb) in loaded_model.blocks.iter().zip(&model.blocks) {
+            assert_eq!(lb.heads.len(), mb.heads.len());
+            for (lh, mh) in lb.heads.iter().zip(&mb.heads) {
+                assert_eq!(lh.w_q.data, mh.w_q.data);
+                assert_eq!(lh.w_k.data, mh.w_k.data);
+                assert_eq!(lh.w_v.data, mh.w_v.data);
+                assert_eq!(lh.w_o.data, mh.w_o.data);
+            }
+            assert_eq!(lb.ffn_gate_w.data, mb.ffn_gate_w.data);
+            assert_eq!(lb.ffn_up_w.data, mb.ffn_up_w.data);
+            assert_eq!(lb.ffn_down_w.data, mb.ffn_down_w.data);
+        }
+
+        // Optim state is identical too: step_count plus every m and v cell.
+        assert_eq!(loaded_state.step_count, 9_999);
+        assert_eq!(loaded_state.m.len(), m.len());
+        assert_eq!(loaded_state.v.len(), v.len());
+        for (lt, st) in loaded_state.m.iter().zip(&m) {
+            assert_eq!(lt.shape, st.shape);
+            assert_eq!(lt.data, st.data);
+        }
+        for (lt, st) in loaded_state.v.iter().zip(&v) {
             assert_eq!(lt.shape, st.shape);
             assert_eq!(lt.data, st.data);
         }

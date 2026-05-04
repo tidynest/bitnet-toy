@@ -1,7 +1,12 @@
-//! Full BitNet language model - embeddings + N transformer blocks + LM head.
+//! Full BitNet language model - token embedding + N transformer blocks + LM head.
 //!
 //! Structure:
-//!     Model { token_embed, pos_embed, blocks: Vec<BlockMasters>, lm_head, config }
+//!     Model { token_embed, blocks: Vec<BlockMasters>, lm_head, config }
+//!
+//! Position information arrives via RoPE inside attention (see `autograd::rope`
+//! and `attention::head_output`) - there is no learned absolute position
+//! embedding tensor. RoPE is parameter-free, so the model carries one fewer
+//! tensor than a typical transformer.
 //!
 //! Training cycle (one step):
 //!     tape   = Tape::new()
@@ -68,7 +73,6 @@ pub struct BlockMasters {
 #[derive(Debug, Clone)]
 pub struct Model {
     pub token_embed: Tensor, // [vocab, hidden]
-    pub pos_embed: Tensor,   // [max_seq_len, hidden]
     pub blocks: Vec<BlockMasters>,
     pub lm_head: Tensor, // [hidden, vocab]
     pub config: ModelConfig,
@@ -78,7 +82,6 @@ pub struct Model {
 /// Lifetime `'t` ties this to a specific `Tape` instance.
 pub struct ModelLeaves<'t> {
     pub token_embed: Var<'t>,
-    pub pos_embed: Var<'t>,
     pub blocks: Vec<BlockWeights<'t>>,
     pub lm_head: Var<'t>,
 }
@@ -119,10 +122,11 @@ impl Model {
         let d = config.head_dim;
         let f = config.ffn_dim;
 
-        // Embedding inits: small constant scale (~0.02) keeps initial logits in
-        // a sensible range so cross-entropy starts ≈ log(vocab_size).
+        // Token embedding init: small constant scale (~0.02) keeps initial
+        // logits in a sensible range so cross-entropy starts ≈ log(vocab_size).
+        // No learned positional embedding: position information is injected
+        // via RoPE inside attention (see `autograd::rope`).
         let token_embed = rng.fill_tensor(vec![config.vocab_size, h], 0.02);
-        let pos_embed = rng.fill_tensor(vec![config.max_seq_len, h], 0.02);
 
         // Linear-layer inits: scale by 1/√fan_in (a poor man's Kaiming).
         let scale_h_d = 1.0 / (h as f32).sqrt();
@@ -154,7 +158,6 @@ impl Model {
 
         Self {
             token_embed,
-            pos_embed,
             blocks,
             lm_head,
             config: *config,
@@ -167,7 +170,6 @@ impl Model {
         use crate::block::AttentionHeadVars;
         ModelLeaves {
             token_embed: Var::leaf(tape, self.token_embed.clone()),
-            pos_embed: Var::leaf(tape, self.pos_embed.clone()),
             blocks: self
                 .blocks
                 .iter()
@@ -202,15 +204,10 @@ impl Model {
             self.config.max_seq_len
         );
 
-        // Embed tokens.
-        let tok = leaves.token_embed.embed(ids);
-        // Embed positions 0..seq. Each window starts at position 0 - fine for our
-        // toy training; a real LM would track absolute position across the corpus.
-        let pos_ids: Vec<usize> = (0..seq).collect();
-        let pos = leaves.pos_embed.embed(&pos_ids);
-
-        // x = tok + pos. Both are [seq, hidden]; same-shape add - no broadcast needed.
-        let mut x = tok.add(pos);
+        // Embed tokens. Position information is added inside attention via
+        // RoPE (`autograd::rope`), not here - so the input to the block stack
+        // is just the token-embedding lookup, no learned positional add.
+        let mut x = leaves.token_embed.embed(ids);
 
         // Stack of transformer blocks.
         for bw in &leaves.blocks {
@@ -243,16 +240,16 @@ impl Model {
     /// Optimisers (`SGD`, `AdamW`, etc.) drive their iteration through here so
     /// they don't need to know the model's internal layout.
     ///
-    /// Order: token_embed, pos_embed, then per block (each head's q, k, v, o
-    /// followed by ffn_gate, ffn_up, ffn_down), finally lm_head. The
-    /// `optim::AdamW` state vectors are sized to match - changing the order
-    /// here breaks resume.
+    /// Order: token_embed, then per block (each head's q, k, v, o followed by
+    /// ffn_gate, ffn_up, ffn_down), finally lm_head. The `optim::AdamW` state
+    /// vectors are sized to match - changing the order here breaks resume.
+    /// (Pre-v0.12 the order included `pos_embed` after `token_embed`; RoPE
+    /// retired that tensor, hence the order change and the `BNT4` magic.)
     pub fn for_each_param_with_grad<F>(&mut self, leaves: &ModelLeaves<'_>, mut f: F)
     where
         F: FnMut(&mut Tensor, &Tensor),
     {
         f(&mut self.token_embed, &leaves.token_embed.grad());
-        f(&mut self.pos_embed, &leaves.pos_embed.grad());
         for (mb, lb) in self.blocks.iter_mut().zip(&leaves.blocks) {
             for (mh, lh) in mb.heads.iter_mut().zip(&lb.heads) {
                 f(&mut mh.w_q, &lh.w_q.grad());
@@ -277,7 +274,6 @@ impl Model {
         F: FnMut(&mut Tensor),
     {
         f(&mut self.token_embed);
-        f(&mut self.pos_embed);
         for mb in self.blocks.iter_mut() {
             for mh in mb.heads.iter_mut() {
                 f(&mut mh.w_q);
@@ -297,7 +293,6 @@ impl Model {
     #[allow(dead_code)]
     pub fn for_each_grad<F: FnMut(&Tensor)>(&self, leaves: &ModelLeaves<'_>, mut f: F) {
         f(&leaves.token_embed.grad());
-        f(&leaves.pos_embed.grad());
         for lb in &leaves.blocks {
             for lh in &lb.heads {
                 f(&lh.w_q.grad());
@@ -317,7 +312,6 @@ impl Model {
     pub fn param_shapes(&self) -> Vec<Vec<usize>> {
         let mut out = Vec::new();
         out.push(self.token_embed.shape.clone());
-        out.push(self.pos_embed.shape.clone());
         for b in &self.blocks {
             for h in &b.heads {
                 out.push(h.w_q.shape.clone());
@@ -387,7 +381,6 @@ mod tests {
 
         let has_nonzero = |t: &Tensor| t.data.iter().any(|&v| v.abs() > 1e-10);
         assert!(has_nonzero(&leaves.token_embed.grad()), "token_embed");
-        assert!(has_nonzero(&leaves.pos_embed.grad()), "pos_embed");
         assert!(has_nonzero(&leaves.lm_head.grad()), "lm_head");
         for (i, b) in leaves.blocks.iter().enumerate() {
             for (j, h) in b.heads.iter().enumerate() {

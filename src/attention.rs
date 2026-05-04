@@ -76,8 +76,13 @@ pub fn attention<'t>(
 /// other heads' outputs (sum-of-projections form).
 fn head_output<'t>(x_eff: Var<'t>, h: &AttentionHeadVars<'t>, scale: f32) -> Var<'t> {
     // Q, K, V projections through ternary-quantised per-head weights.
-    let q = x_eff.matmul(h.w_q.quantise_weights_ste());
-    let k = x_eff.matmul(h.w_k.quantise_weights_ste());
+    // Q and K are then rotated by RoPE so attention scores depend on the
+    // *difference* between query and key positions, not their absolute
+    // values. V is unrotated; the value content is position-independent.
+    // BitNet b1.58 / LLaMA convention; replaces a learned absolute pos_embed
+    // sat outside the attention path.
+    let q = x_eff.matmul(h.w_q.quantise_weights_ste()).rope();
+    let k = x_eff.matmul(h.w_k.quantise_weights_ste()).rope();
     let v = x_eff.matmul(h.w_v.quantise_weights_ste());
 
     // Scaled dot-product scores with causal mask. mul_scalar applies the

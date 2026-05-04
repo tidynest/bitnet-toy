@@ -3,4 +3,20 @@ name = "bitnet-toy"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Default build is dependency-free. Opt into the CUDA back-end with
+# `cargo build --features cuda` (requires the CUDA toolkit on the host;
+# cudarc dynamically loads libcuda.so + libnvrtc.so.* at runtime via the
+# `dynamic-loading` feature, so a rebuild is not needed when the toolkit
+# is upgraded in place).
+default = []
+cuda = ["dep:cudarc"]
+
 [dependencies]
+# Direct CUDA bindings, no cuBLAS / cuDNN abstractions. Hand-rolled NVRTC
+# kernels match the project's "no ML deps, learn the layer" ethos.
+# `default-features = false` skips cublas / cublaslt / curand which we do
+# not want; `dynamic-loading` finds libcuda / libnvrtc at runtime so a
+# binary built with `--features cuda` still loads on a machine where the
+# toolkit lives at a non-default path (e.g. `/opt/cuda/lib64` on Arch).
+cudarc = { version = "0.19", default-features = false, features = ["driver", "nvrtc", "std", "dynamic-loading", "cuda-version-from-build-system", "cublas"], optional = true }

@@ -352,4 +352,49 @@ mod tests {
         assert!((mid - 0.55).abs() < 1e-2);
         assert!((cosine_lr(2000, 100, 1000, 1.0, 0.1) - 0.1).abs() < 1e-6);
     }
+
+    #[test]
+    fn cosine_lr_resume_continuation_skips_warmup_and_decays_smoothly() {
+        // The v0.14 resume pattern: pass `step + offset` and a stretched
+        // `total = offset + n_steps`. The schedule should deliver a
+        // continuation LR somewhere between peak and floor at the start of
+        // the new run (post-warmup territory) and reach floor at the end.
+        // Concretely: a 10k+10k resume should land at the cosine half-way
+        // point at the resume's step 0.
+        let warmup = 200;
+        let peak = 3e-3;
+        let floor = 3e-4;
+        let offset = 10_000;
+        let n_steps = 10_000;
+        let total = offset + n_steps; // 20_000
+
+        // Resume's step 0 (effective 10_000): post-warmup, halfway through
+        // a 19_800-step cosine band. progress ~ (10_000 - 200) / 19_800 ~ 0.495.
+        // LR ~ floor + 0.5 * (peak - floor) * (1 + cos(pi * 0.495))
+        //    ~ floor + 0.5 * peak * 0.0157  -> just above midpoint.
+        let lr_start = cosine_lr(0 + offset, warmup, total, peak, floor);
+        assert!(
+            lr_start > floor && lr_start < peak,
+            "resume step 0 LR {} outside (floor {}, peak {})",
+            lr_start,
+            floor,
+            peak
+        );
+        // Resume's mid (effective 15_000): roughly 3/4 down the cosine.
+        let lr_mid = cosine_lr(5000 + offset, warmup, total, peak, floor);
+        assert!(lr_mid < lr_start, "LR should still be decaying mid-resume");
+        // Resume's last step: at the cosine's tail, very close to floor.
+        let lr_end = cosine_lr(n_steps - 1 + offset, warmup, total, peak, floor);
+        assert!(
+            (lr_end - floor).abs() / floor < 0.02,
+            "resume step {} LR {} should be ~floor {} (relative err > 2%)",
+            n_steps - 1,
+            lr_end,
+            floor
+        );
+        // Sanity: with offset = 0 (fresh run) the schedule reduces to the
+        // pre-v0.14 behaviour exactly.
+        let lr_fresh_step_0 = cosine_lr(0, warmup, n_steps, peak, floor);
+        assert!((lr_fresh_step_0 - 0.0).abs() < 1e-6);
+    }
 }

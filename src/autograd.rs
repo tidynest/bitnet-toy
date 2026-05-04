@@ -831,6 +831,113 @@ impl<'t> Var<'t> {
         }
     }
 
+    /// Rotary Position Embedding (RoPE). Input is rank-2 `[seq, head_dim]`;
+    /// output has the same shape. For each row `pos in 0..seq` and each pair
+    /// index `i in 0..head_dim/2`, rotates the 2D vector
+    /// `(x[pos, 2i], x[pos, 2i+1])` by angle
+    ///
+    ///     theta_{pos, i} = pos * base ^ (-2i / head_dim)        # base = 10000
+    ///
+    /// concretely
+    ///
+    ///     y[pos, 2i]   = x[pos, 2i] * cos(t) - x[pos, 2i+1] * sin(t)
+    ///     y[pos, 2i+1] = x[pos, 2i] * sin(t) + x[pos, 2i+1] * cos(t)
+    ///
+    /// Standard in LLaMA / BitNet b1.58. Replaces learned absolute position
+    /// embeddings: position information is injected at attention time via
+    /// rotated Q and K, so attention scores depend on the *difference*
+    /// between query and key positions naturally.
+    ///
+    /// `head_dim` must be even. RoPE has no learned parameters; the rotation
+    /// angles are fixed by `(pos, pair_index)`.
+    ///
+    /// Backward: each pair's 2D rotation is orthogonal, so its inverse is its
+    /// transpose, which is rotation by the negated angle. We capture the
+    /// per-position cos / sin tables in the closure to avoid recomputing the
+    /// transcendentals during the backward pass.
+    pub fn rope(self) -> Var<'t> {
+        let x_in = self.value();
+        assert_eq!(
+            x_in.ndim(),
+            2,
+            "rope: expected rank-2 [seq, head_dim], got rank {}",
+            x_in.ndim()
+        );
+        let (seq, head_dim) = (x_in.shape[0], x_in.shape[1]);
+        assert!(
+            head_dim % 2 == 0,
+            "rope: head_dim ({}) must be even for pair-wise rotation",
+            head_dim
+        );
+        let half = head_dim / 2;
+
+        // Precompute cos / sin per (pos, pair). The same tables get used by
+        // both the forward result here and the backward closure below.
+        let mut cos_tab = vec![0.0_f32; seq * half];
+        let mut sin_tab = vec![0.0_f32; seq * half];
+        for pos in 0..seq {
+            for i in 0..half {
+                let theta_i = 10000_f32.powf(-(2.0 * i as f32) / head_dim as f32);
+                let angle = pos as f32 * theta_i;
+                cos_tab[pos * half + i] = angle.cos();
+                sin_tab[pos * half + i] = angle.sin();
+            }
+        }
+
+        let mut y_data = vec![0.0_f32; seq * head_dim];
+        for pos in 0..seq {
+            for i in 0..half {
+                let a = x_in.data[pos * head_dim + 2 * i];
+                let b = x_in.data[pos * head_dim + 2 * i + 1];
+                let c = cos_tab[pos * half + i];
+                let s = sin_tab[pos * half + i];
+                y_data[pos * head_dim + 2 * i] = a * c - b * s;
+                y_data[pos * head_dim + 2 * i + 1] = a * s + b * c;
+            }
+        }
+        let y_val = Tensor {
+            data: y_data,
+            shape: vec![seq, head_dim],
+        };
+
+        let p0 = self.id;
+        let backward = Box::new(move |g: &Tensor| -> Vec<(NodeId, Tensor)> {
+            // Inverse rotation: same trig table, sign of sin flipped.
+            //     dL/dx[pos, 2i]   =  dL/dy[pos, 2i]   * cos + dL/dy[pos, 2i+1] * sin
+            //     dL/dx[pos, 2i+1] = -dL/dy[pos, 2i]   * sin + dL/dy[pos, 2i+1] * cos
+            let mut grad_in = vec![0.0_f32; seq * head_dim];
+            for pos in 0..seq {
+                for i in 0..half {
+                    let ga = g.data[pos * head_dim + 2 * i];
+                    let gb = g.data[pos * head_dim + 2 * i + 1];
+                    let c = cos_tab[pos * half + i];
+                    let s = sin_tab[pos * half + i];
+                    grad_in[pos * head_dim + 2 * i] = ga * c + gb * s;
+                    grad_in[pos * head_dim + 2 * i + 1] = -ga * s + gb * c;
+                }
+            }
+            vec![(
+                p0,
+                Tensor {
+                    data: grad_in,
+                    shape: vec![seq, head_dim],
+                },
+            )]
+        });
+
+        let grad_zero = Tensor::zeros(y_val.shape.clone());
+        let id = self.tape.push(Node {
+            value: y_val,
+            grad: RefCell::new(grad_zero),
+            backward: Some(backward),
+            parents: vec![p0],
+        });
+        Var {
+            tape: self.tape,
+            id,
+        }
+    }
+
     /// Multiply every element by a constant `s`. The constant is captured by
     /// value (Copy), so the closure stays `Fn` and 'static.
     /// Backward:  d(s·x)/dx = s, so grad_in = grad_out · s.
@@ -1179,6 +1286,97 @@ mod tests {
         assert_eq!(x.grad().data, vec![3.0, 4.0]);
         assert_eq!(w.grad().data, vec![1.0, 2.0]);
         assert_eq!(b.grad().data, vec![1.0]);
+    }
+
+    #[test]
+    fn rope_at_position_zero_is_the_identity() {
+        // Position 0 -> angle 0 for every pair index -> rotation matrix is I.
+        // First row of any RoPE-rotated tensor must equal the input row to
+        // bit-exact f32 precision.
+        let tape = Tape::new();
+        let x_data: Vec<f32> = (0..1 * 4).map(|i| i as f32 + 1.0).collect();
+        let x = Var::leaf(&tape, Tensor::from_vec(x_data.clone(), vec![1, 4]));
+        let y = x.rope();
+        assert_eq!(y.value().data, x_data);
+    }
+
+    #[test]
+    fn rope_preserves_per_pair_norm() {
+        // Each (x[pos, 2i], x[pos, 2i+1]) pair is rotated by an angle - the
+        // 2-norm of every pair must be preserved up to f32 round-off.
+        let tape = Tape::new();
+        let seq = 5;
+        let head_dim = 8;
+        let x_data: Vec<f32> = (0..seq * head_dim)
+            .map(|i| ((i as f32) * 0.371).sin())
+            .collect();
+        let x = Var::leaf(&tape, Tensor::from_vec(x_data.clone(), vec![seq, head_dim]));
+        let y = x.rope();
+        for pos in 0..seq {
+            for i in 0..head_dim / 2 {
+                let a = x_data[pos * head_dim + 2 * i];
+                let b = x_data[pos * head_dim + 2 * i + 1];
+                let ya = y.value().data[pos * head_dim + 2 * i];
+                let yb = y.value().data[pos * head_dim + 2 * i + 1];
+                let n_in = (a * a + b * b).sqrt();
+                let n_out = (ya * ya + yb * yb).sqrt();
+                assert!(
+                    (n_in - n_out).abs() < 1e-5,
+                    "rope changed pair norm at pos {} pair {}: in {} out {}",
+                    pos,
+                    i,
+                    n_in,
+                    n_out
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rope_backward_is_inverse_rotation() {
+        // The 2D rotation per pair is orthogonal, so its backward is the
+        // transpose, which is rotation by the negated angle. Concretely:
+        // if we seed grad_y = ones, the backward must equal what a forward
+        // rope() pass on `ones` would produce *with the sin sign flipped*.
+        let tape = Tape::new();
+        let seq = 3;
+        let head_dim = 4;
+        let x = Var::leaf(
+            &tape,
+            Tensor::from_vec(
+                (0..seq * head_dim).map(|i| (i as f32) * 0.1 + 0.5).collect(),
+                vec![seq, head_dim],
+            ),
+        );
+        let y = x.rope();
+        tape.backward(y.id);
+
+        // Hand-compute the expected gradient. With grad_y = ones:
+        //   grad_x[pos, 2i]   =  cos + sin
+        //   grad_x[pos, 2i+1] = -sin + cos
+        let half = head_dim / 2;
+        for pos in 0..seq {
+            for i in 0..half {
+                let theta_i = 10000_f32.powf(-(2.0 * i as f32) / head_dim as f32);
+                let angle = pos as f32 * theta_i;
+                let c = angle.cos();
+                let s = angle.sin();
+                let want_a = c + s;
+                let want_b = -s + c;
+                let got_a = x.grad().data[pos * head_dim + 2 * i];
+                let got_b = x.grad().data[pos * head_dim + 2 * i + 1];
+                assert!(
+                    (got_a - want_a).abs() < 1e-5 && (got_b - want_b).abs() < 1e-5,
+                    "rope backward drift at pos {} pair {}: got ({}, {}) want ({}, {})",
+                    pos,
+                    i,
+                    got_a,
+                    got_b,
+                    want_a,
+                    want_b
+                );
+            }
+        }
     }
 
     #[test]

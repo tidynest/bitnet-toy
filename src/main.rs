@@ -29,10 +29,14 @@ mod attention;
 mod autograd;
 mod bitlinear;
 mod block;
+#[cfg(feature = "cuda")]
+mod cuda;
 mod data;
+mod device;
 mod export;
 mod ffn;
 mod inference;
+mod inference_kv;
 mod model;
 mod optim;
 mod tensor;
@@ -243,6 +247,24 @@ pub struct TrainConfig {
     /// those leaves this `None` and the optimiser starts from zeros, costing
     /// the usual ~30 wobbly steps after resume.
     pub start_from_optim: Option<crate::optim::OptimState>,
+    /// Starting offset into the cosine LR schedule. The training loop uses
+    /// `cosine_lr(step + start_step_offset, warmup_steps, cosine_total_steps,
+    /// peak_lr, floor_lr)`. Default 0 (fresh start).
+    ///
+    /// When resuming with `start_from_optim = Some(state)`, set this to
+    /// `state.step_count` so the LR schedule picks up where it left off
+    /// instead of restarting at the warmup floor of zero. Without this
+    /// offset (the v0.7-v0.13 default), every `cargo run` re-walks the
+    /// 200-step warmup ramp at peak LR, which perturbs an already-converged
+    /// model and was diagnosed as the v0.13 cumulative-30k plateau cause.
+    pub start_step_offset: usize,
+    /// Override for the cosine schedule's `total` argument. `None` means
+    /// "use `n_steps`" (the v0.7-v0.13 behaviour). When resuming, set to
+    /// `start_step_offset + n_steps` so the cosine decay denominator
+    /// stretches across both the prior training and the new continuation,
+    /// giving a smooth tail from previous-run-LR down to floor at the end
+    /// of the new run.
+    pub cosine_total_steps: Option<usize>,
 }
 
 impl TrainConfig {
@@ -285,14 +307,28 @@ impl TrainConfig {
             n_workers: 1,
             start_from: None,
             start_from_optim: None,
+            start_step_offset: 0,
+            cosine_total_steps: None,
         }
     }
 
     /// Defaults targeting the full TinyShakespeare corpus at `data/tinyshakespeare.txt`.
-    /// Bigger model, longer sequences, more steps. Expect ~10-30 minutes on CPU.
+    /// Bigger model, longer sequences, more steps. Expect ~25-35 minutes on CPU.
+    ///
+    /// Sizing rationale (v0.13 bump from the v0.9-v0.12 ~2M-param config):
+    ///   - v0.12 hit val_ppl 5.235 in 10k steps and 5.034 cumulative across
+    ///     20k steps. Trajectory still descending - capacity, not training,
+    ///     is the bottleneck.
+    ///   - 1.5x the hidden_dim and ffn_dim, 1.5x the n_heads (head_dim still 16,
+    ///     the BitNet b1.58 per-head dimensionality), n_blocks unchanged at 6.
+    ///     Total parameter count lands around 5M (~2.5x v0.12).
+    ///   - n_steps stays at 10_000. The bigger model converges faster per
+    ///     parameter at this scale; resume to 20k or 30k if the curve still
+    ///     looks promising at the end.
+    ///   - warmup_steps stays at 200 (a fixed-budget LR ramp).
     pub fn shakespeare() -> Self {
         Self {
-            n_steps: 5_000,
+            n_steps: 10_000,
             peak_lr: 3e-3,
             floor_lr: 3e-4,
             warmup_steps: 200,
@@ -303,15 +339,17 @@ impl TrainConfig {
             seed: 1337,
             model: crate::model::ModelConfig {
                 vocab_size: 0, // filled after vocab is built
-                hidden_dim: 64,
-                // 4 heads * 16 head_dim == 64 = hidden_dim. Same total
-                // attention parameter budget as the previous single-head
-                // (head_dim 64) configuration; 4 orthogonal subspaces.
-                n_heads: 4,
+                hidden_dim: 192,
+                // 12 heads * 16 head_dim == 192 = hidden_dim. Keeping head_dim
+                // at 16 (the BitNet b1.58 per-head dimensionality); the extra
+                // hidden capacity is spent on more orthogonal attention
+                // subspaces, not on bigger per-head dims. RoPE rotates pairs
+                // within head_dim, so head_dim must stay even - 16 is fine.
+                n_heads: 12,
                 head_dim: 16,
-                ffn_dim: 128,
+                ffn_dim: 384,
                 max_seq_len: 64,
-                n_blocks: 4,
+                n_blocks: 6,
             },
             corpus_path: Some(std::path::PathBuf::from("data/tinyshakespeare.txt")),
             log_every: 100,
@@ -325,16 +363,55 @@ impl TrainConfig {
             // 100 windows per eval is a fixed-budget tradeoff: ~1 second
             // wall-clock per eval, val_ppl noise floor around 1-2%.
             val_eval_samples: 100,
-            // Batched training: 4 windows per step, processed in parallel on
-            // up to 4 worker threads. On the 7940HS this peaks the chip
-            // briefly during the forward+backward then drops back to idle
-            // during optimiser update; sustained CPU utilisation runs around
-            // 25-40 percent. Bump to 8 + 8 if your laptop's cooling can hold.
+            // Batched training: 4 windows per step, parallelised across
+            // `n_workers` threads via `std::thread::scope`. Each worker runs
+            // one full window's forward + backward; matmul stays serial
+            // (with AVX2 SIMD) inside the worker because at this model scale
+            // every individual matmul (1k-16k output elements) is too small
+            // for the per-call thread-spawn cost to amortise. Outer-level
+            // threading is the right granularity. Bump `BITNET_MATMUL_THREADS`
+            // to N>1 if you scale the model up enough that a single matmul
+            // becomes the dominant per-step work; do not stack both levels.
             batch_size: 4,
             n_workers: 4,
             start_from: None,
             start_from_optim: None,
+            start_step_offset: 0,
+            cosine_total_steps: None,
         }
+    }
+
+    /// Bigger sibling of `shakespeare()`: ~8.5M parameters, sequence length
+    /// doubled to 128. Aimed at squeezing the most out of the RoPE / SwiGLU
+    /// architecture before the next training tier (multi-block + multi-head
+    /// scaling beyond what fits comfortably on one CPU).
+    ///
+    /// Sizing (vs v0.13):
+    ///   - `hidden_dim` 192 -> 256
+    ///   - `ffn_dim` 384 -> 1024 (4x hidden, the standard transformer
+    ///     expansion factor; v0.13 was at 2x because we were keeping the
+    ///     param-count budget tight)
+    ///   - `n_heads` 12 -> 16, `head_dim` still 16 (so 16 * 16 == 256)
+    ///   - `n_blocks` 6 -> 8
+    ///   - `max_seq_len` 64 -> 128 (RoPE handles arbitrary seq_len natively;
+    ///     longer context is where rotary positional info pays the most)
+    ///
+    /// Wall-clock cost on a 7940HS with the v0.11 SIMD kernel: roughly 4-5x
+    /// per step over v0.13, so a 10k-step run is ~2-2.5 hours. Plan for an
+    /// overnight or multi-resume training. The v0.14 LR fix means resumes
+    /// continue the cosine schedule cleanly, no warmup-restart penalty.
+    pub fn shakespeare_large() -> Self {
+        let mut cfg = Self::shakespeare();
+        cfg.model = crate::model::ModelConfig {
+            vocab_size: 0, // filled after vocab is built
+            hidden_dim: 256,
+            n_heads: 16,
+            head_dim: 16, // 16 * 16 == 256
+            ffn_dim: 1024,
+            max_seq_len: 128,
+            n_blocks: 8,
+        };
+        cfg
     }
 }
 
@@ -594,7 +671,7 @@ fn train_bitnet_lm(
          val wins     = {} (split = {:.0}%)\n\
          batching     = batch_size {}, n_workers {}\n\
          optimiser    = AdamW(b1={}, b2={}, wd={}), peak_lr={:.1e}, floor_lr={:.1e},\n\
-                        warmup={} steps, grad_clip={}, total_steps={}",
+                        warmup={} steps, grad_clip={}, total_steps={} (offset {}, cosine_total {})",
         corpus_owned.chars().count(),
         vocab.size(),
         model_cfg.hidden_dim,
@@ -616,6 +693,8 @@ fn train_bitnet_lm(
         cfg.warmup_steps,
         cfg.grad_clip,
         cfg.n_steps,
+        cfg.start_step_offset,
+        cfg.cosine_total_steps.unwrap_or(cfg.n_steps),
     );
 
     let eval_loss = |m: &Model, input: &[usize], target: &[usize]| -> f32 {
@@ -640,10 +719,16 @@ fn train_bitnet_lm(
         // window path, just with one extra Vec allocation. With batch_size > 1
         // the per-window forward+backward passes parallelise across up to
         // `n_workers` threads, returning averaged gradients.
+        // Continue the cosine schedule across resumes: pass `step + offset`
+        // and the (offset + n_steps) total so a cumulative training session
+        // walks one smooth cosine instead of repeating warmup-and-decay
+        // every `cargo run`. With offset = 0 (fresh runs) the math reduces
+        // to the v0.7-v0.13 schedule exactly.
+        let total = cfg.cosine_total_steps.unwrap_or(cfg.n_steps);
         let lr = cosine_lr(
-            step,
+            step + cfg.start_step_offset,
             cfg.warmup_steps,
-            cfg.n_steps,
+            total,
             cfg.peak_lr,
             cfg.floor_lr,
         );
@@ -735,8 +820,12 @@ fn models_path(filename: &str) -> std::path::PathBuf {
 /// `cargo run --release -- shakespeare [resume_path]`. Trains (or continues
 /// training) a larger BitNet on the full TinyShakespeare corpus, exports all
 /// three formats, and generates samples in greedy + two temperature modes.
-fn run_shakespeare_training(resume_path: Option<std::path::PathBuf>) {
-    let mut cfg = TrainConfig::shakespeare();
+fn run_shakespeare_training(resume_path: Option<std::path::PathBuf>, large: bool) {
+    let mut cfg = if large {
+        TrainConfig::shakespeare_large()
+    } else {
+        TrainConfig::shakespeare()
+    };
     let path_present = cfg
         .corpus_path
         .as_ref()
@@ -774,6 +863,23 @@ fn run_shakespeare_training(resume_path: Option<std::path::PathBuf>) {
                     optim_msg
                 );
                 cfg.start_from = Some(m);
+                // Continue the cosine LR schedule from where the previous
+                // run left off, instead of restarting at warmup-zero.
+                // Diagnosed in the v0.13 cumulative-30k run: warmup-restart
+                // perturbs converged 5M-param weights and consumed ~2k of
+                // each 10k-step resume's productive budget. Reading the
+                // step_count from the OPTM payload makes the new schedule
+                // pick up at the right position automatically.
+                if let Some(state) = optim.as_ref() {
+                    cfg.start_step_offset = state.step_count as usize;
+                    cfg.cosine_total_steps =
+                        Some(cfg.start_step_offset + cfg.n_steps);
+                    println!(
+                        "continuing cosine LR schedule: offset {} -> total {}",
+                        cfg.start_step_offset,
+                        cfg.cosine_total_steps.unwrap()
+                    );
+                }
                 cfg.start_from_optim = optim;
             }
             Err(e) => {
@@ -847,31 +953,213 @@ fn run_shakespeare_training(resume_path: Option<std::path::PathBuf>) {
         println!("\nprompt: {:?}\n{}", prompt, g);
     }
 
+    // KV-cache top-p (v0.16). Same architecture, same sampling mode, but the
+    // forward path keeps a per-head cache of (K, V) rows that grows by one
+    // entry per generated token. Per-step compute drops from O(t * H^2 *
+    // blocks) to O(H^2 * blocks) - a ~50-100x wall-clock speedup at this
+    // model size for 200-token samples. Output diverges slightly from the
+    // Var path due to f32 summation order in attention; the argmax of each
+    // step's logits matches the Var path, but downstream sampling pulls
+    // different tokens once the small drift accumulates.
+    println!("\n-- KV-cache top-p (p=0.9, T=0.8; v0.16 fast path) --");
+    let kv_t0 = std::time::Instant::now();
+    for prompt in ["ROMEO:", "To be ", "King "] {
+        let g = inference_kv::generate_with_cache(
+            &model,
+            &vocab,
+            prompt,
+            200,
+            inference::SamplingMode::TopP {
+                p: 0.9,
+                temperature: 0.8,
+            },
+            &mut rng,
+        );
+        println!("\nprompt: {:?}\n{}", prompt, g);
+    }
+    println!(
+        "\n(KV-cache top-p generated 3 x 200 tokens in {:.2}s)",
+        kv_t0.elapsed().as_secs_f32()
+    );
+
+    // Two artefacts side by side, each carrying only what its role needs:
+    //
+    //   - `shakespeare.f32.bin`  full-precision masters + AdamW optim state.
+    //     A save+load cycle is a true identity: resuming from this path picks
+    //     up at the same val_ppl the run ended on. This is the file
+    //     `cargo run --release -- shakespeare <path>` should consume for
+    //     clean continuations.
+    //
+    //   - `shakespeare.ternary_packed.bin`  the compact 1.58-bit-per-weight
+    //     deployment artefact. Optim state is *not* included here: the AdamW
+    //     `m`/`v` buffers are f32, and at the v0.9 ~2M-param scale they
+    //     dominate the file (~8 MB vs ~200 KB of packed weights). The packed
+    //     file is meant for distribution / inference, where momentum is
+    //     irrelevant; resume always uses the .f32.bin instead.
+    let mut f32_buf = Vec::new();
+    export::export_f32(&model, &mut f32_buf, Some(&optim_state))
+        .expect("f32 export to Vec cannot fail");
+    let f32_path = models_path("shakespeare.f32.bin");
+    let _ = std::fs::write(&f32_path, &f32_buf);
+    println!(
+        "\nwrote {} ({:.2} KB)  resume from this for byte-identical continuation",
+        f32_path.display(),
+        f32_buf.len() as f32 / 1024.0
+    );
+
     let mut packed = Vec::new();
-    export::export_ternary_packed(&model, &mut packed, Some(&optim_state))
+    export::export_ternary_packed(&model, &mut packed, None)
         .expect("packed export to Vec cannot fail");
     let path = models_path("shakespeare.ternary_packed.bin");
     let _ = std::fs::write(&path, &packed);
     println!(
-        "\nwrote {} ({:.2} KB)",
+        "wrote {} ({:.2} KB)  compact deployment artefact (no optim state; resume from .f32.bin)",
         path.display(),
         packed.len() as f32 / 1024.0
     );
 }
 
+/// CPU-vs-CUDA matmul demo + benchmark. Reports per-call latency for the
+/// three matmul shapes the v0.13 model leans on hardest, alongside the
+/// max absolute error between the CPU and GPU paths so the bit-equality
+/// caveat is visible in the output (and not just in docs).
+///
+/// The GPU column includes the H<->D copies. At v0.13 model scale that
+/// dominates kernel time (a 192x192 @ 192x16 matmul is ~6 us of compute
+/// on a 4070 but ~50-100 us of PCIe round-trip), which is the headline
+/// argument for Phase 2: keep activations + weights resident on device
+/// across a whole forward pass instead of round-tripping per matmul.
+#[cfg(feature = "cuda")]
+fn run_cuda_demo() {
+    use std::time::Instant;
+
+    use crate::cuda::{cuda_matmul, cuda_state};
+    use crate::data::Lcg;
+    use crate::tensor::Tensor;
+
+    println!("── CUDA matmul: CPU vs cuBLAS sgemm (Chunk 2.0) ──");
+
+    // Initialise device + compile NVRTC kernel up front so the first
+    // benchmarked call does not include the ~50 ms one-time compile.
+    let t_init = Instant::now();
+    match cuda_state() {
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("CUDA initialisation failed: {e}");
+            return;
+        }
+    }
+    println!(
+        "device init + cuBLAS handle: {:.2} ms",
+        t_init.elapsed().as_secs_f64() * 1e3
+    );
+
+    // Three representative shapes from v0.13's hot path. (m, k, n).
+    let shapes: &[(usize, usize, usize, &str)] = &[
+        (64, 192, 16, "attention Q  [seq 64, hidden 192] @ W_q  [192, 16]   = [64, 16]"),
+        (64, 192, 384, "FFN gate/up  [seq 64, hidden 192] @ W   [192, 384]  = [64, 384]"),
+        (64, 384, 192, "FFN down     [seq 64, ffn 384]  @ W_d   [384, 192]  = [64, 192]"),
+    ];
+
+    let mut rng = Lcg::new(0x_C0FFEE_C001_u64);
+    let iters = 100usize;
+
+    println!(
+        "\n{:<60}  {:>10}  {:>10}  {:>10}  {:>12}",
+        "shape", "cpu (us)", "cuda (us)", "ratio", "max |diff|"
+    );
+    println!("{:-<60}  {:->10}  {:->10}  {:->10}  {:->12}", "", "", "", "", "");
+
+    for &(m, k, n, label) in shapes {
+        let lhs_data: Vec<f32> = (0..m * k).map(|_| rng.next_f01() - 0.5).collect();
+        let rhs_data: Vec<f32> = (0..k * n).map(|_| rng.next_f01() - 0.5).collect();
+        let lhs = Tensor::from_vec(lhs_data, vec![m, k]);
+        let rhs = Tensor::from_vec(rhs_data, vec![k, n]);
+
+        // One warmup call per side so caches / first-touch allocations
+        // do not skew the steady-state measurement.
+        let _ = lhs.matmul(&rhs);
+        let _ = cuda_matmul(&lhs, &rhs).expect("CUDA matmul failed");
+
+        let cpu_start = Instant::now();
+        let mut cpu_out = lhs.matmul(&rhs);
+        for _ in 1..iters {
+            cpu_out = lhs.matmul(&rhs);
+        }
+        let cpu_us = cpu_start.elapsed().as_secs_f64() * 1e6 / iters as f64;
+
+        let cuda_start = Instant::now();
+        let mut cuda_out = cuda_matmul(&lhs, &rhs).expect("CUDA matmul failed");
+        for _ in 1..iters {
+            cuda_out = cuda_matmul(&lhs, &rhs).expect("CUDA matmul failed");
+        }
+        let cuda_us = cuda_start.elapsed().as_secs_f64() * 1e6 / iters as f64;
+
+        let max_diff = cpu_out
+            .data
+            .iter()
+            .zip(&cuda_out.data)
+            .map(|(&c, &g)| (c - g).abs())
+            .fold(0.0_f32, f32::max);
+
+        println!(
+            "{:<60}  {:>10.1}  {:>10.1}  {:>10.2}  {:>12.3e}",
+            label,
+            cpu_us,
+            cuda_us,
+            cuda_us / cpu_us,
+            max_diff,
+        );
+    }
+
+    println!(
+        "\nNote: per-call cuda time includes two H->D copies and one D->H copy."
+    );
+    println!(
+        "      The cuBLAS sgemm kernel itself is ~5-10 us on a 4070; the rest is"
+    );
+    println!(
+        "      PCIe round-trip + the per-call cuBLAS setup. Phase 2 will keep tensors"
+    );
+    println!(
+        "      device-resident across whole blocks so the copy cost is paid once per"
+    );
+    println!(
+        "      forward pass instead of once per matmul, which should push the"
+    );
+    println!(
+        "      speedup from ~1.6-3x today into the 5-10x range at v0.13 scale."
+    );
+}
+
 fn main() {
     // CLI dispatch:
-    //   cargo run --release                                -- runs M4-M10 demo
-    //   cargo run --release -- shakespeare                 -- fresh training
-    //   cargo run --release -- shakespeare <resume_path>   -- resumes from file
+    //   cargo run --release                                       -- runs M4-M10 demo
+    //   cargo run --release -- shakespeare                        -- fresh ~5M training
+    //   cargo run --release -- shakespeare <resume_path>          -- resume ~5M
+    //   cargo run --release -- shakespeare-large                  -- fresh ~8.5M training (seq 128)
+    //   cargo run --release -- shakespeare-large <resume_path>    -- resume ~8.5M
+    //   cargo run --release --features cuda -- cuda-demo          -- CPU vs CUDA matmul timings
     let args: Vec<String> = std::env::args().collect();
-    if args.len() > 1 && args[1] == "shakespeare" {
+    if args.len() > 1 && (args[1] == "shakespeare" || args[1] == "shakespeare-large") {
+        let large = args[1] == "shakespeare-large";
         let resume_path = args
             .get(2)
             .map(|s| std::path::PathBuf::from(s))
             .filter(|p| p.exists());
-        run_shakespeare_training(resume_path);
+        run_shakespeare_training(resume_path, large);
         return;
+    }
+    #[cfg(feature = "cuda")]
+    if args.len() > 1 && args[1] == "cuda-demo" {
+        run_cuda_demo();
+        return;
+    }
+    #[cfg(not(feature = "cuda"))]
+    if args.len() > 1 && args[1] == "cuda-demo" {
+        eprintln!("error: this binary was built without the `cuda` feature.");
+        eprintln!("       rebuild with: cargo build --release --features cuda");
+        std::process::exit(2);
     }
 
     println!("── M4: 1D linear regression by SGD on  y = 2x ──");
