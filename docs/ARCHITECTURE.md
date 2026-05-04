@@ -6,41 +6,88 @@ How the modules compose, top-down.
 
 ```
                                  main.rs
-                       (TrainConfig, demos, CLI)
+                  (TrainConfig, CLI: shakespeare /
+                   shakespeare-large / cuda-demo /
+                   cuda-forward-bench, demos, tests)
                                     |
-                ┌───────────────────┼────────────────────┐
-                |                   |                    |
-            inference.rs        optim.rs            export.rs
-       (greedy + temp gen)   (AdamW, clip, LR)    (binary I/O, import)
-                |                   |                    |
-                └───────────────┐   |   ┌────────────────┘
-                                |   |   |
-                              model.rs
+       ┌────────────────────────────┼────────────────────────────┐
+       |                            |                            |
+  inference.rs            inference_kv.rs                   optim.rs
+ (greedy + temp +    (KV-cached generation,             (AdamW, clip,
+  top-k + top-p)      ~50-100x faster                    cosine LR
+                      per-token vs full forward)         + warmup)
+                            |                                |
+                            └─────────┬──────────────────────┘
+                                      |
+                                  model.rs
                   (Model, ModelConfig, leaf register, init)
-                                    |
-                ┌───────────────────┼───────────────────┐
-                |                   |                   |
-            block.rs            attention.rs           ffn.rs
-       (RMSNorm + attn       (multi-head, causal,    (SwiGLU: gate via
-        + FFN + residual)    sum-of-projections)     SiLU, gated up,
-                                                      down projection)
-                                    |
-                              autograd.rs
+                                      |
+                ┌─────────────────────┼─────────────────────┐
+                |                     |                     |
+             block.rs            attention.rs            ffn.rs
+        (RMSNorm + attn       (multi-head, causal,    (SwiGLU: gate via
+         + FFN + residual)    RoPE, sum-of-           SiLU, gated up,
+                              projections)            down projection)
+                                      |
+                                autograd.rs
             (Tape, Var, all ops: matmul, softmax, rmsnorm,
-             quantise_weights_ste, quantise_acts_ste,
-             causal_mask, embed, cross_entropy, etc.)
-                                    |
-                          tensor.rs    bitlinear.rs
-                  (raw f32 storage)  (absmean_ternary, absmax_int8)
+             rope, silu, quantise_*_ste, causal_mask, embed,
+             cross_entropy, etc.)
+                                      |
+              ┌───────────────────────┼───────────────────────┐
+              |                       |                       |
+         tensor.rs              device.rs               bitlinear.rs
+     (raw f32 storage,    (per-op traits: MatMul,    (absmean_ternary,
+      AVX-512/AVX2/scalar  Add, Mul, MulScalar,       absmax_int8)
+      matmul, parallel     Transpose2D, Softmax,
+      via thread::scope)   CausalMask, Rope, Silu,
+                           RmsNorm; generic helpers
+                           attention_head_inference,
+                           ffn_inference, block_inference)
+                                      |
+                                   cuda.rs                       export.rs
+                       (CudaContext + cuBLAS handle +     (binary I/O,
+                        NVRTC kernels for every op       three formats,
+                        in device.rs; CudaTensor;        round-trip
+                        CudaModel + end-to-end forward;  importer; OPTM
+                        cuda-demo + cuda-forward-bench)  payload for
+                        Gated behind --features cuda     resume)
 
                               data.rs
               (Vocab, sliding windows, LCG, file reader; standalone)
 ```
 
+The `device.rs` traits are the abstraction boundary that lets the same
+generic helper function (`block_inference<T>`, `ffn_inference<T>`,
+`attention_head_inference<T>`) compile and run on both `Tensor` (CPU)
+and `CudaTensor` (GPU) - validated by cross-backend tests that demand
+output agreement within tight FP tolerance on every shared call site.
+
 ## Why this layering
 
 - **`tensor.rs`** is a pure value type. No autograd awareness, no quantisation.
-  Pure linear algebra primitives.
+  Pure linear algebra primitives. Holds the matmul kernel which
+  dispatches at runtime to AVX-512, AVX2, or scalar (per
+  `matmul_simd_mode`); also the per-row sharded parallel matmul
+  driven by `BITNET_MATMUL_THREADS`. All three SIMD widths are
+  bit-identical per output cell because none use FMA.
+
+- **`device.rs`** is the device-abstraction layer (Phase 2). One
+  trait per op family (`MatMul`, `Add`, `Mul`, `MulScalar`,
+  `Transpose2D`, `Softmax`, `CausalMask`, `Rope`, `Silu`, `RmsNorm`),
+  each implemented on `Tensor` (CPU) and `CudaTensor` (GPU). Plus
+  generic-over-backend helpers (`attention_head_inference<T>`,
+  `ffn_inference<T>`, `block_inference<T>`) that compose those
+  traits into model layers.
+
+- **`cuda.rs`** is the CUDA back-end (gated `#[cfg(feature = "cuda")]`).
+  Holds the NVRTC-compiled kernels for every op in `device.rs`, the
+  cuBLAS handle for matmul, `CudaTensor` (device-resident f32
+  storage), and `CudaModel` (end-to-end forward). The kernels live in
+  one `KERNELS_SRC` const string; `cuda_state()` compiles them once
+  per process and caches function handles. Production matmul uses
+  cuBLAS sgemm; the v0.18 hand-rolled tile-GEMM kernel is kept
+  `#[cfg(test)]` as an independent reference for cross-checking.
 
 - **`bitlinear.rs`** holds the two quantisation primitives as free functions.
   These are the only places that compute gamma and alpha; everything else
@@ -68,9 +115,17 @@ How the modules compose, top-down.
   Round-trippable in all three formats. The format byte plus a 4-byte magic
   let importers detect the right reader.
 
-- **`inference.rs`** is greedy + temperature sampling. Both build the same
-  forward graph; greedy takes argmax of the last-position logits, temperature
-  samples by inverse CDF.
+- **`inference.rs`** is the original autograd-path generator: greedy +
+  temperature + top-k + top-p sampling. Builds the full Var forward
+  graph each step (slow but matches training-time behaviour
+  exactly).
+
+- **`inference_kv.rs`** (v0.16) is the KV-cached generator: per-block
+  per-head K and V tensors grow by one row per step instead of being
+  recomputed. ~50-100x faster per-token generation. Pure
+  `Tensor` + `Vec<f32>` math, no autograd, no tape. Shape parity
+  with the autograd path is asserted by
+  `cached_forward_matches_var_forward_to_within_floating_point_drift`.
 
 - **`data.rs`** stands alone. Vocab, sliding windows, file reader, LCG,
   shuffler. No upstream dependencies on anything except `std`.
@@ -204,6 +259,116 @@ near-zero loss without learning language. `Var::causal_mask` sets
 get zero attention weight. Backward zeroes gradient on the upper triangle and
 passes it through on the lower, matching the forward selection.
 
+## Per-op trait architecture (Phase 2)
+
+Goal: write a model layer once, run it on either CPU or GPU. The
+constraint: incremental rollout, so we cannot block on implementing
+every op in one trait. The shape: one trait per op family.
+
+```rust
+pub trait MatMul    { fn matmul(&self, rhs: &Self) -> Self; }
+pub trait Add       { fn add(&self, rhs: &Self) -> Self; }
+pub trait Mul       { fn mul(&self, rhs: &Self) -> Self; }
+pub trait MulScalar { fn mul_scalar(&self, s: f32) -> Self; }
+pub trait Transpose2D { fn transpose_2d(&self) -> Self; }
+pub trait Softmax   { fn softmax(&self) -> Self; }
+pub trait CausalMask{ fn causal_mask(&self) -> Self; }
+pub trait Rope      { fn rope(&self) -> Self; }
+pub trait Silu      { fn silu(&self) -> Self; }
+pub trait RmsNorm   { fn rmsnorm(&self) -> Self; }
+```
+
+All return `Self` (panic on backend errors) so generic helpers compose
+without `?` / `.expect()` noise. CPU side panics on shape mismatch;
+GPU side `.expect()`s cudarc errors at the trait-impl boundary. Same
+panic-on-invariant model on both sides.
+
+Generic helpers (also in `device.rs`):
+
+```rust
+fn attention_head_inference<T: MatMul + MulScalar + Transpose2D
+                              + Softmax + CausalMask + Rope>(
+    x: &T, w_q: &T, w_k: &T, w_v: &T, w_o: &T, head_dim: usize) -> T
+
+fn multi_head_attention_inference<T: ...>(
+    x: &T, heads: &[HeadWeights<T>], head_dim: usize) -> T
+
+fn ffn_inference<T: MatMul + Silu + Mul>(
+    x: &T, w_gate: &T, w_up: &T, w_down: &T) -> T
+
+fn block_inference<T: MatMul + Add + MulScalar + Transpose2D
+                      + Softmax + CausalMask + Rope + RmsNorm
+                      + Silu + Mul>(
+    x: &T, heads: &[HeadWeights<T>], ffn: &FfnWeights<T>,
+    head_dim: usize) -> T
+```
+
+The trait-bound list grows linearly with op count (one bound per new
+op a helper uses), not exponentially. Cross-backend tests assert that
+running each generic helper through `Tensor` and through `CudaTensor`
+produces matching outputs within FP tolerance - 1e-3 for
+`attention_head_inference`, 5e-3 for `block_inference`, 2e-2 for the
+end-to-end `CudaModel::forward`. The per-op tolerances are tighter
+(~1e-4 absolute, often much less in practice).
+
+This is **inference-only**: the generic helpers do not interact with
+autograd. The existing `Var`-based CPU forward path in `attention.rs`,
+`ffn.rs`, and `block.rs` continues to drive training; Phase 4 will add
+GPU autograd by writing per-op backward kernels and a tape-equivalent
+for `CudaTensor`.
+
+## CUDA back-end (Phases 1-3)
+
+Optional, gated behind `--features cuda`. Default `cargo build` stays
+dependency-free; CUDA work uses `cudarc 0.19` with `dynamic-loading`
+so the same binary loads on machines with the toolkit at non-default
+paths.
+
+`cuda_state()` is a process-level `OnceLock`-cached holder that
+attaches to GPU 0, instantiates a cuBLAS handle on the default
+stream, and NVRTC-compiles `KERNELS_SRC` (one big string holding
+every op kernel). Every Phase 2 trait impl on `CudaTensor` launches
+its kernel from this cached holder.
+
+`CudaModel` (Phase 3) mirrors `model::Model` but holds device-resident
+weights built on the generic `HeadWeights<CudaTensor>` /
+`FfnWeights<CudaTensor>` types. Token embedding stays on CPU (small
+table; row-pick + H->D slab is cheaper than maintaining a device-side
+lookup). `CudaModel::forward(ids) -> CudaTensor` chains
+`embed -> blocks(block_inference) -> rmsnorm -> lm_head matmul`, all
+device-resident.
+
+Production matmul is **cuBLAS sgemm** with the row-major-via-column-
+major adapter (pass B and A in swapped order; cuBLAS sees row-major
+as transposed col-major; no transpose flags needed). The v0.18
+hand-rolled tile-GEMM kernel is retained `#[cfg(test)]` as an
+independent reference that the cuBLAS path is cross-checked against.
+
+**Trap discovered + defended against in Phase 3.** `INFINITY` is not
+defined under NVRTC (no host `<math.h>` is auto-included). The first
+implementation of `causal_mask_f32` and `softmax_row_f32` used it
+freely; NVRTC compile failed and `cuda_state()` returned `Err`,
+which the `if cuda_state().is_err() { return }` early-exit pattern in
+every CUDA test treated as "skip" - so for several chunks the cross-
+backend tests reported `ok` while never actually exercising any GPU
+code. Fix: `#define INFINITY (__int_as_float(0x7f800000))` at the top
+of `KERNELS_SRC`. Defence: `preflight_cuda_state_initialises_cleanly_when_expected`
+test that, when `EXPECT_CUDA=1` is exported, panics if `cuda_state()`
+errors for any reason. Catches NVRTC-compile regressions before the
+test harness can hide them.
+
+**Performance note.** GPU forward at small model scale is
+**slower than CPU** because each forward queues 60-80 kernel launches
+and each launch pays ~10-30 us of fixed driver overhead - dominant
+when the kernel itself is microseconds. v0.13 production scale
+(hidden 192) gives kernels real work and should flip the ratio;
+further wins live in kernel fusion, CUDA graphs (capture-and-replay),
+larger batches, or Phase 5 ternary tensor cores. Per-op `synchronize()`
+calls were stripped from every trait impl during Phase 3 - cudarc's
+`clone_dtoh` (used by `to_cpu`) is sync, so the final read serialises
+naturally; queued launches on the same stream serialise relative to
+each other without explicit sync.
+
 ## Memory model
 
 The `Tape` owns every recorded value and gradient cell. `Var<'t>` is a `Copy`
@@ -216,15 +381,39 @@ Master parameters in `Model` live across steps; everything else is ephemeral.
 
 ## Where the toy stops
 
-Two places this implementation deliberately diverges from production BitNet:
+The places this implementation still diverges from production BitNet,
+in order of how much each matters:
 
-1. **f32 throughout.** Real BitNet has BF16 master weights and INT8 activations
-   stored as `i8` (not `f32` representations of `i8`). The integer matmul that
-   produces the speedup is also missing; we keep all arithmetic in f32. The
-   *values* are quantised; the *arithmetic* isn't.
+1. **f32 arithmetic.** Real BitNet has BF16 master weights and INT8
+   activations stored as `i8`, with the matmul itself running on
+   tensor cores at INT8 (or even ternary directly via Phase 5 tricks).
+   We quantise the *values* (ternary weights via STE,
+   absmean / absmax) but the arithmetic stays in f32. Fixing this is
+   the headline of CUDA Phase 5: replace the f32 GEMM with a kernel
+   that uses Ada's tensor cores and skips multiplies for the
+   +1 / -1 / 0 ternary weight values.
 
-2. **No KV cache.** Generation recomputes the full forward each token. Real
-   inference caches K and V across positions to make per-token cost constant.
+2. **No GPU training yet.** The end-to-end forward runs on the GPU
+   (Phase 3) but training stays CPU-only because there are no GPU
+   backward kernels. Phase 4 adds per-op backward kernels and a
+   tape-equivalent for `CudaTensor`, after which the existing CPU
+   training loop can opt into the GPU forward+backward.
 
-The first is listed in `TODO.md`. The second is genuine ML-engineering
-territory beyond the curriculum's M10 finale.
+3. **AVX-512 underperforms AVX2 on Zen 4.** Empirically measured: the
+   16-wide AVX-512 loads cause more L2/L3 contention across 4 worker
+   threads than the 8-wide AVX2 loads on this hardware. The
+   automatic SIMD-mode selection picks AVX-512 by default; export
+   `BITNET_MATMUL_SIMD=avx2` for production training on Zen 4. A
+   future Zen-detection branch in `matmul_simd_mode()` would do the
+   right thing automatically.
+
+4. **CUDA per-launch overhead dominates at small model scale.** End-to-
+   end forward is slower than CPU at hidden=32-96; needs hidden=192+
+   (v0.13 production scale) to flip. Future work: kernel fusion,
+   CUDA graphs, larger batched forward.
+
+5. **Inference KV cache is CPU-only.** `inference_kv.rs` is fast
+   (~50-100x over the autograd path) but not yet wired through
+   `CudaModel`. Easy follow-up once Phase 3 settles.
+
+All five are listed in `TODO.md` with the current priority order.

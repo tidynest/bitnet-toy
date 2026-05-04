@@ -418,4 +418,99 @@ tolerance of `1e-4 + 1e-4 * |val|`, an order of magnitude looser than
 the actual measured drift (~6e-7 absolute on the test shapes). Resumed
 training that switches between CPU and GPU mid-run would lose the
 byte-identical-checkpoint guarantee that the CPU SIMD paths have; for
-now the training pipeline is CPU-only, so this is a Phase 3 concern.
+now the training pipeline is CPU-only, so this is a Phase 4 concern.
+
+### CUDA back-end (Phase 2: trait architecture)
+
+Phase 2 (chunks 2.1-2.4) wraps every op the model needs in a per-op
+trait declared in `src/device.rs`. Each trait has a CPU impl on
+`Tensor` and a CUDA impl on `CudaTensor`; a single generic helper
+function written against the trait surface compiles for both
+backends:
+
+```rust
+// All in src/device.rs.
+pub trait MatMul     { fn matmul(&self, rhs: &Self) -> Self; }
+pub trait Add        { fn add(&self, rhs: &Self) -> Self; }
+pub trait Mul        { fn mul(&self, rhs: &Self) -> Self; }
+pub trait MulScalar  { fn mul_scalar(&self, s: f32) -> Self; }
+pub trait Transpose2D{ fn transpose_2d(&self) -> Self; }
+pub trait Softmax    { fn softmax(&self) -> Self; }
+pub trait CausalMask { fn causal_mask(&self) -> Self; }
+pub trait Rope       { fn rope(&self) -> Self; }
+pub trait Silu       { fn silu(&self) -> Self; }
+pub trait RmsNorm    { fn rmsnorm(&self) -> Self; }
+
+pub fn block_inference<T: MatMul + Add + MulScalar + Transpose2D
+                          + Softmax + CausalMask + Rope + RmsNorm
+                          + Silu + Mul>(
+    x: &T,
+    heads: &[HeadWeights<T>],
+    ffn: &FfnWeights<T>,
+    head_dim: usize,
+) -> T;
+```
+
+Cross-backend tests (`*_cpu_vs_cuda_matches`) run each generic helper
+through `Tensor` and `CudaTensor` over the same input and assert
+output agreement within tight FP tolerance. Per-op tolerance is
+`1e-4 + 1e-4 * |val|` (actual measured drift ~1-5e-6); chained
+attention test passes at 1e-3; chained block test at 5e-3. Failure
+of any of these tests implies a regression in a single op kernel.
+
+### CUDA back-end (Phase 3: end-to-end forward)
+
+`CudaModel` (in `src/cuda.rs`) holds device-resident weights mirroring
+the CPU `model::Model`. End-to-end forward chains `embed -> blocks
+(block_inference) -> rmsnorm -> lm_head matmul`, all device-resident
+except the embed lookup which stays CPU-side (the embed table is
+small; row-pick + H->D slab is cheaper than maintaining a device-side
+lookup).
+
+```sh
+PATH=/opt/cuda/bin:$PATH CUDA_PATH=/opt/cuda \
+    cargo run --release --features cuda -- cuda-forward-bench
+```
+
+Empirical numbers on the same 7940HS + RTX 4070 Laptop:
+
+| Config                                          | CPU (us) | CUDA (us) | Ratio |
+|-------------------------------------------------|---------:|----------:|------:|
+| tiny (vocab 17, hidden 32, 4 heads, 2 blocks)   |       40 |       922 | 23x slower |
+| med  (vocab 65, hidden 96, 6 heads, 4 blocks)   |      538 |      2283 |  4x slower |
+
+**The GPU is far slower at small model scale.** Each forward queues
+60-80 kernel launches and each launch pays ~10-30 us of fixed driver
+overhead regardless of how cheap the kernel is. At hidden=32 the
+kernel itself is ~1 us so launch overhead is ~95% of per-call cost.
+v0.13 production scale (hidden 192) gives kernels real work and
+should flip the ratio; further wins live in kernel fusion, CUDA
+graphs, larger batches, or the future Phase 5 ternary tensor-core
+kernels.
+
+Per-op `stream.synchronize()` calls were stripped from every Phase 2
+trait impl during Phase 3 - cudarc's `clone_dtoh` (used by `to_cpu`)
+is sync, so the final read serialises naturally; queued launches on
+the same stream serialise relative to each other without explicit
+sync. Stripping cut the med config from ~7x slower to ~4x slower
+(the tiny config barely moved because launch overhead, not sync,
+dominates there).
+
+### CUDA back-end (preflight)
+
+Phase 3 surfaced a class of bugs that the silent-skip pattern in
+GPU tests (`if cuda_state().is_err() { return }`) would otherwise
+hide for many chunks: an NVRTC kernel that fails to compile makes
+`cuda_state()` return `Err`, every test silently skips as `ok`, and
+no GPU code is exercised. Defence: a hard preflight test gated by
+`EXPECT_CUDA=1`. On a machine that has a usable GPU, always run with
+the env var set so any NVRTC regression panics immediately:
+
+```sh
+EXPECT_CUDA=1 PATH=/opt/cuda/bin:$PATH CUDA_PATH=/opt/cuda \
+    cargo test --release --features cuda \
+    cuda::tests::preflight_cuda_state_initialises_cleanly_when_expected
+```
+
+This costs nothing on green builds and catches the silent-skip
+failure mode immediately on any future kernel-compile breakage.

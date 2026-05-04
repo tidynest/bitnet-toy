@@ -7,10 +7,16 @@ inference, binary export. No third-party ML dependencies.
 
 ## Status
 
-- **119** tests passing on `cargo test`.
-- **0** warnings on `cargo build --release`.
-- `cargo audit` clean (stdlib-only crate; no transitive dependencies).
-- Trains end-to-end on the full TinyShakespeare corpus in ~8-15 minutes on CPU (v0.9 ~2M-param config).
+- **123** tests passing on `cargo test`; **143** with `cargo test --features cuda`.
+- **0** warnings on `cargo build --release` (or `--features cuda`).
+- `cargo audit` clean for the default build (stdlib-only); the optional
+  `cuda` feature pulls `cudarc` and its small dynamic-loading deps.
+- Trains end-to-end on the full TinyShakespeare corpus in ~8-15
+  minutes on CPU (v0.13 ~5M-param config); current best **val_ppl
+  4.869** at 30k cumulative steps.
+- End-to-end model forward runs on the GPU through `CudaModel`
+  (Phase 3); training stays on CPU until Phase 4 lands per-op
+  backward kernels.
 
 ## Quick start
 
@@ -28,6 +34,12 @@ cargo run --release -- shakespeare
 # every master weight (and the AdamW optimiser state) byte-identical, so a
 # resume picks up exactly where the run ended:
 cargo run --release -- shakespeare models/shakespeare.f32.bin
+
+# Optional GPU back-end (Phase 1-3). Requires the CUDA toolkit on the host
+# (Arch: `sudo pacman -S cuda`, lives at /opt/cuda). Build + run the
+# end-to-end forward microbench:
+PATH=/opt/cuda/bin:$PATH CUDA_PATH=/opt/cuda \
+    cargo run --release --features cuda -- cuda-forward-bench
 ```
 
 After Shakespeare training, prints loss curve, then greedy + three sampled-mode
@@ -53,11 +65,13 @@ f32 baseline.
 ## CLI
 
 ```text
-cargo run --release                                  # M4-M10 demos
-cargo run --release -- shakespeare                   # fresh Shakespeare training (~5M params)
-cargo run --release -- shakespeare <path>            # resume ~5M training from checkpoint
-cargo run --release -- shakespeare-large             # fresh ~8.5M training (seq_len 128)
-cargo run --release -- shakespeare-large <path>      # resume ~8.5M training from checkpoint
+cargo run --release                                       # M4-M10 demos
+cargo run --release -- shakespeare                        # fresh Shakespeare training (~5M params)
+cargo run --release -- shakespeare <path>                 # resume ~5M training from checkpoint
+cargo run --release -- shakespeare-large                  # fresh ~8.5M training (seq_len 128)
+cargo run --release -- shakespeare-large <path>           # resume ~8.5M training from checkpoint
+cargo run --release --features cuda -- cuda-demo          # CPU-vs-cuBLAS matmul microbench
+cargo run --release --features cuda -- cuda-forward-bench # CPU-vs-CudaModel end-to-end forward bench
 ```
 
 ## Project layout
@@ -80,18 +94,21 @@ bitnet-toy/
 
 | File | Role |
 |---|---|
-| `src/tensor.rs`      | row-major f32 tensor, matmul, transpose, elementwise ops |
-| `src/autograd.rs`    | tape-based reverse-mode autograd, STE quantiser ops, causal mask |
-| `src/bitlinear.rs`   | `absmean_ternary` and `absmax_int8` quantiser primitives |
-| `src/attention.rs`   | single-head scaled-dot-product self-attention |
-| `src/ffn.rs`         | position-wise feed-forward network |
-| `src/block.rs`       | transformer block (norm + attention + FFN + residuals) |
-| `src/model.rs`       | `Model`, `ModelConfig`, parameter visitor, init via LCG |
-| `src/data.rs`        | char vocab, sliding windows, file loader, LCG, shuffler |
-| `src/optim.rs`       | AdamW, gradient clipping, cosine LR with warmup |
-| `src/inference.rs`   | greedy + temperature autoregressive generation |
-| `src/export.rs`      | three binary formats with header + round-trip importer |
-| `src/main.rs`        | CLI dispatch, `TrainConfig`, demos, integration tests |
+| `src/tensor.rs`        | row-major f32 tensor; matmul (AVX-512 / AVX2 / scalar; parallel); inherent helpers for every Phase 2 op |
+| `src/autograd.rs`      | tape-based reverse-mode autograd, STE quantiser ops, RoPE, causal mask, RMSNorm, SiLU |
+| `src/bitlinear.rs`     | `absmean_ternary` and `absmax_int8` quantiser primitives |
+| `src/attention.rs`     | multi-head scaled-dot-product self-attention (sum-of-projections, causal mask, RoPE) |
+| `src/ffn.rs`           | SwiGLU position-wise feed-forward network |
+| `src/block.rs`         | transformer block (RMSNorm + attention + FFN + residuals) |
+| `src/model.rs`         | `Model`, `ModelConfig`, parameter visitor, init via LCG |
+| `src/data.rs`          | char vocab, sliding windows, file loader, LCG, shuffler |
+| `src/optim.rs`         | AdamW, gradient clipping, cosine LR with warmup, resume continuation |
+| `src/inference.rs`     | greedy / temperature / top-k / top-p autoregressive generation |
+| `src/inference_kv.rs`  | KV-cached generator (~50-100x faster per-token vs full-forward path) |
+| `src/export.rs`        | three binary formats with header + round-trip importer + AdamW state payload |
+| `src/device.rs`        | per-op traits (`MatMul`, `Add`, `Mul`, `MulScalar`, `Transpose2D`, `Softmax`, `CausalMask`, `Rope`, `Silu`, `RmsNorm`); generic helpers `attention_head_inference<T>`, `ffn_inference<T>`, `block_inference<T>` |
+| `src/cuda.rs`          | CUDA back-end (gated `--features cuda`): NVRTC kernels, cuBLAS sgemm, `CudaTensor`, `CudaModel` end-to-end forward |
+| `src/main.rs`          | CLI dispatch, `TrainConfig`, demos, integration tests, `cuda-demo` + `cuda-forward-bench` benches |
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for what each module exposes
 and how the pieces compose.
@@ -153,13 +170,19 @@ This is a learning project, not a production library:
   Empirical note: AVX-512 underperforms AVX2 on Zen 4
   (memory-bandwidth bound); export `BITNET_MATMUL_SIMD=avx2` to opt
   out of AVX-512 there.
-- Optional CUDA back-end (`--features cuda`): hand-rolled NVRTC
-  tile-based GEMM kernel via `cudarc 0.19`. Phase 1 surface in
-  `src/cuda.rs` is matmul-only (`CudaTensor` + `cuda_matmul`); the
-  training pipeline still runs on CPU. NOT bit-identical to CPU
-  (parallel reduction reorders sums) but agrees within `1e-4 + 1e-4 *
-  |val|`. `cargo run --release --features cuda -- cuda-demo` shows the
-  per-call CPU-vs-GPU microbench.
+- Optional CUDA back-end (`--features cuda`) via `cudarc 0.19`. Phase
+  1: cuBLAS sgemm matmul + 9 hand-rolled NVRTC kernels for the rest
+  of the op set (add, mul, mul_scalar, transpose_2d, causal_mask,
+  softmax, rope, silu, rmsnorm). Phase 2: per-op trait architecture
+  (`src/device.rs`) so a single generic helper compiles + runs on
+  both `Tensor` and `CudaTensor`. Phase 3: `CudaModel` end-to-end
+  forward (embed -> blocks -> rmsnorm -> lm_head matmul, all
+  device-resident). NOT bit-identical to CPU (parallel reduction
+  reorders sums; cuBLAS picks its own internal tile schedule) but
+  agrees within `1e-3` per-op, `5e-3` per-block, `2e-2` end-to-end.
+  Training stays on CPU until Phase 4 lands per-op backward kernels.
+  `cargo run --release --features cuda -- cuda-forward-bench` shows
+  the end-to-end CPU-vs-GPU benchmark.
 - KV cache for inference (`src/inference_kv.rs`) gives roughly 50-100x
   faster per-token generation; the older `inference::generate_with_mode`
   recomputes the full forward each step and is kept for parity testing.
