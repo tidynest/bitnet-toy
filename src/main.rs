@@ -1019,6 +1019,162 @@ fn run_shakespeare_training(resume_path: Option<std::path::PathBuf>, large: bool
     );
 }
 
+/// End-to-end CPU vs GPU model forward benchmark. Builds a tiny model
+/// (config matches the `cuda::tests` Phase 3 case), runs N forwards on
+/// each backend, reports mean latency. Demonstrates the full Phase 3
+/// pipeline (embed -> blocks -> rmsnorm -> lm_head matmul) running
+/// device-resident on the GPU.
+#[cfg(feature = "cuda")]
+fn run_cuda_forward_bench() {
+    use std::time::Instant;
+
+    use crate::cuda::{CudaModel, cuda_state};
+    use crate::device::{FfnWeights, HeadWeights, block_inference};
+    use crate::model::{Model, ModelConfig};
+    use crate::tensor::Tensor;
+
+    println!("── CUDA Phase 3: end-to-end model forward (CPU vs GPU) ──");
+
+    let t_init = Instant::now();
+    if cuda_state().is_err() {
+        eprintln!("CUDA initialisation failed");
+        return;
+    }
+    println!(
+        "device init + cuBLAS handle + NVRTC compile: {:.2} ms",
+        t_init.elapsed().as_secs_f64() * 1e3
+    );
+
+    // Two configs: one matching the test case (tiny, ~10k params) and
+    // one closer to v0.13 shakespeare (larger, ~250k params; still
+    // smaller than the trained checkpoint to keep the demo fast).
+    let configs: &[(&str, ModelConfig)] = &[
+        (
+            "tiny  (vocab 17, hidden 32, 4 heads, 2 blocks)",
+            ModelConfig {
+                vocab_size: 17,
+                hidden_dim: 32,
+                n_heads: 4,
+                head_dim: 8,
+                ffn_dim: 64,
+                max_seq_len: 16,
+                n_blocks: 2,
+            },
+        ),
+        (
+            "med   (vocab 65, hidden 96, 6 heads, 4 blocks)",
+            ModelConfig {
+                vocab_size: 65,
+                hidden_dim: 96,
+                n_heads: 6,
+                head_dim: 16,
+                ffn_dim: 192,
+                max_seq_len: 32,
+                n_blocks: 4,
+            },
+        ),
+    ];
+
+    let iters = 20usize;
+    println!(
+        "\n{:<55}  {:>10}  {:>10}  {:>10}",
+        "config", "cpu (us)", "cuda (us)", "ratio"
+    );
+    println!("{:-<55}  {:->10}  {:->10}  {:->10}", "", "", "", "");
+
+    for (label, config) in configs {
+        let model = Model::new(config, 1337);
+        let ids: Vec<usize> = (0..config.max_seq_len.min(8))
+            .map(|i| i % config.vocab_size)
+            .collect();
+
+        // CPU forward via the trait surface (no autograd, no quant) -
+        // matches what the GPU forward computes mathematically.
+        let cpu_forward = |model: &Model, ids: &[usize]| -> Tensor {
+            let h = model.config.hidden_dim;
+            let table = &model.token_embed.data;
+            let mut slab: Vec<f32> = Vec::with_capacity(ids.len() * h);
+            for &id in ids {
+                slab.extend_from_slice(&table[id * h..(id + 1) * h]);
+            }
+            let mut x = Tensor::from_vec(slab, vec![ids.len(), h]);
+            for b in &model.blocks {
+                let heads: Vec<HeadWeights<Tensor>> = b
+                    .heads
+                    .iter()
+                    .map(|h| HeadWeights {
+                        w_q: h.w_q.clone(),
+                        w_k: h.w_k.clone(),
+                        w_v: h.w_v.clone(),
+                        w_o: h.w_o.clone(),
+                    })
+                    .collect();
+                let ffn = FfnWeights {
+                    w_gate: b.ffn_gate_w.clone(),
+                    w_up: b.ffn_up_w.clone(),
+                    w_down: b.ffn_down_w.clone(),
+                };
+                x = block_inference(&x, &heads, &ffn, model.config.head_dim);
+            }
+            x.rmsnorm().matmul(&model.lm_head)
+        };
+
+        // Build the GPU model once (weights stay resident across all
+        // iterations - this is the core Phase 3 advantage over Phase 1's
+        // per-call H<->D copy).
+        let cuda_model = CudaModel::from_cpu(&model);
+
+        // Warmup.
+        let _ = cpu_forward(&model, &ids);
+        let _ = cuda_model.forward(&ids).to_cpu().expect("D->H failed");
+
+        let cpu_start = Instant::now();
+        for _ in 0..iters {
+            let _ = cpu_forward(&model, &ids);
+        }
+        let cpu_us = cpu_start.elapsed().as_secs_f64() * 1e6 / iters as f64;
+
+        let cuda_start = Instant::now();
+        for _ in 0..iters {
+            let _ = cuda_model.forward(&ids).to_cpu().expect("D->H failed");
+        }
+        let cuda_us = cuda_start.elapsed().as_secs_f64() * 1e6 / iters as f64;
+
+        println!(
+            "{:<55}  {:>10.1}  {:>10.1}  {:>10.2}",
+            label,
+            cpu_us,
+            cuda_us,
+            cuda_us / cpu_us,
+        );
+    }
+
+    println!(
+        "\nNote: at these tiny model sizes the GPU is far slower than the CPU."
+    );
+    println!(
+        "      The forward queues 60-80 kernel launches per call and each launch"
+    );
+    println!(
+        "      pays ~10-30 us of fixed driver overhead, regardless of how cheap the"
+    );
+    println!(
+        "      kernel itself is. v0.13 scale (~5M params, hidden 192) gives each"
+    );
+    println!(
+        "      kernel real work to do and should flip the ratio. Per-call sync was"
+    );
+    println!(
+        "      already stripped from the trait impls; the remaining wins live in"
+    );
+    println!(
+        "      kernel fusion, CUDA graphs (capture once, replay many), batched"
+    );
+    println!(
+        "      forwards, and Phase 5's ternary tensor-core GEMM."
+    );
+}
+
 /// CPU-vs-CUDA matmul demo + benchmark. Reports per-call latency for the
 /// three matmul shapes the v0.13 model leans on hardest, alongside the
 /// max absolute error between the CPU and GPU paths so the bit-equality
@@ -1155,8 +1311,13 @@ fn main() {
         run_cuda_demo();
         return;
     }
+    #[cfg(feature = "cuda")]
+    if args.len() > 1 && args[1] == "cuda-forward-bench" {
+        run_cuda_forward_bench();
+        return;
+    }
     #[cfg(not(feature = "cuda"))]
-    if args.len() > 1 && args[1] == "cuda-demo" {
+    if args.len() > 1 && (args[1] == "cuda-demo" || args[1] == "cuda-forward-bench") {
         eprintln!("error: this binary was built without the `cuda` feature.");
         eprintln!("       rebuild with: cargo build --release --features cuda");
         std::process::exit(2);

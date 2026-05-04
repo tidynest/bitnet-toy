@@ -38,15 +38,23 @@ use cudarc::nvrtc::compile_ptx;
 use crate::tensor::Tensor;
 
 /// Concatenated CUDA C source for the production op kernels (add,
-/// mul_scalar, transpose_2d, causal_mask, softmax, rope). Compiled once
-/// per process via NVRTC and cached in `CudaContextHolder`. Each kernel
-/// is small (5-25 lines) and uses only `__global__` entry points (no
-/// device-only helpers, no template kernels), so the compile is fast
-/// and the resulting PTX is human-inspectable if anything misbehaves.
+/// mul_scalar, transpose_2d, causal_mask, softmax, rope, silu, mul,
+/// rmsnorm). Compiled once per process via NVRTC and cached in
+/// `CudaContextHolder`. Each kernel is small (5-25 lines) and uses
+/// only `__global__` entry points (no device-only helpers, no template
+/// kernels), so the compile is fast and the resulting PTX is human-
+/// inspectable if anything misbehaves.
 ///
-/// `expf`, `cosf`, `sinf`, `powf` come from the CUDA math library and
-/// are available without an explicit include in NVRTC.
+/// `expf`, `cosf`, `sinf`, `powf`, `sqrtf` come from the CUDA math
+/// library and are available without an explicit include in NVRTC.
+/// `INFINITY` is **not** defined by NVRTC out of the box (no host
+/// `<math.h>` is auto-included), so we provide our own using the
+/// `__int_as_float` built-in intrinsic that maps the IEEE-754 +infinity
+/// bit pattern (`0x7f800000`) to an f32. This is the same value the
+/// host header would have produced.
 const KERNELS_SRC: &str = r#"
+#define INFINITY (__int_as_float(0x7f800000))
+
 extern "C" __global__ void add_f32(
     const float* __restrict__ a,
     const float* __restrict__ b,
@@ -411,7 +419,6 @@ impl CudaTensor {
         // args pushed above; output buffer sized m*n; lhs / rhs sized
         // m*k and k*n.
         unsafe { launcher.launch(cfg) }.expect("NVRTC kernel launch failed");
-        s.stream.synchronize().expect("stream synchronize failed");
         Self {
             data: out,
             shape: vec![m, n],
@@ -484,7 +491,6 @@ impl crate::device::MatMul for CudaTensor {
         // rhs.data are owned device slices of size m*k and k*n.
         unsafe { s.blas.gemm(cfg, &rhs.data, &self.data, &mut out) }
             .expect("cuBLAS sgemm failed");
-        s.stream.synchronize().expect("stream synchronize failed");
 
         Self {
             data: out,
@@ -531,7 +537,6 @@ impl crate::device::Add for CudaTensor {
         // int) matches the four args; output is sized n; lhs / rhs are
         // both sized n (asserted above).
         unsafe { l.launch(cfg) }.expect("add_f32 launch failed");
-        s.stream.synchronize().expect("synchronize failed");
         Self { data: out, shape: self.shape.clone() }
     }
 }
@@ -555,7 +560,6 @@ impl crate::device::MulScalar for CudaTensor {
         // Safety: signature (const float*, float, float*, int) matches
         // the four args; output sized n; input sized n.
         unsafe { l.launch(cfg) }.expect("mul_scalar_f32 launch failed");
-        st.stream.synchronize().expect("synchronize failed");
         Self { data: out, shape: self.shape.clone() }
     }
 }
@@ -583,7 +587,6 @@ impl crate::device::Transpose2D for CudaTensor {
         // Safety: signature (const float*, float*, int, int) matches
         // the four args; input sized r*c; output sized r*c (= c*r).
         unsafe { l.launch(cfg) }.expect("transpose_2d_f32 launch failed");
-        s.stream.synchronize().expect("synchronize failed");
         Self { data: out, shape: vec![c, r] }
     }
 }
@@ -611,7 +614,6 @@ impl crate::device::CausalMask for CudaTensor {
         // Safety: signature (const float*, float*, int, int) matches
         // the four args; both buffers sized m*n.
         unsafe { l.launch(cfg) }.expect("causal_mask_f32 launch failed");
-        s.stream.synchronize().expect("synchronize failed");
         Self { data: out, shape: vec![m, n] }
     }
 }
@@ -640,7 +642,6 @@ impl crate::device::Softmax for CudaTensor {
         // Safety: signature (const float*, float*, int, int) matches
         // the four args; both buffers sized m*n.
         unsafe { l.launch(cfg) }.expect("softmax_row_f32 launch failed");
-        s.stream.synchronize().expect("synchronize failed");
         Self { data: out, shape: vec![m, n] }
     }
 }
@@ -663,7 +664,6 @@ impl crate::device::Silu for CudaTensor {
         // Safety: signature (const float*, float*, int) matches the
         // three args; both buffers sized n.
         unsafe { l.launch(cfg) }.expect("silu_f32 launch failed");
-        s.stream.synchronize().expect("synchronize failed");
         Self { data: out, shape: self.shape.clone() }
     }
 }
@@ -690,7 +690,6 @@ impl crate::device::RmsNorm for CudaTensor {
         // Safety: signature (const float*, float*, int, int) matches
         // the four args; both buffers sized m*n.
         unsafe { l.launch(cfg) }.expect("rmsnorm_row_f32 launch failed");
-        s.stream.synchronize().expect("synchronize failed");
         Self { data: out, shape: vec![m, n] }
     }
 }
@@ -719,7 +718,6 @@ impl crate::device::Mul for CudaTensor {
         // matches the four args; output sized n; lhs / rhs both sized n
         // (asserted above).
         unsafe { l.launch(cfg) }.expect("mul_f32 launch failed");
-        s.stream.synchronize().expect("synchronize failed");
         Self { data: out, shape: self.shape.clone() }
     }
 }
@@ -749,8 +747,127 @@ impl crate::device::Rope for CudaTensor {
         // Safety: signature (const float*, float*, int, int) matches
         // the four args; both buffers sized seq*head_dim.
         unsafe { l.launch(cfg) }.expect("rope_f32 launch failed");
-        s.stream.synchronize().expect("synchronize failed");
         Self { data: out, shape: vec![seq, head_dim] }
+    }
+}
+
+// ---- Phase 3: end-to-end forward pass on the GPU.
+//
+// `CudaModel` mirrors the CPU `model::Model` but holds device-resident
+// per-block weight bundles built on the Phase 2 generic structs
+// (`HeadWeights<CudaTensor>` and `FfnWeights<CudaTensor>`). The token
+// embedding table stays on the CPU side - one row-pick per input
+// position is cheap enough that adding a dedicated embed-lookup kernel
+// is not worth it; we just gather the [seq, hidden] slab on the host
+// and copy it H->D once per forward call.
+//
+// Phase 3 is **inference-only** and **f32 throughout** - no BitNet
+// ternary quant, no autograd. Comparing a CudaModel forward against
+// the same architecture run through `block_inference<Tensor>` proves
+// the device-side stack is correct end-to-end. Phase 4 will add per-op
+// backward kernels and wire training; Phase 5 will add ternary
+// tensor-core kernels for the quantised inference path.
+
+/// Per-block GPU-resident weights. Built by `CudaModel::from_cpu` from
+/// the corresponding `model::BlockMasters` on the host side.
+pub struct CudaBlockMasters {
+    pub heads: Vec<crate::device::HeadWeights<CudaTensor>>,
+    pub ffn: crate::device::FfnWeights<CudaTensor>,
+}
+
+/// GPU-resident model. Token embedding is kept on the CPU side; every
+/// other weight tensor lives on the device. End-to-end forward pass
+/// runs entirely through the Phase 2 trait surface (matmul / rmsnorm /
+/// silu / softmax / rope / etc.) so the same generic helpers are
+/// exercised in production as in the per-op tests.
+pub struct CudaModel {
+    pub config: crate::model::ModelConfig,
+    /// Kept on CPU: the embed step is a row-pick from a small table
+    /// (vocab x hidden = 50 KB at v0.13 scale), so the simplest
+    /// implementation is to gather the [seq, hidden] slab on host and
+    /// copy it H->D once per forward call. Avoids an embed-lookup
+    /// kernel at the cost of a tiny H->D transfer per call.
+    pub token_embed_cpu: Tensor,
+    pub blocks: Vec<CudaBlockMasters>,
+    pub lm_head: CudaTensor,
+}
+
+impl CudaModel {
+    /// Copy every parameter tensor from a CPU `Model` into device
+    /// memory. The embed table is cloned (kept on CPU); blocks +
+    /// lm_head go H->D. Done once per session; subsequent forwards
+    /// reuse the cached device-resident weights.
+    pub fn from_cpu(model: &crate::model::Model) -> Self {
+        let blocks = model
+            .blocks
+            .iter()
+            .map(|b| {
+                let heads = b
+                    .heads
+                    .iter()
+                    .map(|h| crate::device::HeadWeights {
+                        w_q: CudaTensor::from_cpu(&h.w_q).expect("H->D w_q failed"),
+                        w_k: CudaTensor::from_cpu(&h.w_k).expect("H->D w_k failed"),
+                        w_v: CudaTensor::from_cpu(&h.w_v).expect("H->D w_v failed"),
+                        w_o: CudaTensor::from_cpu(&h.w_o).expect("H->D w_o failed"),
+                    })
+                    .collect();
+                let ffn = crate::device::FfnWeights {
+                    w_gate: CudaTensor::from_cpu(&b.ffn_gate_w).expect("H->D w_gate failed"),
+                    w_up: CudaTensor::from_cpu(&b.ffn_up_w).expect("H->D w_up failed"),
+                    w_down: CudaTensor::from_cpu(&b.ffn_down_w).expect("H->D w_down failed"),
+                };
+                CudaBlockMasters { heads, ffn }
+            })
+            .collect();
+        let lm_head = CudaTensor::from_cpu(&model.lm_head).expect("H->D lm_head failed");
+        Self {
+            config: model.config,
+            token_embed_cpu: model.token_embed.clone(),
+            blocks,
+            lm_head,
+        }
+    }
+
+    /// End-to-end forward pass: token ids -> logits `[seq, vocab]`.
+    ///
+    /// Pipeline:
+    ///   1. CPU embed lookup: row-pick from `token_embed_cpu`.
+    ///   2. H->D copy of the gathered `[seq, hidden]` slab.
+    ///   3. Generic `block_inference<CudaTensor>` per block, all
+    ///      device-resident (no intermediate H<->D bouncing).
+    ///   4. Final RMSNorm.
+    ///   5. `matmul(lm_head)` -> `[seq, vocab]` logits.
+    ///
+    /// Inference-only path. No BitNet quantisation in Phase 3; weights
+    /// are used as their raw f32 masters.
+    pub fn forward(&self, ids: &[usize]) -> CudaTensor {
+        use crate::device::{MatMul, RmsNorm, block_inference};
+        assert!(
+            ids.len() <= self.config.max_seq_len,
+            "forward: seq_len {} exceeds max_seq_len {}",
+            ids.len(),
+            self.config.max_seq_len,
+        );
+        let h = self.config.hidden_dim;
+        let vocab = self.config.vocab_size;
+        let table = &self.token_embed_cpu.data;
+        // Step 1: CPU row-pick. Allocate the [seq, hidden] slab and
+        // fill it from the CPU-side embed table.
+        let mut slab: Vec<f32> = Vec::with_capacity(ids.len() * h);
+        for &id in ids {
+            assert!(id < vocab, "forward: id {id} >= vocab {vocab}");
+            slab.extend_from_slice(&table[id * h..(id + 1) * h]);
+        }
+        let x_cpu = Tensor::from_vec(slab, vec![ids.len(), h]);
+        // Step 2: H->D.
+        let mut x = CudaTensor::from_cpu(&x_cpu).expect("forward: H->D embed failed");
+        // Step 3: blocks, fully device-resident.
+        for block in &self.blocks {
+            x = block_inference(&x, &block.heads, &block.ffn, self.config.head_dim);
+        }
+        // Steps 4 + 5.
+        x.rmsnorm().matmul(&self.lm_head)
     }
 }
 
@@ -935,6 +1052,34 @@ mod tests {
                 .collect(),
             vec![rows, cols],
         )
+    }
+
+    /// **Preflight**. Every other CUDA test starts with
+    /// `if cuda_state().is_err() { skip }` so the suite stays green on
+    /// machines without a GPU. That defensive skip masked a real bug
+    /// in Chunk 2.2 onwards: `INFINITY` is undefined under NVRTC, so
+    /// `cuda_state()` failed during NVRTC compile, every cross-backend
+    /// test silently returned-as-pass, and the GPU code was never
+    /// actually exercised.
+    ///
+    /// This preflight breaks that pattern: on a machine where
+    /// `nvidia-smi` reports a usable GPU (the `EXPECT_CUDA` env var)
+    /// `cuda_state()` MUST succeed. The skip-on-error pattern in the
+    /// other tests stays for cross-machine portability, but this one
+    /// fails loudly if the kernels themselves don't compile.
+    #[test]
+    fn preflight_cuda_state_initialises_cleanly_when_expected() {
+        let expect = std::env::var("EXPECT_CUDA").ok();
+        match cuda_state() {
+            Ok(_) => {}
+            Err(e) if expect.is_none() => {
+                // No GPU + no expectation that there should be one.
+                eprintln!("skipping: no usable CUDA device ({e})");
+            }
+            Err(e) => {
+                panic!("EXPECT_CUDA was set but cuda_state failed: {e}");
+            }
+        }
     }
 
     #[test]
@@ -1127,6 +1272,109 @@ mod tests {
                 "GPU row {i} mean_sq = {mean_sq} (expected ~1)"
             );
         }
+    }
+
+    /// CPU end-to-end forward built from the same generic helpers
+    /// the GPU `CudaModel::forward` uses. Test-only; production CPU
+    /// training stays on the existing autograd `Model::forward`. This
+    /// helper is the apples-to-apples reference for the cross-backend
+    /// model test below.
+    fn cpu_forward_unquantised(model: &crate::model::Model, ids: &[usize]) -> Tensor {
+        use crate::device::{FfnWeights, HeadWeights, block_inference};
+        let h = model.config.hidden_dim;
+        let vocab = model.config.vocab_size;
+        let table = &model.token_embed.data;
+        let mut slab: Vec<f32> = Vec::with_capacity(ids.len() * h);
+        for &id in ids {
+            assert!(id < vocab, "embed id out of range");
+            slab.extend_from_slice(&table[id * h..(id + 1) * h]);
+        }
+        let mut x = Tensor::from_vec(slab, vec![ids.len(), h]);
+        for b in &model.blocks {
+            let heads: Vec<HeadWeights<Tensor>> = b
+                .heads
+                .iter()
+                .map(|h| HeadWeights {
+                    w_q: h.w_q.clone(),
+                    w_k: h.w_k.clone(),
+                    w_v: h.w_v.clone(),
+                    w_o: h.w_o.clone(),
+                })
+                .collect();
+            let ffn = FfnWeights {
+                w_gate: b.ffn_gate_w.clone(),
+                w_up: b.ffn_up_w.clone(),
+                w_down: b.ffn_down_w.clone(),
+            };
+            x = block_inference(&x, &heads, &ffn, model.config.head_dim);
+        }
+        x.rmsnorm().matmul(&model.lm_head)
+    }
+
+    /// **The headline test of Phase 3.** End-to-end model forward
+    /// runs on the GPU through `CudaModel::forward` and matches the
+    /// equivalent CPU forward (built from the same generic helpers)
+    /// within a tolerance proportional to the depth of the chained
+    /// op stack. Validates that:
+    /// - `CudaModel::from_cpu` correctly mirrors every weight tensor
+    /// - `CudaModel::forward` correctly chains embed -> blocks ->
+    ///   rmsnorm -> lm_head matmul
+    /// - the trait surface composes cleanly across two transformer
+    ///   blocks worth of ops
+    #[test]
+    fn cuda_model_forward_matches_cpu_block_inference_chain() {
+        if cuda_state().is_err() {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        }
+        use crate::model::{Model, ModelConfig};
+        let config = ModelConfig {
+            vocab_size: 17,
+            hidden_dim: 32,
+            n_heads: 4,
+            head_dim: 8,
+            ffn_dim: 64,
+            max_seq_len: 16,
+            n_blocks: 2,
+        };
+        let model = Model::new(&config, 42);
+        let ids: Vec<usize> = vec![0, 3, 7, 11, 5, 1, 9];
+
+        let cpu_logits = cpu_forward_unquantised(&model, &ids);
+        let cuda_model = CudaModel::from_cpu(&model);
+        let gpu_logits = cuda_model.forward(&ids).to_cpu().unwrap();
+
+        assert_eq!(cpu_logits.shape, gpu_logits.shape, "logits shape mismatch");
+        // Tolerance: each block adds ~5e-3 of drift on a single
+        // forward; lm_head matmul adds another small chunk. 2 blocks +
+        // final matmul: budget ~2e-2 absolute. Loosened from the
+        // single-block test for chain length.
+        for (i, (&c, &g)) in cpu_logits.data.iter().zip(&gpu_logits.data).enumerate() {
+            let abs = (c - g).abs();
+            assert!(
+                abs <= 2e-2 + 2e-2 * c.abs(),
+                "model logits drift at idx {i}: cpu = {c}, cuda = {g}"
+            );
+        }
+        // Sanity: last-token argmax from both backends must match -
+        // sampling decisions should be identical even if intermediate
+        // logits differ at the last few mantissa bits.
+        let last_offset = (ids.len() - 1) * config.vocab_size;
+        let cpu_argmax = (0..config.vocab_size)
+            .max_by(|&a, &b| {
+                cpu_logits.data[last_offset + a]
+                    .partial_cmp(&cpu_logits.data[last_offset + b])
+                    .unwrap()
+            })
+            .unwrap();
+        let gpu_argmax = (0..config.vocab_size)
+            .max_by(|&a, &b| {
+                gpu_logits.data[last_offset + a]
+                    .partial_cmp(&gpu_logits.data[last_offset + b])
+                    .unwrap()
+            })
+            .unwrap();
+        assert_eq!(cpu_argmax, gpu_argmax, "greedy-token disagreement");
     }
 
     /// **The headline test of Chunk 2.4.** Full transformer block
