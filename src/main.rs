@@ -1014,7 +1014,7 @@ fn run_shakespeare_training(
         min_seen / initial
     );
 
-    print_generation_samples(&model, &vocab);
+    print_generation_samples(&model, &vocab, DEFAULT_PROMPTS);
 
     // Two artefacts side by side, each carrying only what its role needs:
     //
@@ -1054,64 +1054,101 @@ fn run_shakespeare_training(
 }
 
 /// Print the same five generation passes the trainer prints at the end
-/// of a run: greedy, temperature, top-k, top-p, and KV-cache top-p. Used
-/// both by `run_shakespeare_training` (post-train tail) and the standalone
-/// `sample` subcommand below.
-fn print_generation_samples(model: &crate::model::Model, vocab: &data::Vocab) {
-    println!("\n-- greedy generation --");
-    for prompt in ["ROMEO:", "To be ", "King "] {
-        let g = inference::generate(model, vocab, prompt, 200);
-        println!("\nprompt: {:?}\n{}", prompt, g);
+/// of a run, over the supplied prompt list: greedy, temperature, top-k,
+/// top-p (T=0.8), top-p (T=0.5, v0.17), and KV-cache top-p. Used both by
+/// `run_shakespeare_training` (post-train tail, three default prompts)
+/// and the standalone `sample` subcommand below (caller-supplied prompt
+/// when given, otherwise the same defaults).
+fn print_generation_samples(
+    model: &crate::model::Model,
+    vocab: &data::Vocab,
+    prompts: &[&str],
+) {
+    use SampleMode::*;
+    let modes = enabled_sample_modes();
+    if modes.is_empty() {
+        println!("\n(generation tail skipped: BITNET_SAMPLE_MODES=none)");
+        return;
+    }
+    // One-line header so the user can see exactly which modes are
+    // about to run (and infer the env-var spelling that selected them).
+    let mode_labels: Vec<&str> = modes
+        .iter()
+        .map(|m| match m {
+            Greedy => "greedy",
+            Temp08 => "temp",
+            TopK => "topk",
+            TopP => "topp",
+            TopP05 => "topp_low",
+            KvCache => "kv",
+        })
+        .collect();
+    println!("\n(sampling modes enabled: {})", mode_labels.join(","));
+
+    if modes.contains(&Greedy) {
+        println!("\n-- greedy generation --");
+        for prompt in prompts {
+            let g = inference::generate(model, vocab, prompt, 200);
+            println!("\nprompt: {:?}\n{}", prompt, g);
+        }
     }
 
     // Sampling modes: temperature alone (raw distribution shaped), top-k
     // (capped candidate set), top-p / nucleus (adaptive cumulative-probability
-    // cutoff). Each call uses the same RNG so re-runs can be compared.
+    // cutoff). Each call uses the same RNG so re-runs can be compared
+    // bit-for-bit. Initialised once whether or not greedy ran above
+    // (greedy is RNG-free, so its presence doesn't affect the stream).
     let mut rng = data::Lcg::new(0xCAFEF00D);
 
-    println!("\n-- temperature sampling (T=0.8) --");
-    for prompt in ["ROMEO:", "To be ", "King "] {
-        let g = inference::generate_with_mode(
-            model,
-            vocab,
-            prompt,
-            200,
-            inference::SamplingMode::Temperature { temperature: 0.8 },
-            &mut rng,
-        );
-        println!("\nprompt: {:?}\n{}", prompt, g);
+    if modes.contains(&Temp08) {
+        println!("\n-- temperature sampling (T=0.8) --");
+        for prompt in prompts {
+            let g = inference::generate_with_mode(
+                model,
+                vocab,
+                prompt,
+                200,
+                inference::SamplingMode::Temperature { temperature: 0.8 },
+                &mut rng,
+            );
+            println!("\nprompt: {:?}\n{}", prompt, g);
+        }
     }
 
-    println!("\n-- top-k sampling (k=10, T=0.8) --");
-    for prompt in ["ROMEO:", "To be ", "King "] {
-        let g = inference::generate_with_mode(
-            model,
-            vocab,
-            prompt,
-            200,
-            inference::SamplingMode::TopK {
-                k: 10,
-                temperature: 0.8,
-            },
-            &mut rng,
-        );
-        println!("\nprompt: {:?}\n{}", prompt, g);
+    if modes.contains(&TopK) {
+        println!("\n-- top-k sampling (k=10, T=0.8) --");
+        for prompt in prompts {
+            let g = inference::generate_with_mode(
+                model,
+                vocab,
+                prompt,
+                200,
+                inference::SamplingMode::TopK {
+                    k: 10,
+                    temperature: 0.8,
+                },
+                &mut rng,
+            );
+            println!("\nprompt: {:?}\n{}", prompt, g);
+        }
     }
 
-    println!("\n-- top-p / nucleus sampling (p=0.9, T=0.8) --");
-    for prompt in ["ROMEO:", "To be ", "King "] {
-        let g = inference::generate_with_mode(
-            model,
-            vocab,
-            prompt,
-            200,
-            inference::SamplingMode::TopP {
-                p: 0.9,
-                temperature: 0.8,
-            },
-            &mut rng,
-        );
-        println!("\nprompt: {:?}\n{}", prompt, g);
+    if modes.contains(&TopP) {
+        println!("\n-- top-p / nucleus sampling (p=0.9, T=0.8) --");
+        for prompt in prompts {
+            let g = inference::generate_with_mode(
+                model,
+                vocab,
+                prompt,
+                200,
+                inference::SamplingMode::TopP {
+                    p: 0.9,
+                    temperature: 0.8,
+                },
+                &mut rng,
+            );
+            println!("\nprompt: {:?}\n{}", prompt, g);
+        }
     }
 
     // Lower-temperature top-p pass. Tightens the distribution to favour
@@ -1120,21 +1157,24 @@ fn print_generation_samples(model: &crate::model::Model, vocab: &data::Vocab) {
     // small char-LM scales the model has learnt local Shakespeare
     // patterns much more reliably than long-range coherence, so a
     // lower T often surfaces the cleaner short clauses without the
-    // hallucinated words that T=0.8 produces.
-    println!("\n-- top-p / nucleus sampling (p=0.9, T=0.5) --");
-    for prompt in ["ROMEO:", "To be ", "King "] {
-        let g = inference::generate_with_mode(
-            model,
-            vocab,
-            prompt,
-            200,
-            inference::SamplingMode::TopP {
-                p: 0.9,
-                temperature: 0.5,
-            },
-            &mut rng,
-        );
-        println!("\nprompt: {:?}\n{}", prompt, g);
+    // hallucinated words that T=0.8 produces. This is the highest-
+    // signal single mode for "is this a working LM?" inspections.
+    if modes.contains(&TopP05) {
+        println!("\n-- top-p / nucleus sampling (p=0.9, T=0.5) --");
+        for prompt in prompts {
+            let g = inference::generate_with_mode(
+                model,
+                vocab,
+                prompt,
+                200,
+                inference::SamplingMode::TopP {
+                    p: 0.9,
+                    temperature: 0.5,
+                },
+                &mut rng,
+            );
+            println!("\nprompt: {:?}\n{}", prompt, g);
+        }
     }
 
     // KV-cache top-p (v0.16; sliding-window since v0.16.1). Same
@@ -1146,26 +1186,113 @@ fn print_generation_samples(model: &crate::model::Model, vocab: &data::Vocab) {
     // generations. Per-step compute drops from O(t * H^2 * blocks) to
     // O(H^2 * blocks) - a ~50-100x wall-clock speedup. Output diverges
     // slightly from the Var path due to f32 summation order in attention.
-    println!("\n-- KV-cache top-p (p=0.9, T=0.8; v0.16.1 sliding fast path) --");
-    let kv_t0 = std::time::Instant::now();
-    for prompt in ["ROMEO:", "To be ", "King "] {
-        let g = inference_kv::generate_with_cache(
-            model,
-            vocab,
-            prompt,
-            200,
-            inference::SamplingMode::TopP {
-                p: 0.9,
-                temperature: 0.8,
-            },
-            &mut rng,
+    if modes.contains(&KvCache) {
+        println!("\n-- KV-cache top-p (p=0.9, T=0.8; v0.16.1 sliding fast path) --");
+        let kv_t0 = std::time::Instant::now();
+        for prompt in prompts {
+            let g = inference_kv::generate_with_cache(
+                model,
+                vocab,
+                prompt,
+                200,
+                inference::SamplingMode::TopP {
+                    p: 0.9,
+                    temperature: 0.8,
+                },
+                &mut rng,
+            );
+            println!("\nprompt: {:?}\n{}", prompt, g);
+        }
+        println!(
+            "\n(KV-cache top-p generated {} x 200 tokens in {:.2}s)",
+            prompts.len(),
+            kv_t0.elapsed().as_secs_f32()
         );
-        println!("\nprompt: {:?}\n{}", prompt, g);
     }
-    println!(
-        "\n(KV-cache top-p generated 3 x 200 tokens in {:.2}s)",
-        kv_t0.elapsed().as_secs_f32()
-    );
+}
+
+/// Default prompt suite for the post-training generation tail and
+/// the no-arg `sample` subcommand. Three short Shakespeare-shaped
+/// stubs that exercise different opening contexts: a speaker tag,
+/// a famous line opener, and a regal vocative.
+const DEFAULT_PROMPTS: &[&str] = &["ROMEO:", "To be ", "King "];
+
+/// Identifier for one of the six sampling modes the post-training tail
+/// can run. The `print_generation_samples` helper consults
+/// `enabled_sample_modes` at the start of each section to decide whether
+/// to skip it. Order matters for output: modes always print in the
+/// canonical order (Greedy, Temp08, TopK, TopP, TopP05, KvCache),
+/// regardless of how the user lists them.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum SampleMode {
+    Greedy,
+    Temp08,
+    TopK,
+    TopP,
+    TopP05,
+    KvCache,
+}
+
+/// Read `BITNET_SAMPLE_MODES` and return the list of sampling passes the
+/// post-training tail should run. The env var is comma-separated; mode
+/// tokens are matched case-insensitively against a small whitelist of
+/// aliases. Recognised values:
+///
+/// - `all` (default if unset) - run every mode in the canonical order.
+/// - `min` / `minimal` - run only the two highest-signal modes:
+///   top-p at T=0.5 (cleanest dialogue) and the KV-cache top-p
+///   (different code path; smoke-tests the sliding fix).
+/// - `none` - skip the generation tail entirely.
+/// - Comma-separated tokens, any subset of:
+///   `greedy`, `temp`, `topk`, `topp`, `topp_low` (T=0.5), `kv`.
+///
+/// Examples:
+///   `BITNET_SAMPLE_MODES=min cargo run --release -- sample <path>`
+///   `BITNET_SAMPLE_MODES=topp_low,kv cargo run -- shakespeare`
+///   `BITNET_SAMPLE_MODES=greedy,topp cargo run -- sample <path> "ROMEO:"`
+fn enabled_sample_modes() -> Vec<SampleMode> {
+    use SampleMode::*;
+    let raw = std::env::var("BITNET_SAMPLE_MODES").unwrap_or_default();
+    let raw = raw.trim().to_ascii_lowercase();
+    if raw.is_empty() || raw == "all" {
+        return vec![Greedy, Temp08, TopK, TopP, TopP05, KvCache];
+    }
+    if raw == "min" || raw == "minimal" {
+        return vec![TopP05, KvCache];
+    }
+    if raw == "none" {
+        return Vec::new();
+    }
+    let mut requested: Vec<SampleMode> = Vec::new();
+    for tok in raw.split(',') {
+        let mode = match tok.trim() {
+            "greedy" => Greedy,
+            "temp" | "temperature" => Temp08,
+            "topk" | "top-k" => TopK,
+            "topp" | "top-p" => TopP,
+            "topp_low" | "topp-low" | "topp-cold" | "topp05" => TopP05,
+            "kv" | "kv_cache" | "kv-cache" | "kvcache" => KvCache,
+            other if other.is_empty() => continue,
+            other => {
+                eprintln!(
+                    "warning: BITNET_SAMPLE_MODES contains unknown mode {:?}; ignored. \
+                     Recognised: greedy, temp, topk, topp, topp_low, kv (or `all` / `min` / `none`).",
+                    other
+                );
+                continue;
+            }
+        };
+        if !requested.contains(&mode) {
+            requested.push(mode);
+        }
+    }
+    // Force canonical print order regardless of how the user listed them.
+    let canonical = [Greedy, Temp08, TopK, TopP, TopP05, KvCache];
+    canonical
+        .iter()
+        .copied()
+        .filter(|m| requested.contains(m))
+        .collect()
 }
 
 /// Standalone "sample only" entry point. Loads a checkpoint
@@ -1237,7 +1364,95 @@ fn run_sample_only(path: std::path::PathBuf) {
         std::process::exit(1);
     }
 
-    print_generation_samples(&model, &vocab);
+    print_generation_samples(&model, &vocab, DEFAULT_PROMPTS);
+}
+
+/// Variant of `run_sample_only` that takes a caller-supplied prompt and
+/// runs all six sampling modes on just that one prompt. The prompt is
+/// silently filtered to the trained vocab (out-of-vocab characters get
+/// dropped instead of panicking, so "feed it random BS" stays friendly).
+fn run_sample_only_with_prompt(path: std::path::PathBuf, raw_prompt: String) {
+    use crate::data::{Vocab, read_corpus};
+
+    if !path.exists() {
+        eprintln!("checkpoint not found: {}", path.display());
+        std::process::exit(1);
+    }
+    let corpus_path = std::path::PathBuf::from("data/tinyshakespeare.txt");
+    if !corpus_path.exists() {
+        eprintln!(
+            "Could not find {} (needed to rebuild the same vocab the model was trained against).",
+            corpus_path.display()
+        );
+        std::process::exit(1);
+    }
+
+    let mut f = match std::fs::File::open(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("could not open checkpoint {}: {}", path.display(), e);
+            std::process::exit(1);
+        }
+    };
+    let (model, fmt, _optim) = match export::import(&mut f) {
+        Ok(triple) => triple,
+        Err(e) => {
+            eprintln!("could not parse checkpoint {}: {}", path.display(), e);
+            std::process::exit(1);
+        }
+    };
+    println!("loaded {:?}-format checkpoint from {}", fmt, path.display());
+
+    let corpus = match read_corpus(&corpus_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("could not read {}: {}", corpus_path.display(), e);
+            std::process::exit(1);
+        }
+    };
+    let vocab = Vocab::from_text(&corpus);
+    if vocab.size() != model.config.vocab_size {
+        eprintln!(
+            "vocab size mismatch: corpus has {} chars, checkpoint expects {}.\n\
+             The corpus on disk has drifted from the one this model was trained on.",
+            vocab.size(),
+            model.config.vocab_size
+        );
+        std::process::exit(1);
+    }
+
+    // Filter prompt to chars present in the trained vocab; report what
+    // got dropped (if anything) so the user knows. Vocab is the 65 chars
+    // of TinyShakespeare - mostly printable ASCII letters / digits /
+    // common punctuation / newline / space - so most natural English
+    // prompts pass through unchanged.
+    let in_vocab: std::collections::HashSet<char> = corpus.chars().collect();
+    let filtered: String = raw_prompt
+        .chars()
+        .filter(|c| in_vocab.contains(c))
+        .collect();
+    let dropped: String = raw_prompt
+        .chars()
+        .filter(|c| !in_vocab.contains(c))
+        .collect();
+    if !dropped.is_empty() {
+        eprintln!(
+            "warning: dropped {} out-of-vocab char(s) from prompt: {:?}",
+            dropped.chars().count(),
+            dropped
+        );
+    }
+    if filtered.is_empty() {
+        eprintln!("prompt empty after vocab filter; nothing to feed the model");
+        std::process::exit(1);
+    }
+    println!(
+        "prompt (in-vocab) = {:?}  ({} chars)",
+        filtered,
+        filtered.chars().count()
+    );
+
+    print_generation_samples(&model, &vocab, &[filtered.as_str()]);
 }
 
 /// End-to-end CPU vs GPU model forward benchmark. Builds a tiny model
@@ -1644,7 +1859,8 @@ fn main() {
     //   cargo run --release -- shakespeare <resume_path>          -- resume ~5M
     //   cargo run --release -- shakespeare-large                  -- fresh ~8.5M training (seq 128)
     //   cargo run --release -- shakespeare-large <resume_path>    -- resume ~8.5M
-    //   cargo run --release -- sample <checkpoint_path>           -- skip training; just print generation samples
+    //   cargo run --release -- sample <checkpoint_path>           -- skip training; print samples on the 3 default prompts
+    //   cargo run --release -- sample <checkpoint_path> <prompt..> -- skip training; print samples on a caller-supplied prompt
     //   cargo run --release --features cuda -- cuda-shakespeare           -- fresh ~5M GPU bitnet training
     //   cargo run --release --features cuda -- cuda-shakespeare <path>    -- resume ~5M on GPU
     //   cargo run --release --features cuda -- cuda-shakespeare-large     -- fresh ~8.5M GPU bitnet
@@ -1666,13 +1882,24 @@ fn main() {
             Some(s) => std::path::PathBuf::from(s),
             None => {
                 eprintln!(
-                    "usage: cargo run --release -- sample <checkpoint_path>\n\
-                     example: cargo run --release -- sample models/shakespeare.f32.bin"
+                    "usage: cargo run --release -- sample <checkpoint_path> [prompt...]\n\
+                     examples:\n  \
+                     cargo run --release -- sample models/shakespeare.f32.bin\n  \
+                     cargo run --release -- sample models/shakespeare.f32.bin \"BANANA:\"\n  \
+                     cargo run --release -- sample models/shakespeare.f32.bin Look thee well"
                 );
                 std::process::exit(2);
             }
         };
-        run_sample_only(path);
+        // Anything after the path is treated as the prompt. Joining with
+        // single spaces lets the user skip shell-quoting for multi-word
+        // prompts ("Look thee well" works, as does "Look\\ thee\\ well").
+        if args.len() > 3 {
+            let raw_prompt = args[3..].join(" ");
+            run_sample_only_with_prompt(path, raw_prompt);
+        } else {
+            run_sample_only(path);
+        }
         return;
     }
     if args.len() > 1 && (args[1] == "cuda-shakespeare" || args[1] == "cuda-shakespeare-large") {

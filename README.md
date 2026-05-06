@@ -7,7 +7,7 @@ inference, binary export. No third-party ML dependencies.
 
 ## Status
 
-- **137** tests passing on `cargo test`; **169** with `cargo test --features cuda`.
+- **137** tests passing on `cargo test`; **171** with `cargo test --features cuda`.
 - **0** warnings on `cargo build --release` (or `--features cuda`).
 - `cargo audit` clean for the default build (stdlib-only); the optional
   `cuda` feature pulls `cudarc` and its small dynamic-loading deps.
@@ -80,7 +80,10 @@ cargo run --release -- shakespeare                        # fresh Shakespeare tr
 cargo run --release -- shakespeare <path>                 # resume ~5M training from checkpoint
 cargo run --release -- shakespeare-large                  # fresh ~8.5M training (seq_len 128)
 cargo run --release -- shakespeare-large <path>           # resume ~8.5M training from checkpoint
-cargo run --release -- sample <path>                      # skip training; print generation samples from a checkpoint
+cargo run --release -- sample <path>                      # skip training; print samples on the 3 default prompts
+cargo run --release -- sample <path> <prompt...>          # skip training; sample from a caller-supplied prompt
+BITNET_SAMPLE_MODES=min cargo run --release -- sample ... # only the 2 highest-signal modes (top-p T=0.5 + KV-cache)
+BITNET_SAMPLE_MODES=topp_low,kv cargo run -- shakespeare  # subset; same env var also gates the post-train tail
 cargo run --release --features cuda -- cuda-demo          # CPU-vs-cuBLAS matmul microbench
 cargo run --release --features cuda -- cuda-forward-bench # CPU-vs-CudaModel end-to-end forward bench
 cargo run --release --features cuda -- cuda-train-demo    # Phase 4 end-to-end GPU training proof-of-concept

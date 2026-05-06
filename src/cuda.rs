@@ -2565,7 +2565,7 @@ mod tests {
             };
             x = block_inference(&x, &heads, &ffn, model.config.head_dim);
         }
-        x.rmsnorm().matmul(&model.lm_head)
+        x.rmsnorm().matmul(&model.token_embed.transpose_2d())
     }
 
     /// **The headline test of Phase 3.** End-to-end model forward
