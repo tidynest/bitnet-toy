@@ -1,13 +1,34 @@
 # bitnet-toy
 
+![version](https://img.shields.io/badge/version-v0.18.1-3b6ea5)
+![Rust](https://img.shields.io/badge/Rust-2024%20edition-ce412b?logo=rust&logoColor=white)
+![tests](https://img.shields.io/badge/tests-139%20passing-3f9142)
+![CUDA](https://img.shields.io/badge/CUDA-optional%20(cudarc%200.19)-76b900?logo=nvidia&logoColor=white)
+![ML dependencies](https://img.shields.io/badge/ML%20dependencies-none-3f9142)
+
 A hand-rolled implementation of [BitNet b1.58](https://arxiv.org/abs/2402.17764)
 in pure Rust. Every line written from scratch as a learning exercise: tensor
 type, autograd, ternary quantisation, transformer block, training loop,
 inference, binary export. No third-party ML dependencies.
 
+## Contents
+
+- [Status](#status)
+- [Quick start](#quick-start)
+- [What this is](#what-this-is)
+- [CLI](#cli)
+- [Project layout](#project-layout)
+- [Source map](#source-map)
+- [Training](#training)
+- [Export formats](#export-formats)
+- [Build, test, audit](#build-test-audit)
+- [Constraints](#constraints)
+- [Roadmap](#roadmap)
+- [Further reading](#further-reading)
+
 ## Status
 
-- **137** tests passing on `cargo test`; **171** with `cargo test --features cuda`.
+- **139** tests passing on `cargo test`; **171** with `cargo test --features cuda`.
 - **0** warnings on `cargo build --release` (or `--features cuda`).
 - `cargo audit` clean for the default build (stdlib-only); the optional
   `cuda` feature pulls `cudarc` and its small dynamic-loading deps.
@@ -57,7 +78,7 @@ generations (Temperature, top-k, top-p) from the prompts `ROMEO:`, `To be `,
 `King `. Saves two artefacts:
 
 - `models/shakespeare.f32.bin`               full-precision masters + optim state. Use for clean resume.
-- `models/shakespeare.ternary_packed.bin`    base-3 packed deployment artefact (~50x smaller).
+- `models/shakespeare.ternary_packed.bin`    base-3 packed deployment artefact (~6x smaller).
 
 ## What this is
 
@@ -102,7 +123,6 @@ bitnet-toy/
 │   ├── ARCHITECTURE.md    file-by-file walkthrough
 │   └── TRAINING.md        training guide and hyperparameter notes
 ├── README.md    this file
-├── TODO.md      improvement queue and test-training plan
 ├── Cargo.toml
 └── Cargo.lock
 ```
@@ -124,7 +144,7 @@ bitnet-toy/
 | `src/inference_kv.rs`  | KV-cached generator (~50-100x faster per-token vs full-forward path) |
 | `src/export.rs`        | three binary formats with header + round-trip importer + AdamW state payload |
 | `src/device.rs`        | per-op traits (`MatMul`, `Add`, `Mul`, `MulScalar`, `Transpose2D`, `Softmax`, `CausalMask`, `Rope`, `Silu`, `RmsNorm`); generic helpers `attention_head_inference<T>`, `ffn_inference<T>`, `block_inference<T>` |
-| `src/cuda.rs`          | CUDA back-end (gated `--features cuda`): NVRTC kernels, cuBLAS sgemm, `CudaTensor`, `CudaModel` end-to-end forward |
+| `src/cuda.rs`          | CUDA back-end (gated `--features cuda`): NVRTC kernels, cuBLAS sgemm + int8 `cublasGemmEx` tensor-core GEMM, `CudaTensor`, `CudaModel` forward + GPU ternary training |
 | `src/main.rs`          | CLI dispatch, `TrainConfig`, demos, integration tests, `cuda-demo` + `cuda-forward-bench` benches |
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for what each module exposes
@@ -139,7 +159,7 @@ Brief recipe (full guide in [docs/TRAINING.md](docs/TRAINING.md)):
 2. Run `cargo run --release -- shakespeare`.
 3. Watch the four-column status line every 100 steps:
    `train_loss`, `anchor_loss` (smooth signal), `min_seen`, `lr`, `|g|`.
-4. After 5000 steps the model is exported to both `models/shakespeare.f32.bin`
+4. After training completes, the model is exported to both `models/shakespeare.f32.bin`
    (lossless, for resume) and `models/shakespeare.ternary_packed.bin` (compact).
 
 To resume, pass `models/shakespeare.f32.bin` as the second CLI argument;
@@ -156,9 +176,10 @@ steps re-establishing the master values from `γ · W_q`.
 | Ternary i8                         | 1 byte       | 2.92x |
 | TernaryPacked (base-3, 5 per byte) | ~1.6 bits    | 6.02x   (use for distribution) |
 
-Embeddings (`token_embed`, `pos_embed`) stay f32 in all formats. Block weights
-and the LM head are quantised in the two ternary formats. The packed format
-uses base-3 encoding (`3^5 = 243 < 256`) to fit five ternary values per byte.
+The embedding table (`token_embed`) stays f32 in all formats; with tied
+embeddings it doubles as the (transposed) LM-head weight. Block weights are
+quantised in the two ternary formats. The packed format uses base-3 encoding
+(`3^5 = 243 < 256`) to fit five ternary values per byte.
 
 The importer in `export::import` reads any of the three formats, returning a
 `Model` plus the `Format` it was stored as.
@@ -167,7 +188,7 @@ The importer in `export::import` reads any of the three formats, returning a
 
 ```sh
 cargo build --release       # optimised binary at target/release/bitnet-toy
-cargo test                  # runs 119 tests
+cargo test                  # runs 139 tests
 cargo fmt                   # apply rustfmt
 cargo clippy --all-targets  # extra lints (pedantic warnings allowed at crate level)
 cargo audit                 # security audit; trivially clean (no deps)
@@ -199,7 +220,9 @@ This is a learning project, not a production library:
   agrees within `1e-3` per-op, `5e-3` per-block, `2e-2` end-to-end.
   Training stays on CPU until Phase 4 lands per-op backward kernels.
   `cargo run --release --features cuda -- cuda-forward-bench` shows
-  the end-to-end CPU-vs-GPU benchmark.
+  the end-to-end CPU-vs-GPU benchmark. GPU training landed in Phase 4
+  (f32) and then Phase 5.a / 5.b (real ternary BitNet via int8 tensor
+  cores, `cuda-shakespeare`); see the Status section.
 - KV cache for inference (`src/inference_kv.rs`) gives roughly 50-100x
   faster per-token generation. Sliding-window since v0.16.1 (cache
   capped at `max_seq_len` rows; RoPE reapplied at logical position so
@@ -210,9 +233,26 @@ This is a learning project, not a production library:
 For production needs, use [Burn](https://burn.dev), [candle](https://github.com/huggingface/candle),
 or [tch-rs](https://github.com/LaurentMazare/tch-rs).
 
+## Roadmap
+
+Planned work is tracked on GitHub:
+
+- **[Issues](https://github.com/tidynest/bitnet-toy/issues)** the active backlog.
+- **[Roadmap board](https://github.com/users/tidynest/projects/7)** issues grouped by milestone.
+
+Milestones, in priority order:
+
+1. **Phase 5.c — GPU perf** — realise the tensor-core speedup. Per-step launch
+   overhead currently makes the GPU slower than the CPU despite correct ternary
+   int8 GEMM; reuse device buffers, fuse the quant kernels, capture the step as
+   a CUDA graph, then benchmark at scale.
+2. **CPU SIMD & threading** — Zen 4 AVX2 auto-select, an ARM64 NEON path, and a
+   persistent thread pool.
+3. **CLI ergonomics** — train arbitrary corpora with overridable hyperparameters
+   from the command line.
+
 ## Further reading
 
-- **[TODO.md](TODO.md)** queue of pending improvements and the test-training plan.
 - **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** how the modules compose.
 - **[docs/TRAINING.md](docs/TRAINING.md)** training recipe with hyperparameter rationale.
 - **[BitNet b1.58 paper](https://arxiv.org/abs/2402.17764)** the architecture this implements.

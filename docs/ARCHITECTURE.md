@@ -1,14 +1,32 @@
 # Architecture
 
+![docs](https://img.shields.io/badge/docs-architecture-3b6ea5)
+![version](https://img.shields.io/badge/version-v0.18.1-3b6ea5)
+
 How the modules compose, top-down.
+
+## Contents
+
+- [Layered view](#layered-view)
+- [Why this layering](#why-this-layering)
+- [The training cycle](#the-training-cycle-one-step)
+- [STE in one paragraph](#ste-in-one-paragraph)
+- [Multi-head attention](#multi-head-attention-sum-of-projections)
+- [SwiGLU FFN](#swiglu-ffn)
+- [Causal mask](#causal-mask)
+- [Per-op trait architecture (Phase 2)](#per-op-trait-architecture-phase-2)
+- [CUDA back-end](#cuda-back-end)
+- [Memory model](#memory-model)
+- [Where the toy stops](#where-the-toy-stops)
 
 ## Layered view
 
 ```
                                  main.rs
                   (TrainConfig, CLI: shakespeare /
-                   shakespeare-large / cuda-demo /
-                   cuda-forward-bench, demos, tests)
+                   shakespeare-large / sample / cuda-demo /
+                   cuda-forward-bench / cuda-train-demo /
+                   cuda-shakespeare[-large], demos, tests)
                                     |
        ┌────────────────────────────┼────────────────────────────┐
        |                            |                            |
@@ -152,7 +170,7 @@ Model::register_leaves(&tape)
     │
     ▼
 Model::forward(&leaves, ids)
-    builds the graph: embed → blocks → final RMSNorm → BitLinear lm_head
+    builds the graph: embed → blocks → final RMSNorm → tied-embedding LM-head matmul
     every op records itself on the tape
     │
     ▼
@@ -353,9 +371,12 @@ RTX 4070 Laptop). **Phase 4 is functionally complete.** The path is
 f32 throughout; Phase 5 (tensor-core ternary kernels) restores BitNet
 semantics on the GPU.
 
-## CUDA back-end (Phases 1-3, plus Phase 4 chunks 4.1-4.5.f, plus Phase 5.a + 5.b)
+## CUDA back-end
 
-Optional, gated behind `--features cuda`. Default `cargo build` stays
+Phases 1-3 (matmul, per-op traits, end-to-end forward), Phase 4 (full GPU
+autograd, chunks 4.1-4.5.f), and Phase 5.a/5.b (real ternary BitNet training on
+int8 tensor cores) — all optional, gated behind `--features cuda`. Default
+`cargo build` stays
 dependency-free; CUDA work uses `cudarc 0.19` with `dynamic-loading`
 so the same binary loads on machines with the toolkit at non-default
 paths.
@@ -417,39 +438,34 @@ Master parameters in `Model` live across steps; everything else is ephemeral.
 
 ## Where the toy stops
 
-The places this implementation still diverges from production BitNet,
-in order of how much each matters:
+What now works on the GPU (no longer gaps): **end-to-end GPU training**
+(Phase 4) and **real ternary BitNet on int8 tensor cores** via `cublasGemmEx`
+(Phase 5.a/5.b). `cuda-shakespeare` trains genuine 1.58-bit-per-weight
+checkpoints on the GPU.
 
-1. **f32 arithmetic.** Real BitNet has BF16 master weights and INT8
-   activations stored as `i8`, with the matmul itself running on
-   tensor cores at INT8 (or even ternary directly via Phase 5 tricks).
-   We quantise the *values* (ternary weights via STE,
-   absmean / absmax) but the arithmetic stays in f32. Fixing this is
-   the headline of CUDA Phase 5: replace the f32 GEMM with a kernel
-   that uses Ada's tensor cores and skips multiplies for the
-   +1 / -1 / 0 ternary weight values.
+The places this implementation still diverges from production BitNet, in order
+of how much each matters (tracked as
+[GitHub issues](https://github.com/tidynest/bitnet-toy/issues)):
 
-2. **No GPU training yet.** The end-to-end forward runs on the GPU
-   (Phase 3) but training stays CPU-only because there are no GPU
-   backward kernels. Phase 4 adds per-op backward kernels and a
-   tape-equivalent for `CudaTensor`, after which the existing CPU
-   training loop can opt into the GPU forward+backward.
+1. **GPU is slower than CPU at this scale.** The ternary int8 GEMM is correct
+   and runs on Ada tensor cores, but each training step issues ~3000+ kernel
+   launches and per-launch driver overhead dominates the microsecond GEMMs.
+   Realising the speedup needs device-buffer reuse (`sync_from_cpu`),
+   quant-kernel fusion, CUDA graphs, and larger batches — milestone
+   **Phase 5.c — GPU perf** (issues #1-#4).
 
-3. **AVX-512 underperforms AVX2 on Zen 4.** Empirically measured: the
-   16-wide AVX-512 loads cause more L2/L3 contention across 4 worker
-   threads than the 8-wide AVX2 loads on this hardware. The
-   automatic SIMD-mode selection picks AVX-512 by default; export
-   `BITNET_MATMUL_SIMD=avx2` for production training on Zen 4. A
-   future Zen-detection branch in `matmul_simd_mode()` would do the
-   right thing automatically.
+2. **f32 master weights.** Real BitNet keeps BF16 masters; the GEMM is now int8
+   on tensor cores, but the master weights and the AdamW optimiser state remain
+   f32. Lowering the masters to BF16 is a possible future step, not yet
+   scheduled.
 
-4. **CUDA per-launch overhead dominates at small model scale.** End-to-
-   end forward is slower than CPU at hidden=32-96; needs hidden=192+
-   (v0.13 production scale) to flip. Future work: kernel fusion,
-   CUDA graphs, larger batched forward.
+3. **AVX-512 underperforms AVX2 on Zen 4.** The 16-wide AVX-512 loads cause more
+   L2/L3 contention across 4 worker threads than the 8-wide AVX2 loads on this
+   hardware. The auto SIMD selection picks AVX-512 by default; export
+   `BITNET_MATMUL_SIMD=avx2` on Zen 4. A CPUID-based auto-select is issue #5.
 
-5. **Inference KV cache is CPU-only.** `inference_kv.rs` is fast
-   (~50-100x over the autograd path) but not yet wired through
-   `CudaModel`. Easy follow-up once Phase 3 settles.
+4. **Inference KV cache is CPU-only.** `inference_kv.rs` is fast (~50-100x over
+   the autograd path) but not yet wired through `CudaModel`.
 
-All five are listed in `TODO.md` with the current priority order.
+The GPU-perf and SIMD items are tracked on the
+[roadmap board](https://github.com/users/tidynest/projects/7).

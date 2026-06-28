@@ -1,6 +1,20 @@
 # Training Guide
 
+![docs](https://img.shields.io/badge/docs-training-3b6ea5)
+![version](https://img.shields.io/badge/version-v0.18.1-3b6ea5)
+
 How to train, what to expect, what to watch for, and what knobs to turn.
+
+## Contents
+
+- [Smoke test](#smoke-test-no-setup-required)
+- [Real training: TinyShakespeare](#real-training-tinyshakespeare)
+- [Watching the run](#watching-the-run)
+- [Generation modes](#generation-modes)
+- [Tuning](#tuning)
+- [Limitations to know about](#limitations-to-know-about)
+- [Batching and threading notes](#batching-and-threading-notes)
+- [CUDA back-end](#cuda-back-end) — Phases 1-3, 4.1-4.5.f, 5.a/5.b, preflight
 
 ## Smoke test (no setup required)
 
@@ -36,7 +50,7 @@ Default config (defined in `TrainConfig::shakespeare()` in `src/main.rs`):
 
 | Knob | Default | Notes |
 |---|---|---|
-| `n_steps`         | 10000     | ~8-15 min on CPU (v0.9 ~2M-param config) |
+| `n_steps`         | 10000     | ~8-15 min on CPU (v0.13 ~5M-param config) |
 | `peak_lr`         | 3e-3      | After 200-step warmup |
 | `floor_lr`        | 3e-4      | Cosine decay endpoint |
 | `warmup_steps`    | 200       | Linear ramp from 0 to peak; fixed budget regardless of n_steps |
@@ -45,10 +59,10 @@ Default config (defined in `TrainConfig::shakespeare()` in `src/main.rs`):
 | `adamw_beta1`     | 0.9       | First-moment decay |
 | `adamw_beta2`     | 0.95      | Second-moment decay (LLaMA pick) |
 | `seed`            | 1337      | LCG seed for init + window sampling |
-| `model.hidden_dim`     | 128  | Doubled at v0.9 to break through the 280k-param val_ppl ceiling |
-| `model.n_heads`        | 8    | Multi-head attention; head_dim invariant kept by doubling head count |
+| `model.hidden_dim`     | 192  | v0.13 production scale (~5M params) |
+| `model.n_heads`        | 12   | Multi-head attention; n_heads * head_dim == hidden_dim |
 | `model.head_dim`       | 16   | Per-head dim; n_heads * head_dim == hidden_dim |
-| `model.ffn_dim`        | 256  | 2x hidden_dim |
+| `model.ffn_dim`        | 384  | 2x hidden_dim |
 | `model.max_seq_len`    | 64   | Window length |
 | `model.n_blocks`       | 6    | Transformer blocks |
 | `log_every`            | 100  | Print status every N steps |
@@ -136,7 +150,7 @@ Random-baseline `val_ppl` for char-vocab 65 is exactly 65 (uniform
 distribution). A real char-LM gets `val_ppl` in the 3-12 range depending
 on model size and training time.
 
-### Healthy convergence (on Shakespeare, v0.9 ~2M-param config)
+### Healthy convergence (on Shakespeare, v0.13 ~5M-param config)
 
 - `anchor_loss` starts ~4.18 (= log of 65 vocab).
 - After warmup completes (step 200), drops steadily.
@@ -353,7 +367,11 @@ diff <(grep "^step" simd_avx512.log) <(grep "^step" simd_avx2.log)
 diff <(grep "^step" simd_avx512.log) <(grep "^step" simd_off.log)
 ```
 
-### CUDA back-end (Phase 1, v0.18)
+## CUDA back-end
+
+The optional GPU back-end, built in phases. All gated behind `--features cuda`; the default build stays dependency-free.
+
+### Phase 1, v0.18
 
 Build with the optional `cuda` feature (requires the CUDA toolkit on
 the host - on Arch Linux that is `sudo pacman -S cuda`, which puts
@@ -420,7 +438,7 @@ training that switches between CPU and GPU mid-run would lose the
 byte-identical-checkpoint guarantee that the CPU SIMD paths have; for
 now the training pipeline is CPU-only, so this is a Phase 4 concern.
 
-### CUDA back-end (Phase 2: trait architecture)
+### Phase 2: trait architecture
 
 Phase 2 (chunks 2.1-2.4) wraps every op the model needs in a per-op
 trait declared in `src/device.rs`. Each trait has a CPU impl on
@@ -458,7 +476,7 @@ output agreement within tight FP tolerance. Per-op tolerance is
 attention test passes at 1e-3; chained block test at 5e-3. Failure
 of any of these tests implies a regression in a single op kernel.
 
-### CUDA back-end (Phase 3: end-to-end forward)
+### Phase 3: end-to-end forward
 
 `CudaModel` (in `src/cuda.rs`) holds device-resident weights mirroring
 the CPU `model::Model`. End-to-end forward chains `embed -> blocks
@@ -496,7 +514,7 @@ sync. Stripping cut the med config from ~7x slower to ~4x slower
 (the tiny config barely moved because launch overhead, not sync,
 dominates there).
 
-### CUDA back-end (Phase 4 chunk 4.1: matmul backward)
+### Phase 4 chunk 4.1: matmul backward
 
 The first Phase 4 chunk lands a generic backward helper for matmul on
 the existing trait surface, with zero new kernels:
@@ -530,7 +548,7 @@ mul, softmax, rmsnorm, rope) will mirror per op:
    tensors agree within `1e-4 + 1e-4 * |val|` for matmul-backward,
    looser tolerances for chained chunks.
 
-### CUDA back-end (Phase 4 chunk 4.2: elementwise backwards)
+### Phase 4 chunk 4.2: elementwise backwards
 
 Chunk 4.2 landed the four elementwise backwards the FFN + residual
 paths need. Three are pure trait composition (zero new kernels); the
@@ -569,7 +587,7 @@ memcpy). The `add_backward` cross-backend test arm doubles as the
 only test of `CudaTensor::clone()`, so a regression in `clone_dtod`
 will surface there.
 
-### CUDA back-end (Phase 4 chunk 4.3: softmax + causal-mask backwards)
+### Phase 4 chunk 4.3: softmax + causal-mask backwards
 
 Chunk 4.3 lands two fused NVRTC kernels for the attention-shape
 backwards:
@@ -613,7 +631,7 @@ Test pattern note: the causal-mask backward uses a structural check
 because the forward writes `-inf` into the upper triangle, which
 would make `sum(grad_y * forward(x))` itself non-finite.
 
-### CUDA back-end (Phase 4 chunk 4.4: rmsnorm + rope backwards)
+### Phase 4 chunk 4.4: rmsnorm + rope backwards
 
 Chunk 4.4 closes the per-op backward set. After this chunk every
 forward op the model uses has a generic backward helper on the trait
@@ -668,7 +686,7 @@ magnitude looser than the rmsnorm arm (`1e-3` vs `1e-4`) because
 CPU libm and CUDA's intrinsics, the same trade-off the forward-RoPE
 test absorbs.
 
-### CUDA back-end (Phase 4 chunk 4.5.a: attention-head forward+backward)
+### Phase 4 chunk 4.5.a: attention-head forward+backward
 
 Chunk 4.5.a wires the chunk-4.1-4.4 op-level backwards into a hand-
 traced backward chain for one attention head, expressed against the
@@ -729,7 +747,7 @@ Validation strategy that the rest of chunk 4.5 will mirror:
    sums. **First test that exercises every Phase 4 backward kernel
    in one chain on the GPU.**
 
-### CUDA back-end (Phase 4 chunk 4.5.b: SwiGLU FFN forward+backward)
+### Phase 4 chunk 4.5.b: SwiGLU FFN forward+backward
 
 Chunk 4.5.b mirrors the chunk-4.5.a recipe for the FFN:
 
@@ -764,61 +782,60 @@ forward, `5e-3` backward) because the chain is shorter (3 matmuls
 3-branch sum), so less drift accumulates from cuBLAS / NVRTC
 parallel-reduction f32 sums.
 
-### CUDA back-end (Phase 5.b: tensor-core int8 GEMM behind BitLinear)
+### Phase 4 chunks 4.5.c-f: end-to-end GPU training
 
-Phase 5.b rewrites the `BitLinear` trait impl on `CudaTensor` to run
-the matmul in INT32 on Ada tensor cores via `cublasGemmEx`:
+Chunks 4.5.c through 4.5.f compose the per-op and per-layer
+backwards into a runnable training step:
 
-```
-y[m, n] = (alpha[m] * gamma / 127) * sum_k x_q[m, k] * w_q[k, n]
-```
+- **4.5.c `block_forward_save<T>` + `block_backward<T>`**: full
+  pre-norm transformer block. Composes attention + FFN + 2 RMSNorms
+  + 2 residual `Add` backwards. The Add backwards are identity
+  (Clone); each residual splits its incoming gradient along both
+  branches. Multi-head sum-of-projections means each head's
+  `attention_head_backward` receives the same upstream gradient and
+  per-head input gradients accumulate.
+- **4.5.d `CrossEntropy` + `CrossEntropyBackward` traits**: fused
+  softmax + per-row loss in `cross_entropy_forward_save`; closed-form
+  `(softmax - onehot) / seq` gradient in `cross_entropy_backward`.
+  Two new NVRTC kernels (`cross_entropy_softmax_loss_f32` for
+  forward; `cross_entropy_backward_f32` for backward).
+- **4.5.e `CudaModel::compute_grads_for_window(input, target)
+  -> (Vec<Tensor>, f32)`**: the integration. Embed gather (CPU) +
+  H->D + chained `block_forward_save` + final RMSNorm + lm_head
+  matmul -> logits -> cross-entropy fwd. Backward runs the chain
+  in reverse, scatters the embed-input gradient into a CPU
+  `grad_token_embed` table, and flattens every device-side gradient
+  to CPU in canonical visitor order. Drop-in compatible with the
+  CPU `compute_grads_for_window` signature.
+- **4.5.f `cuda-train-demo` CLI subcommand**:
+  ```
+  cargo run --release --features cuda -- cuda-train-demo
+  ```
+  Builds a tiny model from `TINY_CORPUS`, runs 100 training steps
+  on GPU + AdamW updates on CPU, prints loss trajectory. Empirical:
+  loss 3.0015 -> 1.3106 in 100 steps, 0.4 s wall-clock on the
+  7940HS + RTX 4070 Laptop.
 
-where `x_q` is INT8 in `[-128, 127]` (per-row scale `alpha[m]`),
-`w_q` is INT8 in `{-1, 0, +1}` (scalar scale `gamma`). cuBLAS
-arguments: `CUDA_R_8I` for both inputs, `CUDA_R_32I` for the
-output, `CUBLAS_COMPUTE_32I` compute type,
-`CUBLAS_GEMM_DEFAULT_TENSOR_OP` algo. Same row-major-via-column-
-major adapter as the f32 `MatMul` impl.
+The path is **f32 throughout** - BitNet ternary STE quantisation is
+not applied. Phase 5 (tensor-core ternary kernels) restores BitNet
+semantics on the GPU. Until then, the GPU training path trains an
+f32 transformer (which is still useful for ablations + perf
+measurements + Phase 4 wiring proof) but is not a drop-in
+replacement for the CPU path's BitNet ternary semantics.
 
-Three new NVRTC kernels: `quantise_weights_int8_apply_f32`,
-`quantise_acts_int8_apply_f32`, `scale_int32_to_f32`. The reduction
-kernels (`quantise_weights_ste_partial_abs_sum_f32`,
-`quantise_acts_ste_row_absmax_f32`) are reused from Phase 5.a; only
-the apply kernels (which write INT8 instead of dequantised f32) and
-the final scale kernel are new.
+Per-step cost decomposition (v0.13 demo scale):
+- `CudaModel::from_cpu(&model)` rebuild: ~1 ms (H->D copy of every
+  weight tensor + allocation). Done once per training step because
+  CPU weights mutate after each AdamW update. Removable in a
+  follow-up via `CudaModel::sync_from_cpu(&Model)` that overwrites
+  existing device buffers in place.
+- Forward + backward through one block stack: tens of kernel
+  launches at ~10-30 us each. Dominated by launch overhead at this
+  model scale; production-scale kernels (v0.13 hidden=192) would
+  shift to compute-bound.
+- AdamW step on CPU: linear in param count; ms range.
 
-**Shape fallback**: `cublasGemmEx` int8 GEMM requires `lda` and
-`ldb` to be multiples of 4 (the int8 kernel reads 32-bit chunks).
-In our adapter that means `n` and `k` must both be multiples of 4.
-The only project matmul that violates this is lm_head with
-`n = vocab = 65`; the `BitLinear` impl checks alignment up front
-and falls through to the Phase 5.a f32 path when it fails. Both
-paths are algebraically identical so output values match within
-f32 round-off.
-
-**Empirical reality check** on the 7940HS + RTX 4070 Laptop at
-v0.13 scale (~5M params): Phase 5.b cuda-shakespeare runs at
-~300 ms/step; CPU shakespeare is ~180 ms/step. **GPU is currently
-slower than CPU** because per-step launch overhead dominates -
-each training step does ~3000+ kernel launches (~50 bit_linear
-calls per window x 4 windows in batch x 6 quant + GEMM + scale
-launches per bit_linear x 2 for forward + backward). At 10-30 us
-launch overhead per kernel that is 30-90 ms of pure overhead per
-step; the int8 GEMM kernel runs in microseconds on tensor cores
-so the actual matmul work is dwarfed.
-
-Three orthogonal post-Phase-5.b optimisations to realise the
-tensor-core speedup:
-- **Kernel fusion**: collapse the 4 quant kernels per bit_linear
-  (per-row reduction + per-cell apply, for both x and w) into 1-2
-  launches.
-- **CUDA graphs**: capture a full training-step launch sequence
-  once and replay it. cudarc 0.19 has graph support.
-- **Larger batches / longer sequences**: amortise launch overhead
-  across more matmul work. `shakespeare-large` (~8.5M params,
-  seq_len 128) is the obvious test target.
-
-### CUDA back-end (Phase 5.a: real BitNet ternary GPU training)
+### Phase 5.a: real BitNet ternary GPU training
 
 Phase 5.a wraps the chunk-4.5 GPU training pipeline with BitNet b1.58
 STE quantisation, producing real ternary checkpoints on the GPU.
@@ -889,60 +906,61 @@ the same head two ways - autograd `Var` with explicit
 `attention::head_output` byte-for-byte) vs the chunk-5.a helpers -
 and asserts every gradient cell agrees at `1e-4`.
 
-### CUDA back-end (Phase 4 chunks 4.5.c-f: end-to-end GPU training)
+### Phase 5.b: tensor-core int8 GEMM behind BitLinear
 
-Chunks 4.5.c through 4.5.f compose the per-op and per-layer
-backwards into a runnable training step:
+Phase 5.b rewrites the `BitLinear` trait impl on `CudaTensor` to run
+the matmul in INT32 on Ada tensor cores via `cublasGemmEx`:
 
-- **4.5.c `block_forward_save<T>` + `block_backward<T>`**: full
-  pre-norm transformer block. Composes attention + FFN + 2 RMSNorms
-  + 2 residual `Add` backwards. The Add backwards are identity
-  (Clone); each residual splits its incoming gradient along both
-  branches. Multi-head sum-of-projections means each head's
-  `attention_head_backward` receives the same upstream gradient and
-  per-head input gradients accumulate.
-- **4.5.d `CrossEntropy` + `CrossEntropyBackward` traits**: fused
-  softmax + per-row loss in `cross_entropy_forward_save`; closed-form
-  `(softmax - onehot) / seq` gradient in `cross_entropy_backward`.
-  Two new NVRTC kernels (`cross_entropy_softmax_loss_f32` for
-  forward; `cross_entropy_backward_f32` for backward).
-- **4.5.e `CudaModel::compute_grads_for_window(input, target)
-  -> (Vec<Tensor>, f32)`**: the integration. Embed gather (CPU) +
-  H->D + chained `block_forward_save` + final RMSNorm + lm_head
-  matmul -> logits -> cross-entropy fwd. Backward runs the chain
-  in reverse, scatters the embed-input gradient into a CPU
-  `grad_token_embed` table, and flattens every device-side gradient
-  to CPU in canonical visitor order. Drop-in compatible with the
-  CPU `compute_grads_for_window` signature.
-- **4.5.f `cuda-train-demo` CLI subcommand**:
-  ```
-  cargo run --release --features cuda -- cuda-train-demo
-  ```
-  Builds a tiny model from `TINY_CORPUS`, runs 100 training steps
-  on GPU + AdamW updates on CPU, prints loss trajectory. Empirical:
-  loss 3.0015 -> 1.3106 in 100 steps, 0.4 s wall-clock on the
-  7940HS + RTX 4070 Laptop.
+```
+y[m, n] = (alpha[m] * gamma / 127) * sum_k x_q[m, k] * w_q[k, n]
+```
 
-The path is **f32 throughout** - BitNet ternary STE quantisation is
-not applied. Phase 5 (tensor-core ternary kernels) restores BitNet
-semantics on the GPU. Until then, the GPU training path trains an
-f32 transformer (which is still useful for ablations + perf
-measurements + Phase 4 wiring proof) but is not a drop-in
-replacement for the CPU path's BitNet ternary semantics.
+where `x_q` is INT8 in `[-128, 127]` (per-row scale `alpha[m]`),
+`w_q` is INT8 in `{-1, 0, +1}` (scalar scale `gamma`). cuBLAS
+arguments: `CUDA_R_8I` for both inputs, `CUDA_R_32I` for the
+output, `CUBLAS_COMPUTE_32I` compute type,
+`CUBLAS_GEMM_DEFAULT_TENSOR_OP` algo. Same row-major-via-column-
+major adapter as the f32 `MatMul` impl.
 
-Per-step cost decomposition (v0.13 demo scale):
-- `CudaModel::from_cpu(&model)` rebuild: ~1 ms (H->D copy of every
-  weight tensor + allocation). Done once per training step because
-  CPU weights mutate after each AdamW update. Removable in a
-  follow-up via `CudaModel::sync_from_cpu(&Model)` that overwrites
-  existing device buffers in place.
-- Forward + backward through one block stack: tens of kernel
-  launches at ~10-30 us each. Dominated by launch overhead at this
-  model scale; production-scale kernels (v0.13 hidden=192) would
-  shift to compute-bound.
-- AdamW step on CPU: linear in param count; ms range.
+Three new NVRTC kernels: `quantise_weights_int8_apply_f32`,
+`quantise_acts_int8_apply_f32`, `scale_int32_to_f32`. The reduction
+kernels (`quantise_weights_ste_partial_abs_sum_f32`,
+`quantise_acts_ste_row_absmax_f32`) are reused from Phase 5.a; only
+the apply kernels (which write INT8 instead of dequantised f32) and
+the final scale kernel are new.
 
-### CUDA back-end (preflight)
+**Shape fallback**: `cublasGemmEx` int8 GEMM requires `lda` and
+`ldb` to be multiples of 4 (the int8 kernel reads 32-bit chunks).
+In our adapter that means `n` and `k` must both be multiples of 4.
+The only project matmul that violates this is lm_head with
+`n = vocab = 65`; the `BitLinear` impl checks alignment up front
+and falls through to the Phase 5.a f32 path when it fails. Both
+paths are algebraically identical so output values match within
+f32 round-off.
+
+**Empirical reality check** on the 7940HS + RTX 4070 Laptop at
+v0.13 scale (~5M params): Phase 5.b cuda-shakespeare runs at
+~300 ms/step; CPU shakespeare is ~180 ms/step. **GPU is currently
+slower than CPU** because per-step launch overhead dominates -
+each training step does ~3000+ kernel launches (~50 bit_linear
+calls per window x 4 windows in batch x 6 quant + GEMM + scale
+launches per bit_linear x 2 for forward + backward). At 10-30 us
+launch overhead per kernel that is 30-90 ms of pure overhead per
+step; the int8 GEMM kernel runs in microseconds on tensor cores
+so the actual matmul work is dwarfed.
+
+Three orthogonal post-Phase-5.b optimisations to realise the
+tensor-core speedup:
+- **Kernel fusion**: collapse the 4 quant kernels per bit_linear
+  (per-row reduction + per-cell apply, for both x and w) into 1-2
+  launches.
+- **CUDA graphs**: capture a full training-step launch sequence
+  once and replay it. cudarc 0.19 has graph support.
+- **Larger batches / longer sequences**: amortise launch overhead
+  across more matmul work. `shakespeare-large` (~8.5M params,
+  seq_len 128) is the obvious test target.
+
+### Preflight
 
 Phase 3 surfaced a class of bugs that the silent-skip pattern in
 GPU tests (`if cuda_state().is_err() { return }`) would otherwise
