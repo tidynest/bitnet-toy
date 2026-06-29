@@ -687,7 +687,10 @@ mod tests {
         let mut buf = Vec::new();
         export_ternary_packed(&model, &mut buf, None).unwrap();
         let (_loaded, _fmt, optim) = import(&mut Cursor::new(&buf)).unwrap();
-        assert!(optim.is_none(), "expected no optim state in payload-less export");
+        assert!(
+            optim.is_none(),
+            "expected no optim state in payload-less export"
+        );
     }
 
     #[test]
@@ -718,8 +721,7 @@ mod tests {
             .enumerate()
             .map(|(i, s)| {
                 let n: usize = s.iter().product();
-                let data: Vec<f32> =
-                    (0..n).map(|j| (i * 100 + j) as f32 * 0.0001).collect();
+                let data: Vec<f32> = (0..n).map(|j| (i * 100 + j) as f32 * 0.0001).collect();
                 Tensor {
                     data,
                     shape: s.clone(),
@@ -768,8 +770,7 @@ mod tests {
             .enumerate()
             .map(|(i, s)| {
                 let n: usize = s.iter().product();
-                let data: Vec<f32> =
-                    (0..n).map(|j| (i * 7 + j) as f32 * 1.234e-3).collect();
+                let data: Vec<f32> = (0..n).map(|j| (i * 7 + j) as f32 * 1.234e-3).collect();
                 Tensor {
                     data,
                     shape: s.clone(),
@@ -781,8 +782,7 @@ mod tests {
             .enumerate()
             .map(|(i, s)| {
                 let n: usize = s.iter().product();
-                let data: Vec<f32> =
-                    (0..n).map(|j| (i * 11 + j) as f32 * 5.678e-5).collect();
+                let data: Vec<f32> = (0..n).map(|j| (i * 11 + j) as f32 * 5.678e-5).collect();
                 Tensor {
                     data,
                     shape: s.clone(),

@@ -600,18 +600,18 @@ fn compute_batched_grads_cuda_bitnet(
 
     // Sample all window indices up front so changing batch_size does
     // not change which windows the run sees at the same RNG state.
-    let indices: Vec<usize> = (0..batch_size).map(|_| rng.gen_range(windows.len())).collect();
+    let indices: Vec<usize> = (0..batch_size)
+        .map(|_| rng.gen_range(windows.len()))
+        .collect();
 
     // Average gradients across the batch. Start from the first
     // result's tensors (move out, no clone) and sum the rest into them.
     let first_idx = indices[0];
     let (input, target) = &windows[first_idx];
-    let (mut avg_grads, mut total_loss) =
-        cuda_model.compute_grads_for_window_bitnet(input, target);
+    let (mut avg_grads, mut total_loss) = cuda_model.compute_grads_for_window_bitnet(input, target);
     for &idx in &indices[1..] {
         let (input, target) = &windows[idx];
-        let (other_grads, other_loss) =
-            cuda_model.compute_grads_for_window_bitnet(input, target);
+        let (other_grads, other_loss) = cuda_model.compute_grads_for_window_bitnet(input, target);
         for (a, b) in avg_grads.iter_mut().zip(&other_grads) {
             for (av, bv) in a.data.iter_mut().zip(&b.data) {
                 *av += bv;
@@ -854,8 +854,7 @@ fn train_bitnet_lm(
         opt.step_with_grads(&mut model, &grads);
 
         let on_log_step = step % cfg.log_every == 0 || step == cfg.n_steps - 1;
-        let on_eval_step = val_enabled
-            && (step % cfg.eval_every == 0 || step == cfg.n_steps - 1);
+        let on_eval_step = val_enabled && (step % cfg.eval_every == 0 || step == cfg.n_steps - 1);
 
         if on_log_step {
             let anchor_loss = eval_loss(&model, &input0, &target0);
@@ -926,11 +925,7 @@ fn models_path(filename: &str) -> std::path::PathBuf {
 /// `cargo run --release -- shakespeare [resume_path]`. Trains (or continues
 /// training) a larger BitNet on the full TinyShakespeare corpus, exports all
 /// three formats, and generates samples in greedy + two temperature modes.
-fn run_shakespeare_training(
-    resume_path: Option<std::path::PathBuf>,
-    large: bool,
-    use_cuda: bool,
-) {
+fn run_shakespeare_training(resume_path: Option<std::path::PathBuf>, large: bool, use_cuda: bool) {
     let mut cfg = if large {
         TrainConfig::shakespeare_large()
     } else {
@@ -943,10 +938,7 @@ fn run_shakespeare_training(
         // stream. Force serial-batched mode.
         cfg.n_workers = 1;
     }
-    let path_present = cfg
-        .corpus_path
-        .as_ref()
-        .map_or(false, |p| p.exists());
+    let path_present = cfg.corpus_path.as_ref().map_or(false, |p| p.exists());
     if !path_present {
         eprintln!(
             "Could not find data/tinyshakespeare.txt.\n\
@@ -989,8 +981,7 @@ fn run_shakespeare_training(
                 // pick up at the right position automatically.
                 if let Some(state) = optim.as_ref() {
                     cfg.start_step_offset = state.step_count as usize;
-                    cfg.cosine_total_steps =
-                        Some(cfg.start_step_offset + cfg.n_steps);
+                    cfg.cosine_total_steps = Some(cfg.start_step_offset + cfg.n_steps);
                     println!(
                         "continuing cosine LR schedule: offset {} -> total {}",
                         cfg.start_step_offset,
@@ -1059,11 +1050,7 @@ fn run_shakespeare_training(
 /// `run_shakespeare_training` (post-train tail, three default prompts)
 /// and the standalone `sample` subcommand below (caller-supplied prompt
 /// when given, otherwise the same defaults).
-fn print_generation_samples(
-    model: &crate::model::Model,
-    vocab: &data::Vocab,
-    prompts: &[&str],
-) {
+fn print_generation_samples(model: &crate::model::Model, vocab: &data::Vocab, prompts: &[&str]) {
     use SampleMode::*;
     let modes = enabled_sample_modes();
     if modes.is_empty() {
@@ -1586,30 +1573,14 @@ fn run_cuda_forward_bench() {
         );
     }
 
-    println!(
-        "\nNote: at these tiny model sizes the GPU is far slower than the CPU."
-    );
-    println!(
-        "      The forward queues 60-80 kernel launches per call and each launch"
-    );
-    println!(
-        "      pays ~10-30 us of fixed driver overhead, regardless of how cheap the"
-    );
-    println!(
-        "      kernel itself is. v0.13 scale (~5M params, hidden 192) gives each"
-    );
-    println!(
-        "      kernel real work to do and should flip the ratio. Per-call sync was"
-    );
-    println!(
-        "      already stripped from the trait impls; the remaining wins live in"
-    );
-    println!(
-        "      kernel fusion, CUDA graphs (capture once, replay many), batched"
-    );
-    println!(
-        "      forwards, and Phase 5's ternary tensor-core GEMM."
-    );
+    println!("\nNote: at these tiny model sizes the GPU is far slower than the CPU.");
+    println!("      The forward queues 60-80 kernel launches per call and each launch");
+    println!("      pays ~10-30 us of fixed driver overhead, regardless of how cheap the");
+    println!("      kernel itself is. v0.13 scale (~5M params, hidden 192) gives each");
+    println!("      kernel real work to do and should flip the ratio. Per-call sync was");
+    println!("      already stripped from the trait impls; the remaining wins live in");
+    println!("      kernel fusion, CUDA graphs (capture once, replay many), batched");
+    println!("      forwards, and Phase 5's ternary tensor-core GEMM.");
 }
 
 /// CPU-vs-CUDA matmul demo + benchmark. Reports per-call latency for the
@@ -1649,9 +1620,24 @@ fn run_cuda_demo() {
 
     // Three representative shapes from v0.13's hot path. (m, k, n).
     let shapes: &[(usize, usize, usize, &str)] = &[
-        (64, 192, 16, "attention Q  [seq 64, hidden 192] @ W_q  [192, 16]   = [64, 16]"),
-        (64, 192, 384, "FFN gate/up  [seq 64, hidden 192] @ W   [192, 384]  = [64, 384]"),
-        (64, 384, 192, "FFN down     [seq 64, ffn 384]  @ W_d   [384, 192]  = [64, 192]"),
+        (
+            64,
+            192,
+            16,
+            "attention Q  [seq 64, hidden 192] @ W_q  [192, 16]   = [64, 16]",
+        ),
+        (
+            64,
+            192,
+            384,
+            "FFN gate/up  [seq 64, hidden 192] @ W   [192, 384]  = [64, 384]",
+        ),
+        (
+            64,
+            384,
+            192,
+            "FFN down     [seq 64, ffn 384]  @ W_d   [384, 192]  = [64, 192]",
+        ),
     ];
 
     let mut rng = Lcg::new(0x_C0FFEE_C001_u64);
@@ -1661,7 +1647,10 @@ fn run_cuda_demo() {
         "\n{:<60}  {:>10}  {:>10}  {:>10}  {:>12}",
         "shape", "cpu (us)", "cuda (us)", "ratio", "max |diff|"
     );
-    println!("{:-<60}  {:->10}  {:->10}  {:->10}  {:->12}", "", "", "", "", "");
+    println!(
+        "{:-<60}  {:->10}  {:->10}  {:->10}  {:->12}",
+        "", "", "", "", ""
+    );
 
     for &(m, k, n, label) in shapes {
         let lhs_data: Vec<f32> = (0..m * k).map(|_| rng.next_f01() - 0.5).collect();
@@ -1705,24 +1694,12 @@ fn run_cuda_demo() {
         );
     }
 
-    println!(
-        "\nNote: per-call cuda time includes two H->D copies and one D->H copy."
-    );
-    println!(
-        "      The cuBLAS sgemm kernel itself is ~5-10 us on a 4070; the rest is"
-    );
-    println!(
-        "      PCIe round-trip + the per-call cuBLAS setup. Phase 2 will keep tensors"
-    );
-    println!(
-        "      device-resident across whole blocks so the copy cost is paid once per"
-    );
-    println!(
-        "      forward pass instead of once per matmul, which should push the"
-    );
-    println!(
-        "      speedup from ~1.6-3x today into the 5-10x range at v0.13 scale."
-    );
+    println!("\nNote: per-call cuda time includes two H->D copies and one D->H copy.");
+    println!("      The cuBLAS sgemm kernel itself is ~5-10 us on a 4070; the rest is");
+    println!("      PCIe round-trip + the per-call cuBLAS setup. Phase 2 will keep tensors");
+    println!("      device-resident across whole blocks so the copy cost is paid once per");
+    println!("      forward pass instead of once per matmul, which should push the");
+    println!("      speedup from ~1.6-3x today into the 5-10x range at v0.13 scale.");
 }
 
 /// Phase 4 chunk 4.5.f: end-to-end GPU training proof-of-concept.
@@ -1826,7 +1803,10 @@ fn run_cuda_train_demo() {
         let _pre_clip = clip_grad_norm_tensors(&mut grads, 1.0);
         opt.step_with_grads(&mut model, &grads);
         if step % 10 == 0 || step == n_steps - 1 {
-            println!("step {:>4}   loss = {:.4}   min_seen = {:.4}", step, loss, min_loss);
+            println!(
+                "step {:>4}   loss = {:.4}   min_seen = {:.4}",
+                step, loss, min_loss
+            );
         }
     }
     let elapsed = t0.elapsed();
@@ -1986,8 +1966,8 @@ fn main() {
     let mut f32_buf = Vec::new();
     let mut ternary_buf = Vec::new();
     let mut packed_buf = Vec::new();
-    let f32_size = export::export_f32(&m9_model, &mut f32_buf, None)
-        .expect("f32 export to Vec cannot fail");
+    let f32_size =
+        export::export_f32(&m9_model, &mut f32_buf, None).expect("f32 export to Vec cannot fail");
     let ternary_size = export::export_ternary(&m9_model, &mut ternary_buf, None)
         .expect("ternary export to Vec cannot fail");
     let packed_size = export::export_ternary_packed(&m9_model, &mut packed_buf, None)
@@ -2205,12 +2185,10 @@ mod tests {
         let windows = make_windows(&ids, cfg.max_seq_len);
 
         let mut rng_a = Lcg::new(0xBEEFCAFE);
-        let (grads_serial, loss_serial) =
-            compute_batched_grads(&model, &windows, &mut rng_a, 4, 1);
+        let (grads_serial, loss_serial) = compute_batched_grads(&model, &windows, &mut rng_a, 4, 1);
 
         let mut rng_b = Lcg::new(0xBEEFCAFE);
-        let (grads_par, loss_par) =
-            compute_batched_grads(&model, &windows, &mut rng_b, 4, 4);
+        let (grads_par, loss_par) = compute_batched_grads(&model, &windows, &mut rng_b, 4, 4);
 
         assert!((loss_serial - loss_par).abs() < 1e-3);
         assert_eq!(grads_serial.len(), grads_par.len());

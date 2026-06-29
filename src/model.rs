@@ -241,8 +241,13 @@ impl Model {
         // through transpose + STE accumulates a [vocab, hidden] gradient
         // contribution into `token_embed`'s grad slot, on top of the gather
         // gradient from the embed-lookup path above.
-        x.quantise_acts_ste()
-            .matmul(leaves.token_embed.clone().transpose_2d().quantise_weights_ste())
+        x.quantise_acts_ste().matmul(
+            leaves
+                .token_embed
+                .clone()
+                .transpose_2d()
+                .quantise_weights_ste(),
+        )
     }
 
     /// SGD update: `master -= lr · master.grad()`. Reads gradient from each
