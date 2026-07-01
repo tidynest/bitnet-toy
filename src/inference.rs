@@ -224,8 +224,7 @@ fn truncate_top_k(probs: &[f32], k: usize) -> Vec<(usize, f32)> {
     // Pair (index, prob), sort by prob descending. For our vocab sizes
     // (65 for Shakespeare, hundreds for byte-level) a full sort is fine;
     // for large vocabs use a partial-sort/heap.
-    let mut pairs: Vec<(usize, f32)> =
-        probs.iter().enumerate().map(|(i, &p)| (i, p)).collect();
+    let mut pairs: Vec<(usize, f32)> = probs.iter().enumerate().map(|(i, &p)| (i, p)).collect();
     pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).expect("prob was NaN"));
     pairs.truncate(k);
 
@@ -239,8 +238,7 @@ fn truncate_top_k(probs: &[f32], k: usize) -> Vec<(usize, f32)> {
 fn truncate_top_p(probs: &[f32], p: f32) -> Vec<(usize, f32)> {
     let p = p.clamp(0.001, 1.0);
 
-    let mut pairs: Vec<(usize, f32)> =
-        probs.iter().enumerate().map(|(i, &p)| (i, p)).collect();
+    let mut pairs: Vec<(usize, f32)> = probs.iter().enumerate().map(|(i, &p)| (i, p)).collect();
     pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).expect("prob was NaN"));
 
     // Walk the sorted list accumulating prob mass. Stop at the first index

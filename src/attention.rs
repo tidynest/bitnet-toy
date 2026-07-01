@@ -39,11 +39,7 @@ use crate::block::AttentionHeadVars;
 ///
 /// `head_dim` is each head's inner dimension. Used for the per-head 1/√d_k
 /// scaling and must equal `heads[i].w_q.shape[1]` for every head.
-pub fn attention<'t>(
-    x: Var<'t>,
-    heads: &[AttentionHeadVars<'t>],
-    head_dim: usize,
-) -> Var<'t> {
+pub fn attention<'t>(x: Var<'t>, heads: &[AttentionHeadVars<'t>], head_dim: usize) -> Var<'t> {
     assert!(!heads.is_empty(), "attention requires at least one head");
 
     let scale = 1.0_f32 / (head_dim as f32).sqrt();
@@ -90,10 +86,7 @@ fn head_output<'t>(x_eff: Var<'t>, h: &AttentionHeadVars<'t>, scale: f32) -> Var
     // automatically. causal_mask sets scores[i, j] = -inf for j > i so a
     // query at position i never attends to positions > i; without this, the
     // model can trivially predict target[i] = input[i+1].
-    let scores = q
-        .matmul(k.transpose_2d())
-        .mul_scalar(scale)
-        .causal_mask();
+    let scores = q.matmul(k.transpose_2d()).mul_scalar(scale).causal_mask();
 
     // Per-row softmax over the seq axis -> probabilities over keys.
     // Apply to V to get the per-head context [seq, head_dim].
@@ -103,8 +96,7 @@ fn head_output<'t>(x_eff: Var<'t>, h: &AttentionHeadVars<'t>, scale: f32) -> Var
     // Output projection brings each head's [seq, head_dim] back to
     // [seq, hidden_dim]. Re-quantise the context before W_o so this matmul
     // also runs as a BitLinear.
-    ctx.quantise_acts_ste()
-        .matmul(h.w_o.quantise_weights_ste())
+    ctx.quantise_acts_ste().matmul(h.w_o.quantise_weights_ste())
 }
 
 #[cfg(test)]

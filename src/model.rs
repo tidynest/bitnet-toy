@@ -227,7 +227,7 @@ impl Model {
         // Embed tokens. Position information is added inside attention via
         // RoPE (`autograd::rope`), not here - so the input to the block stack
         // is just the token-embedding lookup, no learned positional add.
-        let mut x = leaves.token_embed.clone().embed(ids);
+        let mut x = leaves.token_embed.embed(ids);
 
         // Stack of transformer blocks.
         for bw in &leaves.blocks {
@@ -242,7 +242,7 @@ impl Model {
         // contribution into `token_embed`'s grad slot, on top of the gather
         // gradient from the embed-lookup path above.
         x.quantise_acts_ste()
-            .matmul(leaves.token_embed.clone().transpose_2d().quantise_weights_ste())
+            .matmul(leaves.token_embed.transpose_2d().quantise_weights_ste())
     }
 
     /// SGD update: `master -= lr · master.grad()`. Reads gradient from each

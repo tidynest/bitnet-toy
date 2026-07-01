@@ -2,6 +2,7 @@
 name = "bitnet-toy"
 version = "0.18.1"
 edition = "2024"
+license = "MIT OR Apache-2.0"
 
 [features]
 # Default build is dependency-free. Opt into the CUDA back-end with

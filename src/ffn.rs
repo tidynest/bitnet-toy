@@ -161,10 +161,8 @@ mod tests {
         // small negative numbers near zero. Mul with up gives a small
         // non-zero gated product, and the down projection turns that into a
         // non-zero output (unlike ReLU which would have killed everything).
-        let neg_gate = Tensor::from_vec(
-            vec![-1.0; hidden_dim * ffn_dim],
-            vec![hidden_dim, ffn_dim],
-        );
+        let neg_gate =
+            Tensor::from_vec(vec![-1.0; hidden_dim * ffn_dim], vec![hidden_dim, ffn_dim]);
         let gate_w = Var::leaf(&tape, neg_gate);
         let up_w = Var::leaf(&tape, make_weight(hidden_dim, ffn_dim, 0.01));
         let down_w = Var::leaf(&tape, make_weight(ffn_dim, hidden_dim, 0.02));

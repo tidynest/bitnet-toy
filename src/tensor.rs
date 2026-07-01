@@ -5,7 +5,7 @@
 //!   so transpose physically copies data. Strides are a perf optimisation to be added at a later
 //!   point.
 //! - f32 throughout. BitNet's master weights are nominally BF16, but f32 is what `std`
-//! gives us for free, and master precision is thrown away at export anyway.
+//!   gives us for free, and master precision is thrown away at export anyway.
 //! - Owned data only (no views, no `Rc`). Sharing arrives in M3 where autograd needs it.
 //!
 //! Parallelism (v0.10): `Tensor::matmul` shards the output rows across threads
@@ -63,10 +63,10 @@ const MATMUL_PARALLEL_THRESHOLD: usize = 256;
 fn matmul_thread_count() -> usize {
     static N: OnceLock<usize> = OnceLock::new();
     *N.get_or_init(|| {
-        if let Ok(s) = std::env::var("BITNET_MATMUL_THREADS") {
-            if let Ok(n) = s.parse::<usize>() {
-                return n.max(1);
-            }
+        if let Ok(s) = std::env::var("BITNET_MATMUL_THREADS")
+            && let Ok(n) = s.parse::<usize>()
+        {
+            return n.max(1);
         }
         1
     })
@@ -91,13 +91,13 @@ enum MatmulSimd {
 
 /// Cached SIMD strategy. Selection rules (highest priority first):
 ///   - `BITNET_MATMUL_SIMD=off | 0 | none | scalar` -> scalar
-///   - `BITNET_MATMUL_SIMD=avx2`                    -> AVX2 even if the CPU
-///                                                     also exposes AVX-512
-///                                                     (lets us A/B the two
-///                                                     SIMD widths without
-///                                                     recompiling)
-///   - default                                      -> highest detected:
-///                                                     AVX-512 -> AVX2 -> scalar
+///   - `BITNET_MATMUL_SIMD=avx2` -> AVX2 even if the CPU
+///     also exposes AVX-512
+///     (lets us A/B the two
+///     SIMD widths without
+///     recompiling)
+///   - default -> highest detected:
+///     AVX-512 -> AVX2 -> scalar
 ///
 /// Reading the env var once via `OnceLock` keeps the hot dispatch branch-free.
 #[allow(clippy::needless_return)]
@@ -574,7 +574,12 @@ impl Tensor {
     /// loop multiplies by `1/denom` rather than dividing because
     /// scalar division is the most expensive primitive on most CPUs.
     pub fn softmax(&self) -> Tensor {
-        assert_eq!(self.ndim(), 2, "softmax: expected rank-2, got rank {}", self.ndim());
+        assert_eq!(
+            self.ndim(),
+            2,
+            "softmax: expected rank-2, got rank {}",
+            self.ndim()
+        );
         let (m, n) = (self.shape[0], self.shape[1]);
         let mut s = vec![0.0_f32; m * n];
         for i in 0..m {
@@ -607,7 +612,12 @@ impl Tensor {
     /// Applied to attention scores before softmax so a query at row `i`
     /// cannot attend to keys at columns `> i`.
     pub fn causal_mask(&self) -> Tensor {
-        assert_eq!(self.ndim(), 2, "causal_mask: expected rank-2, got rank {}", self.ndim());
+        assert_eq!(
+            self.ndim(),
+            2,
+            "causal_mask: expected rank-2, got rank {}",
+            self.ndim()
+        );
         let (m, n) = (self.shape[0], self.shape[1]);
         let mut data = self.data.clone();
         for i in 0..m {
@@ -633,7 +643,12 @@ impl Tensor {
     /// Matches the `Var::softmax` closure (autograd.rs:618-621)
     /// cell-for-cell.
     pub fn softmax_backward(&self, s_out: &Tensor) -> Tensor {
-        assert_eq!(self.ndim(), 2, "softmax_backward: rank-2 only, got rank {}", self.ndim());
+        assert_eq!(
+            self.ndim(),
+            2,
+            "softmax_backward: rank-2 only, got rank {}",
+            self.ndim()
+        );
         assert_eq!(self.shape, s_out.shape, "softmax_backward: shape mismatch");
         let (m, n) = (self.shape[0], self.shape[1]);
         let mut grad_in = vec![0.0_f32; m * n];
@@ -642,8 +657,7 @@ impl Tensor {
                 .map(|k| self.data[i * n + k] * s_out.data[i * n + k])
                 .sum();
             for j in 0..n {
-                grad_in[i * n + j] =
-                    s_out.data[i * n + j] * (self.data[i * n + j] - dot);
+                grad_in[i * n + j] = s_out.data[i * n + j] * (self.data[i * n + j] - dot);
             }
         }
         Tensor {
@@ -659,7 +673,12 @@ impl Tensor {
     /// tensor is needed - the mask pattern is shape-determined.
     /// Matches `Var::causal_mask` (autograd.rs:805-811).
     pub fn causal_mask_backward(&self) -> Tensor {
-        assert_eq!(self.ndim(), 2, "causal_mask_backward: rank-2 only, got rank {}", self.ndim());
+        assert_eq!(
+            self.ndim(),
+            2,
+            "causal_mask_backward: rank-2 only, got rank {}",
+            self.ndim()
+        );
         let (m, n) = (self.shape[0], self.shape[1]);
         let mut grad_in = vec![0.0_f32; m * n];
         for i in 0..m {
@@ -681,14 +700,18 @@ impl Tensor {
     /// trained with the existing CPU forward stay numerically valid
     /// when later evaluated through the trait-based path.
     pub fn rmsnorm(&self) -> Tensor {
-        assert_eq!(self.ndim(), 2, "rmsnorm: rank-2 only, got rank {}", self.ndim());
+        assert_eq!(
+            self.ndim(),
+            2,
+            "rmsnorm: rank-2 only, got rank {}",
+            self.ndim()
+        );
         let (m, n) = (self.shape[0], self.shape[1]);
         let n_f = n as f32;
         const EPS: f32 = 1e-5;
         let mut y = vec![0.0_f32; m * n];
         for i in 0..m {
-            let mean_sq: f32 =
-                (0..n).map(|j| self.data[i * n + j].powi(2)).sum::<f32>() / n_f;
+            let mean_sq: f32 = (0..n).map(|j| self.data[i * n + j].powi(2)).sum::<f32>() / n_f;
             let inv = 1.0_f32 / (mean_sq + EPS).sqrt();
             for j in 0..n {
                 y[i * n + j] = self.data[i * n + j] * inv;
@@ -747,9 +770,18 @@ impl Tensor {
     /// Parameter-free; trig table is recomputed per call (cheap, and
     /// avoids cache state for the inference path).
     pub fn rope(&self) -> Tensor {
-        assert_eq!(self.ndim(), 2, "rope: expected rank-2, got rank {}", self.ndim());
+        assert_eq!(
+            self.ndim(),
+            2,
+            "rope: expected rank-2, got rank {}",
+            self.ndim()
+        );
         let (seq, head_dim) = (self.shape[0], self.shape[1]);
-        assert!(head_dim % 2 == 0, "rope: head_dim ({}) must be even", head_dim);
+        assert!(
+            head_dim % 2 == 0,
+            "rope: head_dim ({}) must be even",
+            head_dim
+        );
         let half = head_dim / 2;
         let mut y = vec![0.0_f32; seq * head_dim];
         for pos in 0..seq {
@@ -779,14 +811,16 @@ impl Tensor {
     /// `Var::rmsnorm` (autograd.rs:702-758) byte-for-byte.
     pub fn rmsnorm_backward(&self, x_saved: &Tensor) -> Tensor {
         assert_eq!(self.ndim(), 2, "rmsnorm_backward: rank-2 only");
-        assert_eq!(self.shape, x_saved.shape, "rmsnorm_backward: shape mismatch");
+        assert_eq!(
+            self.shape, x_saved.shape,
+            "rmsnorm_backward: shape mismatch"
+        );
         let (m, n) = (self.shape[0], self.shape[1]);
         let n_f = n as f32;
         const EPS: f32 = 1e-5;
         let mut grad_in = vec![0.0_f32; m * n];
         for i in 0..m {
-            let mean_sq: f32 =
-                (0..n).map(|j| x_saved.data[i * n + j].powi(2)).sum::<f32>() / n_f;
+            let mean_sq: f32 = (0..n).map(|j| x_saved.data[i * n + j].powi(2)).sum::<f32>() / n_f;
             let inv_rms = 1.0_f32 / (mean_sq + EPS).sqrt();
             let dot: f32 = (0..n)
                 .map(|j| x_saved.data[i * n + j] * self.data[i * n + j])
@@ -868,7 +902,12 @@ impl Tensor {
             for v in &mut softmax[i * vocab..(i + 1) * vocab] {
                 *v *= inv;
             }
-            assert!(targets[i] < vocab, "cross_entropy: target {} >= vocab {}", targets[i], vocab);
+            assert!(
+                targets[i] < vocab,
+                "cross_entropy: target {} >= vocab {}",
+                targets[i],
+                vocab
+            );
             total_loss += -(self.data[i * vocab + targets[i]] - log_denom);
         }
         let loss = total_loss / seq as f32;
@@ -886,10 +925,18 @@ impl Tensor {
     /// Per-cell formula `(softmax - onehot) / seq` matches the
     /// autograd closure (autograd.rs:1093-1106) with `g_scalar = 1`.
     pub fn cross_entropy_backward(&self, targets: &[usize], seq: usize) -> Tensor {
-        assert_eq!(self.ndim(), 2, "cross_entropy_backward: rank-2 softmax required");
+        assert_eq!(
+            self.ndim(),
+            2,
+            "cross_entropy_backward: rank-2 softmax required"
+        );
         let (seq_chk, vocab) = (self.shape[0], self.shape[1]);
         assert_eq!(seq, seq_chk, "cross_entropy_backward: seq mismatch");
-        assert_eq!(targets.len(), seq, "cross_entropy_backward: target len mismatch");
+        assert_eq!(
+            targets.len(),
+            seq,
+            "cross_entropy_backward: target len mismatch"
+        );
         let inv_seq = 1.0_f32 / seq as f32;
         let mut grad = self.data.clone();
         for i in 0..seq {
@@ -1146,10 +1193,8 @@ mod tests {
         let m = 64;
         let k = 128;
         let n = 256;
-        let lhs_data: Vec<f32> =
-            (0..m * k).map(|i| (i as f32 * 0.137).sin()).collect();
-        let rhs_data: Vec<f32> =
-            (0..k * n).map(|i| (i as f32 * 0.041).cos()).collect();
+        let lhs_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.137).sin()).collect();
+        let rhs_data: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.041).cos()).collect();
         let lhs = Tensor::from_vec(lhs_data, vec![m, k]);
         let rhs = Tensor::from_vec(rhs_data, vec![k, n]);
 
@@ -1159,7 +1204,8 @@ mod tests {
             let parallel = lhs.matmul_with_threads(&rhs, threads);
             assert_eq!(
                 parallel.shape, serial.shape,
-                "shape mismatch at threads={}", threads
+                "shape mismatch at threads={}",
+                threads
             );
             assert_eq!(
                 parallel.data, serial.data,
@@ -1216,7 +1262,8 @@ mod tests {
         assert_eq!(result.shape, vec![m, n]);
         for (idx, (&got, &want)) in result.data.iter().zip(&classic).enumerate() {
             assert_eq!(
-                got, want,
+                got,
+                want,
                 "AXPY/SIMD drift at idx {} (i = {}, j = {})",
                 idx,
                 idx / n,
@@ -1340,9 +1387,7 @@ mod tests {
         // up a real divergence (or vice versa). Prime n=23 hits the n % 8 =
         // 7 tail of AVX2 *and* the n % 16 = 7 tail of AVX-512, so both tail
         // paths are exercised in the same call.
-        if !std::is_x86_feature_detected!("avx2")
-            || !std::is_x86_feature_detected!("avx512f")
-        {
+        if !std::is_x86_feature_detected!("avx2") || !std::is_x86_feature_detected!("avx512f") {
             eprintln!("skipping: needs both AVX2 and AVX-512 foundation");
             return;
         }

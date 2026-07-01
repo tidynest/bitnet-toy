@@ -32,7 +32,9 @@
 use std::sync::{Arc, OnceLock};
 
 use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, sys::cublasOperation_t};
-use cudarc::driver::{CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
+use cudarc::driver::{
+    CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
+};
 use cudarc::nvrtc::compile_ptx;
 
 use crate::tensor::Tensor;
@@ -654,11 +656,10 @@ pub struct CudaContextHolder {
 pub fn cuda_state() -> Result<&'static CudaContextHolder, String> {
     static STATE: OnceLock<Result<CudaContextHolder, String>> = OnceLock::new();
     let r = STATE.get_or_init(|| {
-        let ctx = CudaContext::new(0)
-            .map_err(|e| format!("CudaContext::new(0) failed: {e:?}"))?;
+        let ctx = CudaContext::new(0).map_err(|e| format!("CudaContext::new(0) failed: {e:?}"))?;
         let stream = ctx.default_stream();
-        let blas = CudaBlas::new(stream.clone())
-            .map_err(|e| format!("CudaBlas::new failed: {e:?}"))?;
+        let blas =
+            CudaBlas::new(stream.clone()).map_err(|e| format!("CudaBlas::new failed: {e:?}"))?;
 
         // Phase 2.2 production kernel module: one NVRTC compile, six
         // function handles loaded out of the resulting module.
@@ -688,8 +689,7 @@ pub fn cuda_state() -> Result<&'static CudaContextHolder, String> {
         let rope_backward_fn = load("rope_backward_f32")?;
         let cross_entropy_softmax_loss_fn = load("cross_entropy_softmax_loss_f32")?;
         let cross_entropy_backward_fn = load("cross_entropy_backward_f32")?;
-        let quantise_weights_partial_abs_sum_fn =
-            load("quantise_weights_ste_partial_abs_sum_f32")?;
+        let quantise_weights_partial_abs_sum_fn = load("quantise_weights_ste_partial_abs_sum_f32")?;
         let quantise_weights_apply_fn = load("quantise_weights_ste_apply_f32")?;
         let quantise_acts_row_absmax_fn = load("quantise_acts_ste_row_absmax_f32")?;
         let quantise_acts_apply_fn = load("quantise_acts_ste_apply_f32")?;
@@ -819,11 +819,7 @@ impl CudaTensor {
             .expect("alloc_zeros failed");
         const TILE: u32 = 16;
         let cfg = LaunchConfig {
-            grid_dim: (
-                (n_i as u32).div_ceil(TILE),
-                (m_i as u32).div_ceil(TILE),
-                1,
-            ),
+            grid_dim: ((n_i as u32).div_ceil(TILE), (m_i as u32).div_ceil(TILE), 1),
             block_dim: (TILE, TILE, 1),
             shared_mem_bytes: 0,
         };
@@ -870,7 +866,8 @@ impl crate::device::MatMul for CudaTensor {
         assert_eq!(rhs.shape.len(), 2, "rhs must be 2-D, got {:?}", rhs.shape);
         assert_eq!(
             self.shape[1], rhs.shape[0],
-            "shape mismatch: {:?} @ {:?}", self.shape, rhs.shape
+            "shape mismatch: {:?} @ {:?}",
+            self.shape, rhs.shape
         );
         let s = cuda_state().expect("cuda_state failed");
         let m = self.shape[0];
@@ -908,8 +905,7 @@ impl crate::device::MatMul for CudaTensor {
         // adapter described in the doc comment; alloc_zeros above gave us
         // exactly m*n f32 of writable device memory; self.data and
         // rhs.data are owned device slices of size m*k and k*n.
-        unsafe { s.blas.gemm(cfg, &rhs.data, &self.data, &mut out) }
-            .expect("cuBLAS sgemm failed");
+        unsafe { s.blas.gemm(cfg, &rhs.data, &self.data, &mut out) }.expect("cuBLAS sgemm failed");
 
         Self {
             data: out,
@@ -936,7 +932,8 @@ impl crate::device::Add for CudaTensor {
     fn add(&self, rhs: &Self) -> Self {
         assert_eq!(
             self.shape, rhs.shape,
-            "add: shape mismatch: {:?} vs {:?}", self.shape, rhs.shape
+            "add: shape mismatch: {:?} vs {:?}",
+            self.shape, rhs.shape
         );
         let s = cuda_state().expect("cuda_state failed");
         let n = self.data.len();
@@ -956,7 +953,10 @@ impl crate::device::Add for CudaTensor {
         // int) matches the four args; output is sized n; lhs / rhs are
         // both sized n (asserted above).
         unsafe { l.launch(cfg) }.expect("add_f32 launch failed");
-        Self { data: out, shape: self.shape.clone() }
+        Self {
+            data: out,
+            shape: self.shape.clone(),
+        }
     }
 }
 
@@ -979,19 +979,30 @@ impl crate::device::MulScalar for CudaTensor {
         // Safety: signature (const float*, float, float*, int) matches
         // the four args; output sized n; input sized n.
         unsafe { l.launch(cfg) }.expect("mul_scalar_f32 launch failed");
-        Self { data: out, shape: self.shape.clone() }
+        Self {
+            data: out,
+            shape: self.shape.clone(),
+        }
     }
 }
 
 impl crate::device::Transpose2D for CudaTensor {
     fn transpose_2d(&self) -> Self {
-        assert_eq!(self.shape.len(), 2, "transpose_2d: rank-2 only, got {:?}", self.shape);
+        assert_eq!(
+            self.shape.len(),
+            2,
+            "transpose_2d: rank-2 only, got {:?}",
+            self.shape
+        );
         let s = cuda_state().expect("cuda_state failed");
         let r = self.shape[0];
         let c = self.shape[1];
         let r_i = i32::try_from(r).expect("r exceeds i32");
         let c_i = i32::try_from(c).expect("c exceeds i32");
-        let mut out = s.stream.alloc_zeros::<f32>(r * c).expect("alloc_zeros failed");
+        let mut out = s
+            .stream
+            .alloc_zeros::<f32>(r * c)
+            .expect("alloc_zeros failed");
         const TILE: u32 = 16;
         let cfg = LaunchConfig {
             grid_dim: ((r_i as u32).div_ceil(TILE), (c_i as u32).div_ceil(TILE), 1),
@@ -1006,19 +1017,30 @@ impl crate::device::Transpose2D for CudaTensor {
         // Safety: signature (const float*, float*, int, int) matches
         // the four args; input sized r*c; output sized r*c (= c*r).
         unsafe { l.launch(cfg) }.expect("transpose_2d_f32 launch failed");
-        Self { data: out, shape: vec![c, r] }
+        Self {
+            data: out,
+            shape: vec![c, r],
+        }
     }
 }
 
 impl crate::device::CausalMask for CudaTensor {
     fn causal_mask(&self) -> Self {
-        assert_eq!(self.shape.len(), 2, "causal_mask: rank-2 only, got {:?}", self.shape);
+        assert_eq!(
+            self.shape.len(),
+            2,
+            "causal_mask: rank-2 only, got {:?}",
+            self.shape
+        );
         let s = cuda_state().expect("cuda_state failed");
         let m = self.shape[0];
         let n = self.shape[1];
         let m_i = i32::try_from(m).expect("m exceeds i32");
         let n_i = i32::try_from(n).expect("n exceeds i32");
-        let mut out = s.stream.alloc_zeros::<f32>(m * n).expect("alloc_zeros failed");
+        let mut out = s
+            .stream
+            .alloc_zeros::<f32>(m * n)
+            .expect("alloc_zeros failed");
         const TILE: u32 = 16;
         let cfg = LaunchConfig {
             grid_dim: ((n_i as u32).div_ceil(TILE), (m_i as u32).div_ceil(TILE), 1),
@@ -1033,19 +1055,30 @@ impl crate::device::CausalMask for CudaTensor {
         // Safety: signature (const float*, float*, int, int) matches
         // the four args; both buffers sized m*n.
         unsafe { l.launch(cfg) }.expect("causal_mask_f32 launch failed");
-        Self { data: out, shape: vec![m, n] }
+        Self {
+            data: out,
+            shape: vec![m, n],
+        }
     }
 }
 
 impl crate::device::Softmax for CudaTensor {
     fn softmax(&self) -> Self {
-        assert_eq!(self.shape.len(), 2, "softmax: rank-2 only, got {:?}", self.shape);
+        assert_eq!(
+            self.shape.len(),
+            2,
+            "softmax: rank-2 only, got {:?}",
+            self.shape
+        );
         let s = cuda_state().expect("cuda_state failed");
         let m = self.shape[0];
         let n = self.shape[1];
         let m_i = i32::try_from(m).expect("m exceeds i32");
         let n_i = i32::try_from(n).expect("n exceeds i32");
-        let mut out = s.stream.alloc_zeros::<f32>(m * n).expect("alloc_zeros failed");
+        let mut out = s
+            .stream
+            .alloc_zeros::<f32>(m * n)
+            .expect("alloc_zeros failed");
         // One thread per row. 256 rows per block; covers shakespeare
         // configs without needing a multi-thread-per-row reduction.
         let cfg = LaunchConfig {
@@ -1061,7 +1094,10 @@ impl crate::device::Softmax for CudaTensor {
         // Safety: signature (const float*, float*, int, int) matches
         // the four args; both buffers sized m*n.
         unsafe { l.launch(cfg) }.expect("softmax_row_f32 launch failed");
-        Self { data: out, shape: vec![m, n] }
+        Self {
+            data: out,
+            shape: vec![m, n],
+        }
     }
 }
 
@@ -1078,7 +1114,10 @@ impl crate::device::SoftmaxBackward for CudaTensor {
         let n = self.shape[1];
         let m_i = i32::try_from(m).expect("m exceeds i32");
         let n_i = i32::try_from(n).expect("n exceeds i32");
-        let mut out = s.stream.alloc_zeros::<f32>(m * n).expect("alloc_zeros failed");
+        let mut out = s
+            .stream
+            .alloc_zeros::<f32>(m * n)
+            .expect("alloc_zeros failed");
         let cfg = LaunchConfig {
             grid_dim: ((m_i as u32).div_ceil(256), 1, 1),
             block_dim: (256, 1, 1),
@@ -1094,7 +1133,10 @@ impl crate::device::SoftmaxBackward for CudaTensor {
         // float* out, int m, int n) matches the five args; all three
         // buffers sized m*n; output freshly allocated above.
         unsafe { l.launch(cfg) }.expect("softmax_backward_row_f32 launch failed");
-        Self { data: out, shape: vec![m, n] }
+        Self {
+            data: out,
+            shape: vec![m, n],
+        }
     }
 }
 
@@ -1106,7 +1148,10 @@ impl crate::device::CausalMaskBackward for CudaTensor {
         let n = self.shape[1];
         let m_i = i32::try_from(m).expect("m exceeds i32");
         let n_i = i32::try_from(n).expect("n exceeds i32");
-        let mut out = st.stream.alloc_zeros::<f32>(m * n).expect("alloc_zeros failed");
+        let mut out = st
+            .stream
+            .alloc_zeros::<f32>(m * n)
+            .expect("alloc_zeros failed");
         // 16x16 threads per block matches the forward `causal_mask_f32`
         // launch shape. One thread per (i, j) output cell.
         let cfg = LaunchConfig {
@@ -1122,7 +1167,10 @@ impl crate::device::CausalMaskBackward for CudaTensor {
         // Safety: signature (const float* grad_y, float* out, int m,
         // int n) matches the four args; both buffers sized m*n.
         unsafe { l.launch(cfg) }.expect("causal_mask_backward_f32 launch failed");
-        Self { data: out, shape: vec![m, n] }
+        Self {
+            data: out,
+            shape: vec![m, n],
+        }
     }
 }
 
@@ -1144,7 +1192,10 @@ impl crate::device::Silu for CudaTensor {
         // Safety: signature (const float*, float*, int) matches the
         // three args; both buffers sized n.
         unsafe { l.launch(cfg) }.expect("silu_f32 launch failed");
-        Self { data: out, shape: self.shape.clone() }
+        Self {
+            data: out,
+            shape: self.shape.clone(),
+        }
     }
 }
 
@@ -1173,19 +1224,30 @@ impl crate::device::SiluBackward for CudaTensor {
         // float* out, int n) matches the four args; all three buffers
         // sized n; output freshly allocated above.
         unsafe { l.launch(cfg) }.expect("silu_backward_f32 launch failed");
-        Self { data: out, shape: self.shape.clone() }
+        Self {
+            data: out,
+            shape: self.shape.clone(),
+        }
     }
 }
 
 impl crate::device::RmsNorm for CudaTensor {
     fn rmsnorm(&self) -> Self {
-        assert_eq!(self.shape.len(), 2, "rmsnorm: rank-2 only, got {:?}", self.shape);
+        assert_eq!(
+            self.shape.len(),
+            2,
+            "rmsnorm: rank-2 only, got {:?}",
+            self.shape
+        );
         let s = cuda_state().expect("cuda_state failed");
         let m = self.shape[0];
         let n = self.shape[1];
         let m_i = i32::try_from(m).expect("m exceeds i32");
         let n_i = i32::try_from(n).expect("n exceeds i32");
-        let mut out = s.stream.alloc_zeros::<f32>(m * n).expect("alloc_zeros failed");
+        let mut out = s
+            .stream
+            .alloc_zeros::<f32>(m * n)
+            .expect("alloc_zeros failed");
         let cfg = LaunchConfig {
             grid_dim: ((m_i as u32).div_ceil(256), 1, 1),
             block_dim: (256, 1, 1),
@@ -1199,7 +1261,10 @@ impl crate::device::RmsNorm for CudaTensor {
         // Safety: signature (const float*, float*, int, int) matches
         // the four args; both buffers sized m*n.
         unsafe { l.launch(cfg) }.expect("rmsnorm_row_f32 launch failed");
-        Self { data: out, shape: vec![m, n] }
+        Self {
+            data: out,
+            shape: vec![m, n],
+        }
     }
 }
 
@@ -1216,7 +1281,10 @@ impl crate::device::RmsNormBackward for CudaTensor {
         let n = self.shape[1];
         let m_i = i32::try_from(m).expect("m exceeds i32");
         let n_i = i32::try_from(n).expect("n exceeds i32");
-        let mut out = s.stream.alloc_zeros::<f32>(m * n).expect("alloc_zeros failed");
+        let mut out = s
+            .stream
+            .alloc_zeros::<f32>(m * n)
+            .expect("alloc_zeros failed");
         // Same launch shape as forward `rmsnorm_row_f32`: one thread per row.
         let cfg = LaunchConfig {
             grid_dim: ((m_i as u32).div_ceil(256), 1, 1),
@@ -1233,7 +1301,10 @@ impl crate::device::RmsNormBackward for CudaTensor {
         // float* out, int m, int n) matches the five args; all three
         // buffers sized m*n; output freshly allocated above.
         unsafe { l.launch(cfg) }.expect("rmsnorm_backward_row_f32 launch failed");
-        Self { data: out, shape: vec![m, n] }
+        Self {
+            data: out,
+            shape: vec![m, n],
+        }
     }
 }
 
@@ -1241,7 +1312,8 @@ impl crate::device::Mul for CudaTensor {
     fn mul(&self, rhs: &Self) -> Self {
         assert_eq!(
             self.shape, rhs.shape,
-            "mul: shape mismatch: {:?} vs {:?}", self.shape, rhs.shape
+            "mul: shape mismatch: {:?} vs {:?}",
+            self.shape, rhs.shape
         );
         let s = cuda_state().expect("cuda_state failed");
         let n = self.data.len();
@@ -1261,24 +1333,42 @@ impl crate::device::Mul for CudaTensor {
         // matches the four args; output sized n; lhs / rhs both sized n
         // (asserted above).
         unsafe { l.launch(cfg) }.expect("mul_f32 launch failed");
-        Self { data: out, shape: self.shape.clone() }
+        Self {
+            data: out,
+            shape: self.shape.clone(),
+        }
     }
 }
 
 impl crate::device::Rope for CudaTensor {
     fn rope(&self) -> Self {
-        assert_eq!(self.shape.len(), 2, "rope: rank-2 only, got {:?}", self.shape);
+        assert_eq!(
+            self.shape.len(),
+            2,
+            "rope: rank-2 only, got {:?}",
+            self.shape
+        );
         let s = cuda_state().expect("cuda_state failed");
         let seq = self.shape[0];
         let head_dim = self.shape[1];
-        assert!(head_dim % 2 == 0, "rope: head_dim ({head_dim}) must be even");
+        assert!(
+            head_dim % 2 == 0,
+            "rope: head_dim ({head_dim}) must be even"
+        );
         let seq_i = i32::try_from(seq).expect("seq exceeds i32");
         let hd_i = i32::try_from(head_dim).expect("head_dim exceeds i32");
         let half_i = hd_i / 2;
-        let mut out = s.stream.alloc_zeros::<f32>(seq * head_dim).expect("alloc_zeros failed");
+        let mut out = s
+            .stream
+            .alloc_zeros::<f32>(seq * head_dim)
+            .expect("alloc_zeros failed");
         const TILE: u32 = 16;
         let cfg = LaunchConfig {
-            grid_dim: ((half_i as u32).div_ceil(TILE), (seq_i as u32).div_ceil(TILE), 1),
+            grid_dim: (
+                (half_i as u32).div_ceil(TILE),
+                (seq_i as u32).div_ceil(TILE),
+                1,
+            ),
             block_dim: (TILE, TILE, 1),
             shared_mem_bytes: 0,
         };
@@ -1290,7 +1380,10 @@ impl crate::device::Rope for CudaTensor {
         // Safety: signature (const float*, float*, int, int) matches
         // the four args; both buffers sized seq*head_dim.
         unsafe { l.launch(cfg) }.expect("rope_f32 launch failed");
-        Self { data: out, shape: vec![seq, head_dim] }
+        Self {
+            data: out,
+            shape: vec![seq, head_dim],
+        }
     }
 }
 
@@ -1307,12 +1400,19 @@ impl crate::device::RopeBackward for CudaTensor {
         let seq_i = i32::try_from(seq).expect("seq exceeds i32");
         let hd_i = i32::try_from(head_dim).expect("head_dim exceeds i32");
         let half_i = hd_i / 2;
-        let mut out = s.stream.alloc_zeros::<f32>(seq * head_dim).expect("alloc_zeros failed");
+        let mut out = s
+            .stream
+            .alloc_zeros::<f32>(seq * head_dim)
+            .expect("alloc_zeros failed");
         // Same 2-D 16x16 launch shape as forward `rope_f32` - one
         // thread per (pos, pair).
         const TILE: u32 = 16;
         let cfg = LaunchConfig {
-            grid_dim: ((half_i as u32).div_ceil(TILE), (seq_i as u32).div_ceil(TILE), 1),
+            grid_dim: (
+                (half_i as u32).div_ceil(TILE),
+                (seq_i as u32).div_ceil(TILE),
+                1,
+            ),
             block_dim: (TILE, TILE, 1),
             shared_mem_bytes: 0,
         };
@@ -1325,7 +1425,10 @@ impl crate::device::RopeBackward for CudaTensor {
         // int head_dim) matches the four args; both buffers sized
         // seq*head_dim; output freshly allocated above.
         unsafe { l.launch(cfg) }.expect("rope_backward_f32 launch failed");
-        Self { data: out, shape: vec![seq, head_dim] }
+        Self {
+            data: out,
+            shape: vec![seq, head_dim],
+        }
     }
 }
 
@@ -1350,7 +1453,10 @@ impl crate::device::CrossEntropy for CudaTensor {
             .stream
             .clone_htod(&targets_i32)
             .expect("clone_htod targets");
-        let mut softmax = s.stream.alloc_zeros::<f32>(seq * vocab).expect("alloc softmax");
+        let mut softmax = s
+            .stream
+            .alloc_zeros::<f32>(seq * vocab)
+            .expect("alloc softmax");
         let mut per_row_loss = s.stream.alloc_zeros::<f32>(seq).expect("alloc loss");
         let seq_i = i32::try_from(seq).expect("seq exceeds i32");
         let vocab_i = i32::try_from(vocab).expect("vocab exceeds i32");
@@ -1374,7 +1480,10 @@ impl crate::device::CrossEntropy for CudaTensor {
         // Copy per-row losses back and average. seq is small (~64) so
         // this is far cheaper than fighting GPU atomic-add or a second
         // reduction kernel.
-        let losses_host = s.stream.clone_dtoh(&per_row_loss).expect("D->H per_row_loss");
+        let losses_host = s
+            .stream
+            .clone_dtoh(&per_row_loss)
+            .expect("D->H per_row_loss");
         let total: f32 = losses_host.iter().sum();
         let loss = total / seq as f32;
         (
@@ -1389,10 +1498,18 @@ impl crate::device::CrossEntropy for CudaTensor {
 
 impl crate::device::CrossEntropyBackward for CudaTensor {
     fn cross_entropy_backward(&self, targets: &[usize], seq: usize) -> Self {
-        assert_eq!(self.shape.len(), 2, "cross_entropy_backward: rank-2 softmax");
+        assert_eq!(
+            self.shape.len(),
+            2,
+            "cross_entropy_backward: rank-2 softmax"
+        );
         assert_eq!(seq, self.shape[0], "cross_entropy_backward: seq mismatch");
         let vocab = self.shape[1];
-        assert_eq!(targets.len(), seq, "cross_entropy_backward: target len mismatch");
+        assert_eq!(
+            targets.len(),
+            seq,
+            "cross_entropy_backward: target len mismatch"
+        );
         let s = cuda_state().expect("cuda_state failed");
         let targets_i32: Vec<i32> = targets
             .iter()
@@ -1410,7 +1527,11 @@ impl crate::device::CrossEntropyBackward for CudaTensor {
         let vocab_i = i32::try_from(vocab).expect("vocab exceeds i32");
         // 2-D 16x16 launch: one thread per (row, col).
         let cfg = LaunchConfig {
-            grid_dim: ((vocab_i as u32).div_ceil(16), (seq_i as u32).div_ceil(16), 1),
+            grid_dim: (
+                (vocab_i as u32).div_ceil(16),
+                (seq_i as u32).div_ceil(16),
+                1,
+            ),
             block_dim: (16, 16, 1),
             shared_mem_bytes: 0,
         };
@@ -1424,7 +1545,10 @@ impl crate::device::CrossEntropyBackward for CudaTensor {
         // targets, float* grad_logits, int seq, int vocab) matches;
         // both float buffers sized seq*vocab.
         unsafe { l.launch(cfg) }.expect("cross_entropy_backward_f32 launch");
-        Self { data: out, shape: vec![seq, vocab] }
+        Self {
+            data: out,
+            shape: vec![seq, vocab],
+        }
     }
 }
 
@@ -1444,7 +1568,9 @@ impl crate::device::QuantiseWeightsSTE for CudaTensor {
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        let mut l1 = s.stream.launch_builder(&s.quantise_weights_partial_abs_sum_fn);
+        let mut l1 = s
+            .stream
+            .launch_builder(&s.quantise_weights_partial_abs_sum_fn);
         l1.arg(&self.data);
         l1.arg(&mut row_abs_sum);
         l1.arg(&m_i);
@@ -1464,7 +1590,10 @@ impl crate::device::QuantiseWeightsSTE for CudaTensor {
         l2.arg(&m_i);
         l2.arg(&n_i);
         unsafe { l2.launch(cfg_cells) }.expect("quantise_weights_apply launch");
-        Self { data: out, shape: vec![m, n] }
+        Self {
+            data: out,
+            shape: vec![m, n],
+        }
     }
 }
 
@@ -1501,7 +1630,10 @@ impl crate::device::QuantiseActsSTE for CudaTensor {
         l2.arg(&m_i);
         l2.arg(&n_i);
         unsafe { l2.launch(cfg_cells) }.expect("quantise_acts_apply launch");
-        Self { data: out, shape: vec![m, n] }
+        Self {
+            data: out,
+            shape: vec![m, n],
+        }
     }
 }
 
@@ -1544,11 +1676,22 @@ impl crate::device::BitLinear for CudaTensor {
         use cudarc::driver::{DevicePtr, DevicePtrMut};
         use std::ffi::c_void;
 
-        assert_eq!(self.shape.len(), 2, "bit_linear lhs must be 2-D, got {:?}", self.shape);
-        assert_eq!(rhs.shape.len(), 2, "bit_linear rhs must be 2-D, got {:?}", rhs.shape);
+        assert_eq!(
+            self.shape.len(),
+            2,
+            "bit_linear lhs must be 2-D, got {:?}",
+            self.shape
+        );
+        assert_eq!(
+            rhs.shape.len(),
+            2,
+            "bit_linear rhs must be 2-D, got {:?}",
+            rhs.shape
+        );
         assert_eq!(
             self.shape[1], rhs.shape[0],
-            "bit_linear shape mismatch: {:?} @ {:?}", self.shape, rhs.shape
+            "bit_linear shape mismatch: {:?} @ {:?}",
+            self.shape, rhs.shape
         );
         let st = cuda_state().expect("cuda_state failed");
         let m = self.shape[0];
@@ -1601,14 +1744,19 @@ impl crate::device::BitLinear for CudaTensor {
 
         // ---- Stage 2: quantise rhs (weights) to INT8 + gamma scalar. ----
         let mut gamma = st.stream.alloc_zeros::<f32>(1).expect("alloc gamma");
-        let mut w_row_abs_sum = st.stream.alloc_zeros::<f32>(k).expect("alloc w_row_abs_sum");
+        let mut w_row_abs_sum = st
+            .stream
+            .alloc_zeros::<f32>(k)
+            .expect("alloc w_row_abs_sum");
         let mut w_q = st.stream.alloc_zeros::<i8>(k * n).expect("alloc w_q");
         let cfg_w_rows = LaunchConfig {
             grid_dim: ((k_i as u32).div_ceil(256), 1, 1),
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        let mut l = st.stream.launch_builder(&st.quantise_weights_partial_abs_sum_fn);
+        let mut l = st
+            .stream
+            .launch_builder(&st.quantise_weights_partial_abs_sum_fn);
         l.arg(&rhs.data);
         l.arg(&mut w_row_abs_sum);
         l.arg(&k_i);
@@ -1683,7 +1831,10 @@ impl crate::device::BitLinear for CudaTensor {
         l.arg(&n_i);
         unsafe { l.launch(cfg_scale) }.expect("scale_int32_to_f32 launch");
 
-        Self { data: out, shape: vec![m, n] }
+        Self {
+            data: out,
+            shape: vec![m, n],
+        }
     }
 }
 
@@ -1847,8 +1998,9 @@ impl CudaModel {
         target_ids: &[usize],
     ) -> (Vec<Tensor>, f32) {
         use crate::device::{
-            BlockSaved, MatMul, RmsNorm, RmsNormBackward, Transpose2D, block_forward_save,
-            block_backward, cross_entropy_backward, cross_entropy_forward_save, matmul_backward,
+            BlockSaved, MatMul, RmsNorm, RmsNormBackward, Transpose2D, block_backward,
+            block_forward_save, cross_entropy_backward, cross_entropy_forward_save,
+            matmul_backward,
         };
         assert_eq!(
             input_ids.len(),
@@ -1910,8 +2062,10 @@ impl CudaModel {
         // grad through the transpose: [hidden, vocab] -> [vocab, hidden].
         // This is the LM-head's contribution to the tied token_embed grad;
         // it gets summed into the embed-gather contribution further down.
-        let grad_token_embed_from_lm =
-            grad_lm_head_w.transpose_2d().to_cpu().expect("D->H grad_lm");
+        let grad_token_embed_from_lm = grad_lm_head_w
+            .transpose_2d()
+            .to_cpu()
+            .expect("D->H grad_lm");
         // pre_lm_head = rmsnorm(final_x)
         let grad_final_x = grad_pre_lm_head.rmsnorm_backward(final_x);
 
@@ -2036,9 +2190,8 @@ impl CudaModel {
         let mut block_saveds: Vec<BlockSaved<CudaTensor>> = Vec::with_capacity(n_blocks);
         block_inputs.push(x_post_embed);
         for (i, block) in self.blocks.iter().enumerate() {
-            let (out, saved) = block_forward_save_bitnet(
-                &block_inputs[i], &block.heads, &block.ffn, head_dim,
-            );
+            let (out, saved) =
+                block_forward_save_bitnet(&block_inputs[i], &block.heads, &block.ffn, head_dim);
             block_saveds.push(saved);
             block_inputs.push(out);
         }
@@ -2063,8 +2216,10 @@ impl CudaModel {
         // Tied-embedding gradient contribution: transpose [hidden, vocab]
         // -> [vocab, hidden], pulled to host so we can sum it into the
         // embed-gather gradient below.
-        let grad_token_embed_from_lm =
-            grad_lm_head_w.transpose_2d().to_cpu().expect("D->H grad_lm");
+        let grad_token_embed_from_lm = grad_lm_head_w
+            .transpose_2d()
+            .to_cpu()
+            .expect("D->H grad_lm");
         let grad_final_x = grad_pre_lm_head.rmsnorm_backward(final_x);
 
         let mut grad_x = grad_final_x;
@@ -2257,10 +2412,10 @@ mod tests {
         let rhs_data: Vec<f32> = (0..k * n)
             .map(|i| (i as f32 * 0.0259).cos() * 0.1)
             .collect();
-        let lhs = CudaTensor::from_cpu(&Tensor::from_vec(lhs_data, vec![m, k]))
-            .expect("H->D failed");
-        let rhs = CudaTensor::from_cpu(&Tensor::from_vec(rhs_data, vec![k, n]))
-            .expect("H->D failed");
+        let lhs =
+            CudaTensor::from_cpu(&Tensor::from_vec(lhs_data, vec![m, k])).expect("H->D failed");
+        let rhs =
+            CudaTensor::from_cpu(&Tensor::from_vec(rhs_data, vec![k, n])).expect("H->D failed");
 
         let cublas_out = lhs.matmul(&rhs).to_cpu().unwrap();
         let nvrtc_out = lhs.matmul_nvrtc(&rhs).to_cpu().unwrap();
@@ -2452,11 +2607,7 @@ mod tests {
         // head_dim must be even. Use realistic v0.13 attention shape.
         let a = random_tensor(64, 16, 0.6);
         let cpu = <Tensor as Rope>::rope(&a);
-        let gpu = CudaTensor::from_cpu(&a)
-            .unwrap()
-            .rope()
-            .to_cpu()
-            .unwrap();
+        let gpu = CudaTensor::from_cpu(&a).unwrap().rope().to_cpu().unwrap();
         // RoPE uses transcendentals (cos/sin/pow); GPU + CPU may use
         // slightly different math implementations. Slightly looser
         // tolerance than the elementwise-arithmetic ops.
@@ -2477,11 +2628,7 @@ mod tests {
         }
         let a = random_tensor(13, 19, 0.7);
         let cpu = <Tensor as Silu>::silu(&a);
-        let gpu = CudaTensor::from_cpu(&a)
-            .unwrap()
-            .silu()
-            .to_cpu()
-            .unwrap();
+        let gpu = CudaTensor::from_cpu(&a).unwrap().silu().to_cpu().unwrap();
         assert_close(&gpu, &cpu);
     }
 
@@ -2692,10 +2839,9 @@ mod tests {
             w_up: CudaTensor::from_cpu(&cpu_ffn.w_up).unwrap(),
             w_down: CudaTensor::from_cpu(&cpu_ffn.w_down).unwrap(),
         };
-        let gpu_out =
-            block_inference::<CudaTensor>(&x_gpu, &gpu_heads, &gpu_ffn, head_dim)
-                .to_cpu()
-                .unwrap();
+        let gpu_out = block_inference::<CudaTensor>(&x_gpu, &gpu_heads, &gpu_ffn, head_dim)
+            .to_cpu()
+            .unwrap();
 
         assert_eq!(cpu_out.shape, gpu_out.shape, "block output shape mismatch");
         // The block chains rmsnorm -> attention -> add -> rmsnorm ->
@@ -2786,7 +2932,10 @@ mod tests {
                 .to_cpu()
                 .unwrap();
 
-        assert_eq!(cpu_out.shape, gpu_out.shape, "attention output shape mismatch");
+        assert_eq!(
+            cpu_out.shape, gpu_out.shape,
+            "attention output shape mismatch"
+        );
         // Tolerance widened slightly because the chain accumulates
         // drift across 5 matmuls + softmax + RoPE; per-op tolerance is
         // 1e-4 + 1e-4*|val| but the chained product needs ~1e-3.
@@ -2881,9 +3030,7 @@ mod tests {
         let x_data: Vec<f32> = (0..m * k)
             .map(|i| (i as f32 * 0.041).sin() * 0.5 + 0.1)
             .collect();
-        let w_data: Vec<f32> = (0..k * n)
-            .map(|i| (i as f32 * 0.073).cos() * 0.4)
-            .collect();
+        let w_data: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.073).cos() * 0.4).collect();
         let x_cpu = Tensor::from_vec(x_data.clone(), vec![m, k]);
         let w_cpu = Tensor::from_vec(w_data.clone(), vec![k, n]);
         let x_gpu = CudaTensor::from_cpu(&x_cpu).expect("H->D x");
