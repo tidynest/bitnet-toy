@@ -29,12 +29,13 @@
 //!
 //! SIMD (v0.17): a third path is layered on top - AVX-512 foundation
 //! (`avx512f`, 16 f32 per inner-loop step via `_mm512_mul_ps` +
-//! `_mm512_add_ps`) for Zen 4 / Sapphire Rapids and later. Detection is
-//! cached once via `OnceLock`; the dispatcher picks the widest available
-//! path (AVX-512 -> AVX2 -> scalar). Export `BITNET_MATMUL_SIMD=avx2` to
-//! force the AVX2 path even on AVX-512 hardware (useful for A/B timing),
-//! or `BITNET_MATMUL_SIMD=off` (also `0 | none | scalar`) to force the
-//! scalar path. All three paths produce byte-identical output per cell.
+//! `_mm512_add_ps`) for Sapphire Rapids and later. Detection is cached once
+//! via `OnceLock`; the dispatcher picks the widest path that actually wins.
+//! (v0.19): on Zen 4 (CPUID family `0x19`) AVX-512 is double-pumped and ~9%
+//! slower on this bandwidth-bound matmul, so the dispatcher auto-selects AVX2
+//! there. Export `BITNET_MATMUL_SIMD=avx512` to force AVX-512 back on (A/B
+//! timing), `=avx2` to force AVX2 anywhere, or `=off` (also `0 | none |
+//! scalar`) to force the scalar path. All paths are byte-identical per cell.
 
 use std::sync::OnceLock;
 
@@ -91,15 +92,16 @@ enum MatmulSimd {
 
 /// Cached SIMD strategy. Selection rules (highest priority first):
 ///   - `BITNET_MATMUL_SIMD=off | 0 | none | scalar` -> scalar
-///   - `BITNET_MATMUL_SIMD=avx2` -> AVX2 even if the CPU
-///     also exposes AVX-512
-///     (lets us A/B the two
-///     SIMD widths without
+///   - `BITNET_MATMUL_SIMD=avx2` -> AVX2 even if AVX-512 is present
+///   - `BITNET_MATMUL_SIMD=avx512` -> AVX-512 if present, overriding the
+///     Zen 4 auto-demotion below (lets us A/B the two widths without
 ///     recompiling)
-///   - default -> highest detected:
-///     AVX-512 -> AVX2 -> scalar
+///   - default -> widest that actually wins: AVX-512, except on Zen 4 where
+///     its double-pumped 512-bit path is ~9% slower on this bandwidth-bound
+///     matmul so AVX2 is picked instead; then AVX2 -> scalar
 ///
-/// Reading the env var once via `OnceLock` keeps the hot dispatch branch-free.
+/// Reading the env var (and CPUID) once via `OnceLock` keeps the hot dispatch
+/// branch-free.
 #[allow(clippy::needless_return)]
 fn matmul_simd_mode() -> MatmulSimd {
     static M: OnceLock<MatmulSimd> = OnceLock::new();
@@ -111,19 +113,59 @@ fn matmul_simd_mode() -> MatmulSimd {
             return MatmulSimd::Scalar;
         }
         let force_avx2 = matches!(env.as_deref(), Some("avx2"));
+        let force_avx512 = matches!(env.as_deref(), Some("avx512" | "avx-512"));
         #[cfg(target_arch = "x86_64")]
         {
-            if !force_avx2 && std::is_x86_feature_detected!("avx512f") {
+            // AVX-512 is the widest path but not always the fastest: on Zen 4
+            // it is double-pumped and this matmul is memory-bandwidth bound, so
+            // it measured ~9% slower than AVX2. Auto-demote there unless the
+            // caller explicitly forces AVX-512 for A/B timing.
+            let avx512_preferred = force_avx512 || !is_zen4();
+            if !force_avx2 && avx512_preferred && std::is_x86_feature_detected!("avx512f") {
                 return MatmulSimd::Avx512;
             }
             if std::is_x86_feature_detected!("avx2") {
                 return MatmulSimd::Avx2;
             }
         }
-        // Avoid unused-variable warning when target_arch != x86_64.
-        let _ = force_avx2;
+        // Avoid unused-variable warnings when target_arch != x86_64.
+        let _ = (force_avx2, force_avx512);
         MatmulSimd::Scalar
     })
+}
+
+/// True on AMD Zen 4 (CPU family `0x19`), whose 512-bit AVX ops are double-
+/// pumped; on this bandwidth-bound matmul that makes the AVX-512 kernel ~9%
+/// slower than AVX2 (measured v0.17 on a Ryzen 9 7940HS). Zen 5 (family `0x1A`)
+/// has a native full-width datapath and is faster at AVX-512, so it is
+/// deliberately excluded.
+///
+/// `std` exposes CPU *features* but not vendor/family, so we read CPUID leaf 0
+/// for the vendor string and leaf 1 for the family field directly.
+#[cfg(target_arch = "x86_64")]
+fn is_zen4() -> bool {
+    use std::arch::x86_64::__cpuid;
+    // Leaves 0 and 1 are architectural on every x86_64 CPU, so `__cpuid` is safe.
+    let vendor = __cpuid(0);
+    // "AuthenticAMD" is packed into EBX, EDX, ECX in that order.
+    let is_amd = vendor.ebx == 0x6874_7541 // "Auth"
+        && vendor.edx == 0x6974_6e65 // "enti"
+        && vendor.ecx == 0x444d_4163; // "cAMD"
+    is_amd && decode_family(__cpuid(1).eax) == 0x19
+}
+
+/// Decode the effective CPU family from CPUID leaf 1 EAX. The 4-bit base family
+/// is bits [11:8]; when it is `0xF` the 8-bit extended family in bits [27:20]
+/// is added (AMD Zen reports base `0xF` + ext `0x0A` = `0x19`). Split out as a
+/// pure function so the bit math is unit-testable without the target hardware.
+#[cfg(target_arch = "x86_64")]
+fn decode_family(eax: u32) -> u32 {
+    let base = (eax >> 8) & 0xf;
+    if base == 0xf {
+        base + ((eax >> 20) & 0xff)
+    } else {
+        base
+    }
 }
 
 /// Compute `out += lhs @ rhs` (m,k) @ (k,n) -> (m,n) via the AXPY-ordered
@@ -1116,6 +1158,23 @@ impl crate::device::RmsNorm for Tensor {
 // Entire module compiled out of release / `cargo run` build; only `cargo test` sees it
 mod tests {
     use super::*; // pulls `Tensor` into the test module's scope
+
+    /// Decode the effective CPU family from representative CPUID leaf-1 EAX
+    /// values. Machine-independent: exercises the base/extended-family math
+    /// `is_zen4` relies on without needing the actual silicon.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn decode_family_matches_known_cpuid_values() {
+        // AMD Zen 4: base 0xF + ext 0x0A -> 0x19 (this EAX also decodes to
+        // model 0x74, i.e. a Phoenix 7940HS).
+        assert_eq!(decode_family(0x00A7_0F40), 0x19);
+        // AMD Zen 5: ext 0x0B -> 0x1A, must NOT read as Zen 4.
+        assert_eq!(decode_family(0x00B0_0F00), 0x1A);
+        // AMD Zen / Zen+: ext 0x08 -> 0x17.
+        assert_eq!(decode_family(0x0080_0F11), 0x17);
+        // Intel Skylake: base family 6, no extended-family addend.
+        assert_eq!(decode_family(0x0009_06ED), 0x06);
+    }
 
     #[test]
     fn from_vec_enforces_shape() {

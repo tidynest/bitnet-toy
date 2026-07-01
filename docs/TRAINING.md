@@ -1,7 +1,7 @@
 # Training Guide
 
 ![docs](https://img.shields.io/badge/docs-training-3b6ea5)
-![version](https://img.shields.io/badge/version-v0.18.1-3b6ea5)
+![version](https://img.shields.io/badge/version-v0.19.0-3b6ea5)
 
 How to train, what to expect, what to watch for, and what knobs to turn.
 
@@ -286,18 +286,24 @@ picks the widest path the CPU exposes:
 
 | Path     | Lanes | Detection                     |
 |----------|-------|-------------------------------|
-| AVX-512  |    16 | `is_x86_feature_detected!("avx512f")` (Zen 4, Sapphire Rapids onwards) |
+| AVX-512  |    16 | `is_x86_feature_detected!("avx512f")` (Sapphire Rapids onwards; **not** Zen 4 by default — see below) |
 | AVX2     |     8 | `is_x86_feature_detected!("avx2")` (everything since ~2013)            |
 | Scalar   |     1 | always                                                                 |
 
 All three paths produce **byte-identical** output per cell because
 per-cell accumulation order (`kk = 0..k`) is unchanged and none of them
 uses fused multiply-add. The dispatcher itself reads
-`BITNET_MATMUL_SIMD` once, caches the result in a `OnceLock`, and stays
-branch-free for the rest of the process.
+`BITNET_MATMUL_SIMD` (and CPUID) once, caches the result in a
+`OnceLock`, and stays branch-free for the rest of the process.
+
+Since v0.19 the dispatcher makes one exception to *widest-wins*: on Zen 4
+(CPUID family `0x19`), where AVX-512 is double-pumped and ~9% slower on
+this bandwidth-bound matmul (see below), it auto-selects AVX2. Zen 5
+(family `0x1A`) has a native full-width datapath and keeps AVX-512.
 
 ```sh
-cargo run --release -- shakespeare                              # widest available (AVX-512 on Zen 4)
+cargo run --release -- shakespeare                              # widest that wins (AVX2 on Zen 4, AVX-512 elsewhere)
+BITNET_MATMUL_SIMD=avx512 cargo run --release -- shakespeare    # force AVX-512 even on Zen 4 (A/B timing)
 BITNET_MATMUL_SIMD=avx2 cargo run --release -- shakespeare      # force AVX2 even on AVX-512 hardware
 BITNET_MATMUL_SIMD=off  cargo run --release -- shakespeare      # force scalar (also: 0 | none | scalar)
 ```
@@ -346,9 +352,9 @@ The plausible interpretations:
 On Intel Sapphire Rapids and later the 512-bit units are native
 (not double-pumped) and the speedup over AVX2 should be larger
 there - re-run on that hardware before making conclusions about
-the AVX-512 path's general value. For now on Zen 4 the
-`BITNET_MATMUL_SIMD=avx2` override is worth using for production
-training runs.
+the AVX-512 path's general value. On Zen 4 the dispatcher now selects
+AVX2 automatically (since v0.19, via a CPUID family `0x19` check); pass
+`BITNET_MATMUL_SIMD=avx512` to opt back in for benchmarking.
 
 To benchmark locally:
 

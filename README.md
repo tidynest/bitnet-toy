@@ -1,8 +1,8 @@
 # bitnet-toy
 
-![version](https://img.shields.io/badge/version-v0.18.1-3b6ea5)
+![version](https://img.shields.io/badge/version-v0.19.0-3b6ea5)
 ![Rust](https://img.shields.io/badge/Rust-2024%20edition-ce412b?logo=rust&logoColor=white)
-![tests](https://img.shields.io/badge/tests-139%20passing-3f9142)
+![tests](https://img.shields.io/badge/tests-140%20passing-3f9142)
 ![CUDA](https://img.shields.io/badge/CUDA-optional%20(cudarc%200.19)-76b900?logo=nvidia&logoColor=white)
 ![ML dependencies](https://img.shields.io/badge/ML%20dependencies-none-3f9142)
 
@@ -28,7 +28,7 @@ inference, binary export. No third-party ML dependencies.
 
 ## Status
 
-- **139** tests passing on `cargo test`; **171** with `cargo test --features cuda`.
+- **140** tests passing on `cargo test`; **172** with `cargo test --features cuda`.
 - **0** warnings on `cargo build --release` (or `--features cuda`).
 - `cargo audit` clean for the default build (stdlib-only); the optional
   `cuda` feature pulls `cudarc` and its small dynamic-loading deps.
@@ -201,13 +201,15 @@ This is a learning project, not a production library:
 - Pure Rust, no third-party ML dependencies (only `std`).
 - f32 throughout; no BF16 or FP16.
 - SIMD inside `Tensor::matmul` on x86_64, runtime-detected, widest path
-  first: AVX-512 foundation (16 f32 per inner-loop step) on Zen 4 /
+  that actually wins: AVX-512 foundation (16 f32 per inner-loop step) on
   Sapphire Rapids and later, falling back to AVX2 (8 f32) and then to a
   scalar AXPY. All three are bit-identical per output cell because none
   use FMA. Multi-threaded across output rows via `std::thread::scope`.
-  Empirical note: AVX-512 underperforms AVX2 on Zen 4
-  (memory-bandwidth bound); export `BITNET_MATMUL_SIMD=avx2` to opt
-  out of AVX-512 there.
+  On Zen 4 (CPUID family `0x19`) AVX-512 is double-pumped and
+  memory-bandwidth bound, so it runs ~9% slower than AVX2; the dispatcher
+  detects Zen 4 and auto-selects AVX2 there. Overrides:
+  `BITNET_MATMUL_SIMD=avx512` forces AVX-512 back on (for A/B timing),
+  `=avx2` forces AVX2 anywhere, `=off` forces scalar.
 - Optional CUDA back-end (`--features cuda`) via `cudarc 0.19`. Phase
   1: cuBLAS sgemm matmul + 9 hand-rolled NVRTC kernels for the rest
   of the op set (add, mul, mul_scalar, transpose_2d, causal_mask,
@@ -246,8 +248,8 @@ Milestones, in priority order:
    overhead currently makes the GPU slower than the CPU despite correct ternary
    int8 GEMM; reuse device buffers, fuse the quant kernels, capture the step as
    a CUDA graph, then benchmark at scale.
-2. **CPU SIMD & threading** — Zen 4 AVX2 auto-select, an ARM64 NEON path, and a
-   persistent thread pool.
+2. **CPU SIMD & threading** — an ARM64 NEON path and a persistent thread pool
+   (Zen 4 AVX2 auto-select landed in v0.19).
 3. **CLI ergonomics** — train arbitrary corpora with overridable hyperparameters
    from the command line.
 
