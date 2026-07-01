@@ -1,29 +1,17 @@
 # cargo-deny policy for the rust-sec-ci pre-push gate (`cargo deny check`).
 #
 # The default build is dependency-free, so the only crate in the graph is
-# bitnet-toy itself (dual-licensed MIT OR Apache-2.0). The allow-list below is
-# the project's curated permissive set, kept in sync with the sibling Rust
-# repos; it also covers the licenses pulled in by the optional `cuda` feature
-# (cudarc + transitive deps), which the gate does not check by default.
+# bitnet-toy itself, dual-licensed MIT OR Apache-2.0. The allow-list is trimmed
+# to exactly those two so cargo-deny emits no `license-not-encountered` noise.
+# If the optional `cuda` feature (cudarc + transitive deps) ever needs to be
+# gate-checked, add the licenses it introduces here.
 #
 # advisories / bans / sources pass on cargo-deny's defaults for this crate, so
 # only the licenses policy is specified here.
 
 [licenses]
 allow = [
-    "0BSD",
     "Apache-2.0",
-    "Apache-2.0 WITH LLVM-exception",
-    "BSD-2-Clause",
-    "BSD-3-Clause",
-    "BSL-1.0",
-    "CC0-1.0",
-    "CDLA-Permissive-2.0",
-    "ISC",
     "MIT",
-    "MIT-0",
-    "MPL-2.0",
-    "Unicode-3.0",
-    "Zlib",
 ]
 confidence-threshold = 0.8
