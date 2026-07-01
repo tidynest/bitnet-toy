@@ -1,7 +1,7 @@
 # Architecture
 
 ![docs](https://img.shields.io/badge/docs-architecture-3b6ea5)
-![version](https://img.shields.io/badge/version-v0.18.1-3b6ea5)
+![version](https://img.shields.io/badge/version-v0.19.0-3b6ea5)
 
 How the modules compose, top-down.
 
