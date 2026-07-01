@@ -1,0 +1,17 @@
+# cargo-deny policy for the rust-sec-ci pre-push gate (`cargo deny check`).
+#
+# The default build is dependency-free, so the only crate in the graph is
+# bitnet-toy itself, dual-licensed MIT OR Apache-2.0. The allow-list is trimmed
+# to exactly those two so cargo-deny emits no `license-not-encountered` noise.
+# If the optional `cuda` feature (cudarc + transitive deps) ever needs to be
+# gate-checked, add the licenses it introduces here.
+#
+# advisories / bans / sources pass on cargo-deny's defaults for this crate, so
+# only the licenses policy is specified here.
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "MIT",
+]
+confidence-threshold = 0.8

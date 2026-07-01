@@ -255,10 +255,7 @@ pub trait CrossEntropyBackward {
 /// follow the chunk-4.x naming convention so call sites read like the
 /// rest of Phase 4.
 #[allow(dead_code)]
-pub fn cross_entropy_forward_save<T: CrossEntropy>(
-    logits: &T,
-    targets: &[usize],
-) -> (f32, T) {
+pub fn cross_entropy_forward_save<T: CrossEntropy>(logits: &T, targets: &[usize]) -> (f32, T) {
     logits.cross_entropy_forward_save(targets)
 }
 
@@ -304,13 +301,20 @@ pub fn multi_head_attention_inference<T>(x: &T, heads: &[HeadWeights<T>], head_d
 where
     T: MatMul + Add + MulScalar + Transpose2D + Softmax + CausalMask + Rope,
 {
-    assert!(!heads.is_empty(), "multi_head_attention requires at least one head");
+    assert!(
+        !heads.is_empty(),
+        "multi_head_attention requires at least one head"
+    );
     let mut combined = attention_head_inference(
-        x, &heads[0].w_q, &heads[0].w_k, &heads[0].w_v, &heads[0].w_o, head_dim,
+        x,
+        &heads[0].w_q,
+        &heads[0].w_k,
+        &heads[0].w_v,
+        &heads[0].w_o,
+        head_dim,
     );
     for h in &heads[1..] {
-        let head_out =
-            attention_head_inference(x, &h.w_q, &h.w_k, &h.w_v, &h.w_o, head_dim);
+        let head_out = attention_head_inference(x, &h.w_q, &h.w_k, &h.w_v, &h.w_o, head_dim);
         combined = combined.add(&head_out);
     }
     combined
@@ -332,16 +336,7 @@ pub fn block_inference<T>(
     head_dim: usize,
 ) -> T
 where
-    T: MatMul
-        + Add
-        + MulScalar
-        + Transpose2D
-        + Softmax
-        + CausalMask
-        + Rope
-        + RmsNorm
-        + Silu
-        + Mul,
+    T: MatMul + Add + MulScalar + Transpose2D + Softmax + CausalMask + Rope + RmsNorm + Silu + Mul,
 {
     let attn_out = multi_head_attention_inference(&x.rmsnorm(), heads, head_dim);
     let x1 = x.add(&attn_out);
@@ -378,6 +373,7 @@ where
 /// - `up` is needed for `mul_backward(grad_h, gate, up)`.
 /// - `h = gate * up` is needed for `matmul_backward(grad_y, h,
 ///   w_down)`.
+///
 /// All four are owned f32 tensors on whichever backend ran the
 /// forward; the CPU `Clone` derive cost is trivial, the CUDA `Clone`
 /// path is never invoked because forward `move`s the intermediates
@@ -416,7 +412,15 @@ where
     let up = x.matmul(w_up);
     let h = gate.mul(&up);
     let out = h.matmul(w_down);
-    (out, FfnSaved { gate_pre, gate, up, h })
+    (
+        out,
+        FfnSaved {
+            gate_pre,
+            gate,
+            up,
+            h,
+        },
+    )
 }
 
 /// Backward pass through the SwiGLU FFN, hand-traced from the forward
@@ -558,10 +562,15 @@ where
     }
     let x1 = x.add(&y1);
     let y2_pre = x1.rmsnorm();
-    let (y2, ffn_saved) =
-        ffn_forward_save(&y2_pre, &ffn.w_gate, &ffn.w_up, &ffn.w_down);
+    let (y2, ffn_saved) = ffn_forward_save(&y2_pre, &ffn.w_gate, &ffn.w_up, &ffn.w_down);
     let out = x1.add(&y2);
-    let saved = BlockSaved { y1_pre, x1, y2_pre, head_saveds, ffn_saved };
+    let saved = BlockSaved {
+        y1_pre,
+        x1,
+        y2_pre,
+        head_saveds,
+        ffn_saved,
+    };
     (out, saved)
 }
 
@@ -770,7 +779,13 @@ where
     // k_pre = bit_linear(x, w_k)
     let (grad_x_k, grad_w_k) = bit_linear_backward(&grad_k_pre, x, w_k);
     let grad_x = grad_x_q.add(&grad_x_k).add(&grad_x_v);
-    AttentionHeadGrads { grad_x, grad_w_q, grad_w_k, grad_w_v, grad_w_o }
+    AttentionHeadGrads {
+        grad_x,
+        grad_w_q,
+        grad_w_k,
+        grad_w_v,
+        grad_w_o,
+    }
 }
 
 /// Phase 5.a: BitNet SwiGLU FFN forward+save. Same math as
@@ -790,7 +805,15 @@ where
     let up = x.bit_linear(w_up);
     let h = gate.mul(&up);
     let out = h.bit_linear(w_down);
-    (out, FfnSaved { gate_pre, gate, up, h })
+    (
+        out,
+        FfnSaved {
+            gate_pre,
+            gate,
+            up,
+            h,
+        },
+    )
 }
 
 /// Phase 5.a: BitNet SwiGLU FFN backward. Same chain as
@@ -814,7 +837,12 @@ where
     let (grad_x_up, grad_w_up) = bit_linear_backward(&grad_up, x, w_up);
     let (grad_x_gate, grad_w_gate) = bit_linear_backward(&grad_gate_pre, x, w_gate);
     let grad_x = grad_x_gate.add(&grad_x_up);
-    FfnGrads { grad_x, grad_w_gate, grad_w_up, grad_w_down }
+    FfnGrads {
+        grad_x,
+        grad_w_gate,
+        grad_w_up,
+        grad_w_down,
+    }
 }
 
 /// Phase 5.a: BitNet transformer block forward+save. Composes
@@ -841,7 +869,10 @@ where
         + Mul
         + BitLinear,
 {
-    assert!(!heads.is_empty(), "block_forward_save_bitnet: at least one head");
+    assert!(
+        !heads.is_empty(),
+        "block_forward_save_bitnet: at least one head"
+    );
     let y1_pre = x.rmsnorm();
     let mut head_saveds: Vec<AttentionHeadSaved<T>> = Vec::with_capacity(heads.len());
     let (head0_out, head0_saved) = attention_head_forward_save_bitnet(
@@ -855,18 +886,22 @@ where
     head_saveds.push(head0_saved);
     let mut y1 = head0_out;
     for h in &heads[1..] {
-        let (out_h, saved_h) = attention_head_forward_save_bitnet(
-            &y1_pre, &h.w_q, &h.w_k, &h.w_v, &h.w_o, head_dim,
-        );
+        let (out_h, saved_h) =
+            attention_head_forward_save_bitnet(&y1_pre, &h.w_q, &h.w_k, &h.w_v, &h.w_o, head_dim);
         y1 = y1.add(&out_h);
         head_saveds.push(saved_h);
     }
     let x1 = x.add(&y1);
     let y2_pre = x1.rmsnorm();
-    let (y2, ffn_saved) =
-        ffn_forward_save_bitnet(&y2_pre, &ffn.w_gate, &ffn.w_up, &ffn.w_down);
+    let (y2, ffn_saved) = ffn_forward_save_bitnet(&y2_pre, &ffn.w_gate, &ffn.w_up, &ffn.w_down);
     let out = x1.add(&y2);
-    let saved = BlockSaved { y1_pre, x1, y2_pre, head_saveds, ffn_saved };
+    let saved = BlockSaved {
+        y1_pre,
+        x1,
+        y2_pre,
+        head_saveds,
+        ffn_saved,
+    };
     (out, saved)
 }
 
@@ -897,7 +932,10 @@ where
         + QuantiseWeightsSTE
         + Clone,
 {
-    assert!(!heads.is_empty(), "block_backward_bitnet: at least one head");
+    assert!(
+        !heads.is_empty(),
+        "block_backward_bitnet: at least one head"
+    );
     let (grad_x1_a, grad_y2) = add_backward(grad_out);
     let ffn_grads = ffn_backward_bitnet(
         &grad_y2,
@@ -917,7 +955,10 @@ where
             &grad_y1,
             &saved.y1_pre,
             saved_h,
-            &h.w_q, &h.w_k, &h.w_v, &h.w_o,
+            &h.w_q,
+            &h.w_k,
+            &h.w_v,
+            &h.w_o,
             head_dim,
         );
         grad_y1_pre = Some(match grad_y1_pre {
@@ -961,14 +1002,7 @@ where
 /// production training path stays on the existing `Var`-based
 /// `attention::attention` until Phase 4 adds GPU autograd.
 #[allow(dead_code)]
-pub fn attention_head_inference<T>(
-    x: &T,
-    w_q: &T,
-    w_k: &T,
-    w_v: &T,
-    w_o: &T,
-    head_dim: usize,
-) -> T
+pub fn attention_head_inference<T>(x: &T, w_q: &T, w_k: &T, w_v: &T, w_o: &T, head_dim: usize) -> T
 where
     T: MatMul + MulScalar + Transpose2D + Softmax + CausalMask + Rope,
 {
@@ -994,6 +1028,7 @@ where
 /// - `attn` is needed for both softmax backward (saves output, not
 ///   input) and matmul backward through `attn @ v`.
 /// - `ctx` is needed for matmul backward through `ctx @ w_o`.
+///
 /// Pre-mask / pre-mul_scalar / pre-softmax tensors are NOT saved -
 /// causal_mask backward is shape-only, mul_scalar backward is shape-
 /// only, softmax backward saves output.
@@ -1092,13 +1127,7 @@ pub fn attention_head_backward<T>(
     head_dim: usize,
 ) -> AttentionHeadGrads<T>
 where
-    T: MatMul
-        + Add
-        + MulScalar
-        + Transpose2D
-        + SoftmaxBackward
-        + CausalMaskBackward
-        + RopeBackward,
+    T: MatMul + Add + MulScalar + Transpose2D + SoftmaxBackward + CausalMaskBackward + RopeBackward,
 {
     // out = ctx @ w_o
     let (grad_ctx, grad_w_o) = matmul_backward(grad_out, &saved.ctx, w_o);
@@ -1496,7 +1525,11 @@ mod tests {
         let (grad_a, grad_b) = mul_backward(&grad_c, &a, &b);
 
         let loss = |a_v: &[f32], b_v: &[f32]| -> f32 {
-            a_v.iter().zip(b_v).zip(&g_data).map(|((x, y), g)| g * (x * y)).sum()
+            a_v.iter()
+                .zip(b_v)
+                .zip(&g_data)
+                .map(|((x, y), g)| g * (x * y))
+                .sum()
         };
         let h: f32 = 1e-3;
         for idx in 0..n {
@@ -1531,7 +1564,10 @@ mod tests {
         let grad_a = mul_scalar_backward(&grad_c, s_scalar);
 
         let loss = |a_v: &[f32]| -> f32 {
-            a_v.iter().zip(&g_data).map(|(x, g)| g * (x * s_scalar)).sum()
+            a_v.iter()
+                .zip(&g_data)
+                .map(|(x, g)| g * (x * s_scalar))
+                .sum()
         };
         let h: f32 = 1e-3;
         for idx in 0..n {
@@ -1629,7 +1665,9 @@ mod tests {
 
         // mul_scalar_backward: tests MulScalar trait impl on both backends.
         let cpu_ms = mul_scalar_backward(&g_cpu, s_scalar);
-        let gpu_ms = mul_scalar_backward(&g_gpu, s_scalar).to_cpu().expect("D->H");
+        let gpu_ms = mul_scalar_backward(&g_gpu, s_scalar)
+            .to_cpu()
+            .expect("D->H");
         assert_close("mul_scalar_backward", &cpu_ms, &gpu_ms);
 
         // silu_backward: the headline cross-backend test for the new
@@ -1700,7 +1738,8 @@ mod tests {
             for j in 0..n {
                 let want = if j > i { 0.0 } else { g_data[i * n + j] };
                 assert_eq!(
-                    grad_x.data[i * n + j], want,
+                    grad_x.data[i * n + j],
+                    want,
                     "causal_mask_backward at ({i},{j}): want {want}, got {}",
                     grad_x.data[i * n + j]
                 );
@@ -1752,7 +1791,9 @@ mod tests {
         // Causal mask: square seq=17 (prime; covers non-multiple-of-16
         // tile fall-off in the 2-D launch shape).
         let s = 17usize;
-        let g_data_cm: Vec<f32> = (0..s * s).map(|i| (i as f32 * 0.061).sin() + 0.05).collect();
+        let g_data_cm: Vec<f32> = (0..s * s)
+            .map(|i| (i as f32 * 0.061).sin() + 0.05)
+            .collect();
         let g_cpu_cm = Tensor::from_vec(g_data_cm.clone(), vec![s, s]);
         let g_gpu_cm = CudaTensor::from_cpu(&g_cpu_cm).expect("H->D g_cm");
         let cpu_cm = causal_mask_backward(&g_cpu_cm);
@@ -1783,8 +1824,9 @@ mod tests {
         // Avoid all-zero rows (RMSNorm is well-defined everywhere
         // because of EPS, but finite-diff stability prefers
         // away-from-zero magnitudes).
-        let x_data: Vec<f32> =
-            (0..m * n).map(|i| (i as f32 * 0.43 + 0.5).sin() * 1.5).collect();
+        let x_data: Vec<f32> = (0..m * n)
+            .map(|i| (i as f32 * 0.43 + 0.5).sin() * 1.5)
+            .collect();
         let g_data: Vec<f32> = (0..m * n).map(|i| (i as f32 * 0.31).cos() + 0.4).collect();
         let x = Tensor::from_vec(x_data.clone(), vec![m, n]);
         let grad_y = Tensor::from_vec(g_data.clone(), vec![m, n]);
@@ -1862,10 +1904,10 @@ mod tests {
         // softmax test for symmetry).
         let m = 11usize;
         let n = 13usize;
-        let x_data: Vec<f32> =
-            (0..m * n).map(|i| (i as f32 * 0.041 + 0.3).sin() * 1.2).collect();
-        let g_data_rn: Vec<f32> =
-            (0..m * n).map(|i| (i as f32 * 0.097).cos() + 0.2).collect();
+        let x_data: Vec<f32> = (0..m * n)
+            .map(|i| (i as f32 * 0.041 + 0.3).sin() * 1.2)
+            .collect();
+        let g_data_rn: Vec<f32> = (0..m * n).map(|i| (i as f32 * 0.097).cos() + 0.2).collect();
         let x_cpu = Tensor::from_vec(x_data.clone(), vec![m, n]);
         let x_gpu = CudaTensor::from_cpu(&x_cpu).expect("H->D x");
         let g_cpu_rn = Tensor::from_vec(g_data_rn.clone(), vec![m, n]);
@@ -1890,8 +1932,9 @@ mod tests {
         let seq = 13usize;
         let head_dim = 18usize;
         let n_rope = seq * head_dim;
-        let g_data_rp: Vec<f32> =
-            (0..n_rope).map(|i| (i as f32 * 0.061).sin() + 0.1).collect();
+        let g_data_rp: Vec<f32> = (0..n_rope)
+            .map(|i| (i as f32 * 0.061).sin() + 0.1)
+            .collect();
         let g_cpu_rp = Tensor::from_vec(g_data_rp.clone(), vec![seq, head_dim]);
         let g_gpu_rp = CudaTensor::from_cpu(&g_cpu_rp).expect("H->D g_rp");
         let cpu_rp = rope_backward(&g_cpu_rp);
@@ -1927,29 +1970,56 @@ mod tests {
         let head_dim = 4usize;
         let seq = 6usize;
         let hidden = 12usize;
-        let x_data: Vec<f32> = (0..seq * hidden).map(|i| (i as f32 * 0.071).sin() * 0.7).collect();
-        let w_q_data: Vec<f32> = (0..hidden * head_dim).map(|i| (i as f32 * 0.103).cos() * 0.4).collect();
-        let w_k_data: Vec<f32> = (0..hidden * head_dim).map(|i| (i as f32 * 0.137).sin() * 0.4).collect();
-        let w_v_data: Vec<f32> = (0..hidden * head_dim).map(|i| (i as f32 * 0.181 + 0.2).cos() * 0.4).collect();
-        let w_o_data: Vec<f32> = (0..head_dim * hidden).map(|i| (i as f32 * 0.211).sin() * 0.4).collect();
+        let x_data: Vec<f32> = (0..seq * hidden)
+            .map(|i| (i as f32 * 0.071).sin() * 0.7)
+            .collect();
+        let w_q_data: Vec<f32> = (0..hidden * head_dim)
+            .map(|i| (i as f32 * 0.103).cos() * 0.4)
+            .collect();
+        let w_k_data: Vec<f32> = (0..hidden * head_dim)
+            .map(|i| (i as f32 * 0.137).sin() * 0.4)
+            .collect();
+        let w_v_data: Vec<f32> = (0..hidden * head_dim)
+            .map(|i| (i as f32 * 0.181 + 0.2).cos() * 0.4)
+            .collect();
+        let w_o_data: Vec<f32> = (0..head_dim * hidden)
+            .map(|i| (i as f32 * 0.211).sin() * 0.4)
+            .collect();
 
         // Path A: Var-based autograd with explicit quant wrappers,
         // matching the head_output recipe in attention.rs:80-110.
         let tape = Tape::new();
         let x_var = Var::leaf(&tape, Tensor::from_vec(x_data.clone(), vec![seq, hidden]));
-        let w_q_var = Var::leaf(&tape, Tensor::from_vec(w_q_data.clone(), vec![hidden, head_dim]));
-        let w_k_var = Var::leaf(&tape, Tensor::from_vec(w_k_data.clone(), vec![hidden, head_dim]));
-        let w_v_var = Var::leaf(&tape, Tensor::from_vec(w_v_data.clone(), vec![hidden, head_dim]));
-        let w_o_var = Var::leaf(&tape, Tensor::from_vec(w_o_data.clone(), vec![head_dim, hidden]));
+        let w_q_var = Var::leaf(
+            &tape,
+            Tensor::from_vec(w_q_data.clone(), vec![hidden, head_dim]),
+        );
+        let w_k_var = Var::leaf(
+            &tape,
+            Tensor::from_vec(w_k_data.clone(), vec![hidden, head_dim]),
+        );
+        let w_v_var = Var::leaf(
+            &tape,
+            Tensor::from_vec(w_v_data.clone(), vec![hidden, head_dim]),
+        );
+        let w_o_var = Var::leaf(
+            &tape,
+            Tensor::from_vec(w_o_data.clone(), vec![head_dim, hidden]),
+        );
         let x_eff = x_var.quantise_acts_ste();
         let q_v = x_eff.matmul(w_q_var.quantise_weights_ste()).rope();
         let k_v = x_eff.matmul(w_k_var.quantise_weights_ste()).rope();
         let v_v = x_eff.matmul(w_v_var.quantise_weights_ste());
         let scale = 1.0_f32 / (head_dim as f32).sqrt();
-        let scores_v = q_v.matmul(k_v.transpose_2d()).mul_scalar(scale).causal_mask();
+        let scores_v = q_v
+            .matmul(k_v.transpose_2d())
+            .mul_scalar(scale)
+            .causal_mask();
         let attn_v = scores_v.softmax();
         let ctx_v = attn_v.matmul(v_v);
-        let out_v = ctx_v.quantise_acts_ste().matmul(w_o_var.quantise_weights_ste());
+        let out_v = ctx_v
+            .quantise_acts_ste()
+            .matmul(w_o_var.quantise_weights_ste());
         tape.backward(out_v.id);
         let grad_x_truth = x_var.grad();
         let grad_w_q_truth = w_q_var.grad();
@@ -1965,9 +2035,8 @@ mod tests {
         let w_o = Tensor::from_vec(w_o_data, vec![head_dim, hidden]);
         let (out, saved) = attention_head_forward_save_bitnet(&x, &w_q, &w_k, &w_v, &w_o, head_dim);
         let grad_out = Tensor::ones(out.shape.clone());
-        let grads = attention_head_backward_bitnet(
-            &grad_out, &x, &saved, &w_q, &w_k, &w_v, &w_o, head_dim,
-        );
+        let grads =
+            attention_head_backward_bitnet(&grad_out, &x, &saved, &w_q, &w_k, &w_v, &w_o, head_dim);
 
         let cmp = |label: &str, truth: &Tensor, helper: &Tensor| {
             assert_eq!(truth.shape, helper.shape, "{label}: shape diverged");
@@ -2071,8 +2140,7 @@ mod tests {
         let w_k = Tensor::from_vec(w_k_data, vec![hidden, head_dim]);
         let w_v = Tensor::from_vec(w_v_data, vec![hidden, head_dim]);
         let w_o = Tensor::from_vec(w_o_data, vec![head_dim, hidden]);
-        let (out, saved) =
-            attention_head_forward_save(&x, &w_q, &w_k, &w_v, &w_o, head_dim);
+        let (out, saved) = attention_head_forward_save(&x, &w_q, &w_k, &w_v, &w_o, head_dim);
         // Forward outputs must match within tight FP tolerance (the
         // forward path is identical to `attention_head_inference`,
         // which is already cross-checked, so this is a sanity belt).
@@ -2152,9 +2220,8 @@ mod tests {
         let w_o_cpu = Tensor::from_vec(w_o_data.clone(), vec![head_dim, hidden]);
         let g_cpu = Tensor::from_vec(g_data.clone(), vec![seq, hidden]);
 
-        let (out_cpu, saved_cpu) = attention_head_forward_save(
-            &x_cpu, &w_q_cpu, &w_k_cpu, &w_v_cpu, &w_o_cpu, head_dim,
-        );
+        let (out_cpu, saved_cpu) =
+            attention_head_forward_save(&x_cpu, &w_q_cpu, &w_k_cpu, &w_v_cpu, &w_o_cpu, head_dim);
         let grads_cpu = attention_head_backward(
             &g_cpu, &x_cpu, &saved_cpu, &w_q_cpu, &w_k_cpu, &w_v_cpu, &w_o_cpu, head_dim,
         );
@@ -2166,9 +2233,8 @@ mod tests {
         let w_o_gpu = CudaTensor::from_cpu(&w_o_cpu).expect("H->D w_o");
         let g_gpu = CudaTensor::from_cpu(&g_cpu).expect("H->D g");
 
-        let (out_gpu, saved_gpu) = attention_head_forward_save(
-            &x_gpu, &w_q_gpu, &w_k_gpu, &w_v_gpu, &w_o_gpu, head_dim,
-        );
+        let (out_gpu, saved_gpu) =
+            attention_head_forward_save(&x_gpu, &w_q_gpu, &w_k_gpu, &w_v_gpu, &w_o_gpu, head_dim);
         let grads_gpu = attention_head_backward(
             &g_gpu, &x_gpu, &saved_gpu, &w_q_gpu, &w_k_gpu, &w_v_gpu, &w_o_gpu, head_dim,
         );
@@ -2329,10 +2395,15 @@ mod tests {
         let w_down_cpu = Tensor::from_vec(w_down_data.clone(), vec![ffn, hidden]);
         let g_cpu = Tensor::from_vec(g_data.clone(), vec![seq, hidden]);
 
-        let (out_cpu, saved_cpu) =
-            ffn_forward_save(&x_cpu, &w_gate_cpu, &w_up_cpu, &w_down_cpu);
-        let grads_cpu =
-            ffn_backward(&g_cpu, &x_cpu, &saved_cpu, &w_gate_cpu, &w_up_cpu, &w_down_cpu);
+        let (out_cpu, saved_cpu) = ffn_forward_save(&x_cpu, &w_gate_cpu, &w_up_cpu, &w_down_cpu);
+        let grads_cpu = ffn_backward(
+            &g_cpu,
+            &x_cpu,
+            &saved_cpu,
+            &w_gate_cpu,
+            &w_up_cpu,
+            &w_down_cpu,
+        );
 
         let x_gpu = CudaTensor::from_cpu(&x_cpu).expect("H->D x");
         let w_gate_gpu = CudaTensor::from_cpu(&w_gate_cpu).expect("H->D w_gate");
@@ -2340,10 +2411,15 @@ mod tests {
         let w_down_gpu = CudaTensor::from_cpu(&w_down_cpu).expect("H->D w_down");
         let g_gpu = CudaTensor::from_cpu(&g_cpu).expect("H->D g");
 
-        let (out_gpu, saved_gpu) =
-            ffn_forward_save(&x_gpu, &w_gate_gpu, &w_up_gpu, &w_down_gpu);
-        let grads_gpu =
-            ffn_backward(&g_gpu, &x_gpu, &saved_gpu, &w_gate_gpu, &w_up_gpu, &w_down_gpu);
+        let (out_gpu, saved_gpu) = ffn_forward_save(&x_gpu, &w_gate_gpu, &w_up_gpu, &w_down_gpu);
+        let grads_gpu = ffn_backward(
+            &g_gpu,
+            &x_gpu,
+            &saved_gpu,
+            &w_gate_gpu,
+            &w_up_gpu,
+            &w_down_gpu,
+        );
 
         let assert_close = |label: &str, cpu_t: &Tensor, gpu_t_dev: &CudaTensor, tol: f32| {
             let gpu_t = gpu_t_dev.to_cpu().expect("D->H");
@@ -2358,9 +2434,24 @@ mod tests {
         };
         assert_close("forward output", &out_cpu, &out_gpu, 1e-3);
         assert_close("grad_x", &grads_cpu.grad_x, &grads_gpu.grad_x, 5e-3);
-        assert_close("grad_w_gate", &grads_cpu.grad_w_gate, &grads_gpu.grad_w_gate, 5e-3);
-        assert_close("grad_w_up", &grads_cpu.grad_w_up, &grads_gpu.grad_w_up, 5e-3);
-        assert_close("grad_w_down", &grads_cpu.grad_w_down, &grads_gpu.grad_w_down, 5e-3);
+        assert_close(
+            "grad_w_gate",
+            &grads_cpu.grad_w_gate,
+            &grads_gpu.grad_w_gate,
+            5e-3,
+        );
+        assert_close(
+            "grad_w_up",
+            &grads_cpu.grad_w_up,
+            &grads_gpu.grad_w_up,
+            5e-3,
+        );
+        assert_close(
+            "grad_w_down",
+            &grads_cpu.grad_w_down,
+            &grads_gpu.grad_w_down,
+            5e-3,
+        );
     }
 
     // ---- Phase 4 chunk 4.5.c: full transformer block forward+backward ----
@@ -2378,7 +2469,9 @@ mod tests {
     ) -> (Vec<HeadWeights<Tensor>>, FfnWeights<Tensor>) {
         let mk = |rows: usize, cols: usize, seed: f32| {
             Tensor::from_vec(
-                (0..rows * cols).map(|i| (i as f32 * seed).sin() * 0.3).collect(),
+                (0..rows * cols)
+                    .map(|i| (i as f32 * seed).sin() * 0.3)
+                    .collect(),
                 vec![rows, cols],
             )
         };
@@ -2414,7 +2507,9 @@ mod tests {
         let ffn_dim = 16usize;
         let seq = 5usize;
         let x = Tensor::from_vec(
-            (0..seq * hidden).map(|i| (i as f32 * 0.073).sin() * 0.6).collect(),
+            (0..seq * hidden)
+                .map(|i| (i as f32 * 0.073).sin() * 0.6)
+                .collect(),
             vec![seq, hidden],
         );
         let (heads, ffn) = make_block_weights_cpu(hidden, head_dim, n_heads, ffn_dim);
@@ -2513,14 +2608,49 @@ mod tests {
             .zip(&grads_gpu.head_grads)
             .enumerate()
         {
-            assert_close(&format!("head[{idx}].grad_w_q"), &cg.grad_w_q, &gg.grad_w_q, 2e-2);
-            assert_close(&format!("head[{idx}].grad_w_k"), &cg.grad_w_k, &gg.grad_w_k, 2e-2);
-            assert_close(&format!("head[{idx}].grad_w_v"), &cg.grad_w_v, &gg.grad_w_v, 2e-2);
-            assert_close(&format!("head[{idx}].grad_w_o"), &cg.grad_w_o, &gg.grad_w_o, 2e-2);
+            assert_close(
+                &format!("head[{idx}].grad_w_q"),
+                &cg.grad_w_q,
+                &gg.grad_w_q,
+                2e-2,
+            );
+            assert_close(
+                &format!("head[{idx}].grad_w_k"),
+                &cg.grad_w_k,
+                &gg.grad_w_k,
+                2e-2,
+            );
+            assert_close(
+                &format!("head[{idx}].grad_w_v"),
+                &cg.grad_w_v,
+                &gg.grad_w_v,
+                2e-2,
+            );
+            assert_close(
+                &format!("head[{idx}].grad_w_o"),
+                &cg.grad_w_o,
+                &gg.grad_w_o,
+                2e-2,
+            );
         }
-        assert_close("grad_w_gate", &grads_cpu.grad_w_gate, &grads_gpu.grad_w_gate, 2e-2);
-        assert_close("grad_w_up", &grads_cpu.grad_w_up, &grads_gpu.grad_w_up, 2e-2);
-        assert_close("grad_w_down", &grads_cpu.grad_w_down, &grads_gpu.grad_w_down, 2e-2);
+        assert_close(
+            "grad_w_gate",
+            &grads_cpu.grad_w_gate,
+            &grads_gpu.grad_w_gate,
+            2e-2,
+        );
+        assert_close(
+            "grad_w_up",
+            &grads_cpu.grad_w_up,
+            &grads_gpu.grad_w_up,
+            2e-2,
+        );
+        assert_close(
+            "grad_w_down",
+            &grads_cpu.grad_w_down,
+            &grads_gpu.grad_w_down,
+            2e-2,
+        );
     }
 
     // ---- Phase 4 chunk 4.5.d: cross-entropy forward + backward ----

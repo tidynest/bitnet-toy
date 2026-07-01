@@ -96,10 +96,7 @@ impl KVCache {
         // `head_dim` lives on the empty K / V tensors (shape [0, head_dim])
         // so we don't need to also store it on the cache itself.
         let _ = head_dim;
-        KVCache {
-            blocks,
-            seq_pos: 0,
-        }
+        KVCache { blocks, seq_pos: 0 }
     }
 }
 
@@ -207,9 +204,7 @@ fn softmax_1d(scores: &[f32]) -> Vec<f32> {
 
 /// SiLU (swish): `x * sigmoid(x)`, elementwise.
 fn silu_vec(x: &[f32]) -> Vec<f32> {
-    x.iter()
-        .map(|&v| v * (1.0 / (1.0 + (-v).exp())))
-        .collect()
+    x.iter().map(|&v| v * (1.0 / (1.0 + (-v).exp()))).collect()
 }
 
 /// Append a row to a `[t, head_dim]` cache tensor. Mutates `cache` in place
@@ -378,14 +373,10 @@ fn sample_from_logits(logits: &[f32], mode: &SamplingMode, rng: &mut Lcg) -> usi
         Greedy => logits
             .iter()
             .enumerate()
-            .max_by(|(_, a), (_, b)| {
-                a.partial_cmp(b).expect("logit was NaN in greedy sample")
-            })
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).expect("logit was NaN in greedy sample"))
             .map(|(i, _)| i)
             .unwrap_or(0),
-        Temperature { temperature }
-        | TopK { temperature, .. }
-        | TopP { temperature, .. } => {
+        Temperature { temperature } | TopK { temperature, .. } | TopP { temperature, .. } => {
             let t = (*temperature).max(1e-6);
             let inv_t = 1.0 / t;
             let scaled: Vec<f32> = logits.iter().map(|&l| l * inv_t).collect();
@@ -414,11 +405,7 @@ fn sample_from_logits(logits: &[f32], mode: &SamplingMode, rng: &mut Lcg) -> usi
                     }
                 }
                 TopP { p, .. } => {
-                    let mut sorted: Vec<(usize, f32)> = probs
-                        .iter()
-                        .copied()
-                        .enumerate()
-                        .collect();
+                    let mut sorted: Vec<(usize, f32)> = probs.iter().copied().enumerate().collect();
                     sorted.sort_unstable_by(|a, b| {
                         b.1.partial_cmp(&a.1).expect("logit was NaN in top-p")
                     });

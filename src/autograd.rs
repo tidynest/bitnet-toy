@@ -13,7 +13,7 @@
 //! Why a tape (vs. embedding grad fields in `Tensor`:
 //! - `Tensor` (M1) stays a pure value type with zero autograde overhead.
 //! - Ownership of every recorded value lives in one place - no `Rc<RefCell<...>>`
-//! on the public API.
+//!   on the public API.
 //! - Mirrors how PyTorch internally records its autograd graph.
 
 use crate::bitlinear::{absmax_int8, absmean_ternary};
@@ -1344,7 +1344,9 @@ mod tests {
         let x = Var::leaf(
             &tape,
             Tensor::from_vec(
-                (0..seq * head_dim).map(|i| (i as f32) * 0.1 + 0.5).collect(),
+                (0..seq * head_dim)
+                    .map(|i| (i as f32) * 0.1 + 0.5)
+                    .collect(),
                 vec![seq, head_dim],
             ),
         );
@@ -1606,10 +1608,7 @@ mod tests {
         // Input: 3x3 of ones. After mask, positions with j > i become -inf;
         // others remain 1.0. Checked exhaustively.
         let tape = Tape::new();
-        let x = Var::leaf(
-            &tape,
-            Tensor::from_vec(vec![1.0; 9], vec![3, 3]),
-        );
+        let x = Var::leaf(&tape, Tensor::from_vec(vec![1.0; 9], vec![3, 3]));
         let y = x.causal_mask();
         for i in 0..3 {
             for j in 0..3 {
@@ -1674,12 +1673,7 @@ mod tests {
                 }
                 row_sum += v;
             }
-            assert!(
-                (row_sum - 1.0).abs() < 1e-5,
-                "row {} sum = {}",
-                i,
-                row_sum
-            );
+            assert!((row_sum - 1.0).abs() < 1e-5, "row {} sum = {}", i, row_sum);
         }
     }
 
