@@ -373,6 +373,7 @@ where
 /// - `up` is needed for `mul_backward(grad_h, gate, up)`.
 /// - `h = gate * up` is needed for `matmul_backward(grad_y, h,
 ///   w_down)`.
+///
 /// All four are owned f32 tensors on whichever backend ran the
 /// forward; the CPU `Clone` derive cost is trivial, the CUDA `Clone`
 /// path is never invoked because forward `move`s the intermediates
@@ -1027,6 +1028,7 @@ where
 /// - `attn` is needed for both softmax backward (saves output, not
 ///   input) and matmul backward through `attn @ v`.
 /// - `ctx` is needed for matmul backward through `ctx @ w_o`.
+///
 /// Pre-mask / pre-mul_scalar / pre-softmax tensors are NOT saved -
 /// causal_mask backward is shape-only, mul_scalar backward is shape-
 /// only, softmax backward saves output.

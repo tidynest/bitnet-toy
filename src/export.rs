@@ -1,14 +1,14 @@
 //! Binary export and import of trained model weights.
 //!
 //! Three formats:
-//!   - `Format::Float32`        every weight as raw f32 (4 bytes per value).
-//!                              Lossless: BitLinear masters survive byte-identical
-//!                              through save+load, so resuming training picks up
-//!                              exactly where it left off (no `step 0 val_ppl`
-//!                              spike from a re-quantised master). This is the
-//!                              recommended format for `--resume` checkpoints.
-//!   - `Format::Ternary`        embeddings stay f32; every BitLinear weight (block
-//!                              weights and the LM head) becomes `(γ f32, ternary i8/value)`.
+//!   - `Format::Float32`: every weight as raw f32 (4 bytes per value).
+//!     Lossless: BitLinear masters survive byte-identical
+//!     through save+load, so resuming training picks up
+//!     exactly where it left off (no `step 0 val_ppl`
+//!     spike from a re-quantised master). This is the
+//!     recommended format for `--resume` checkpoints.
+//!   - `Format::Ternary`: embeddings stay f32; every BitLinear weight (block
+//!     weights and the LM head) becomes `(γ f32, ternary i8/value)`.
 //!
 //! On-disk layout starts with a 33-byte header so importers can sanity-check
 //! the file and reconstruct a `ModelConfig` without external metadata.

@@ -24,6 +24,12 @@
 #![allow(clippy::missing_errors_doc)]
 #![allow(clippy::module_name_repetitions)]
 #![allow(clippy::float_cmp)]
+// Default-group lints kept off for the same reason: in tensor / autograd math,
+// index-parallel loops and wide operand lists read clearer than the iterator
+// rewrites clippy suggests, and the tape/closure types are inherent to the design.
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::type_complexity)]
 
 mod attention;
 mod autograd;
@@ -517,7 +523,7 @@ fn compute_batched_grads(
         // multiple windows on each thread, which is the right tradeoff
         // when you want to cap concurrent CPU usage.
         std::thread::scope(|s| {
-            let chunk_size = (indices.len() + workers - 1) / workers;
+            let chunk_size = indices.len().div_ceil(workers);
             let handles: Vec<_> = indices
                 .chunks(chunk_size)
                 .map(|chunk| {
@@ -938,7 +944,7 @@ fn run_shakespeare_training(resume_path: Option<std::path::PathBuf>, large: bool
         // stream. Force serial-batched mode.
         cfg.n_workers = 1;
     }
-    let path_present = cfg.corpus_path.as_ref().map_or(false, |p| p.exists());
+    let path_present = cfg.corpus_path.as_ref().is_some_and(|p| p.exists());
     if !path_present {
         eprintln!(
             "Could not find data/tinyshakespeare.txt.\n\
@@ -1259,7 +1265,7 @@ fn enabled_sample_modes() -> Vec<SampleMode> {
             "topp" | "top-p" => TopP,
             "topp_low" | "topp-low" | "topp-cold" | "topp05" => TopP05,
             "kv" | "kv_cache" | "kv-cache" | "kvcache" => KvCache,
-            other if other.is_empty() => continue,
+            "" => continue,
             other => {
                 eprintln!(
                     "warning: BITNET_SAMPLE_MODES contains unknown mode {:?}; ignored. \
@@ -1852,7 +1858,7 @@ fn main() {
         let large = args[1] == "shakespeare-large";
         let resume_path = args
             .get(2)
-            .map(|s| std::path::PathBuf::from(s))
+            .map(std::path::PathBuf::from)
             .filter(|p| p.exists());
         run_shakespeare_training(resume_path, large, /*use_cuda=*/ false);
         return;

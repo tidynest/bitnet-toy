@@ -13,7 +13,7 @@
 //! Why a tape (vs. embedding grad fields in `Tensor`:
 //! - `Tensor` (M1) stays a pure value type with zero autograde overhead.
 //! - Ownership of every recorded value lives in one place - no `Rc<RefCell<...>>`
-//! on the public API.
+//!   on the public API.
 //! - Mirrors how PyTorch internally records its autograd graph.
 
 use crate::bitlinear::{absmax_int8, absmean_ternary};

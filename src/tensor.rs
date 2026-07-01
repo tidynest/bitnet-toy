@@ -5,7 +5,7 @@
 //!   so transpose physically copies data. Strides are a perf optimisation to be added at a later
 //!   point.
 //! - f32 throughout. BitNet's master weights are nominally BF16, but f32 is what `std`
-//! gives us for free, and master precision is thrown away at export anyway.
+//!   gives us for free, and master precision is thrown away at export anyway.
 //! - Owned data only (no views, no `Rc`). Sharing arrives in M3 where autograd needs it.
 //!
 //! Parallelism (v0.10): `Tensor::matmul` shards the output rows across threads
@@ -63,10 +63,10 @@ const MATMUL_PARALLEL_THRESHOLD: usize = 256;
 fn matmul_thread_count() -> usize {
     static N: OnceLock<usize> = OnceLock::new();
     *N.get_or_init(|| {
-        if let Ok(s) = std::env::var("BITNET_MATMUL_THREADS") {
-            if let Ok(n) = s.parse::<usize>() {
-                return n.max(1);
-            }
+        if let Ok(s) = std::env::var("BITNET_MATMUL_THREADS")
+            && let Ok(n) = s.parse::<usize>()
+        {
+            return n.max(1);
         }
         1
     })
@@ -91,13 +91,13 @@ enum MatmulSimd {
 
 /// Cached SIMD strategy. Selection rules (highest priority first):
 ///   - `BITNET_MATMUL_SIMD=off | 0 | none | scalar` -> scalar
-///   - `BITNET_MATMUL_SIMD=avx2`                    -> AVX2 even if the CPU
-///                                                     also exposes AVX-512
-///                                                     (lets us A/B the two
-///                                                     SIMD widths without
-///                                                     recompiling)
-///   - default                                      -> highest detected:
-///                                                     AVX-512 -> AVX2 -> scalar
+///   - `BITNET_MATMUL_SIMD=avx2` -> AVX2 even if the CPU
+///     also exposes AVX-512
+///     (lets us A/B the two
+///     SIMD widths without
+///     recompiling)
+///   - default -> highest detected:
+///     AVX-512 -> AVX2 -> scalar
 ///
 /// Reading the env var once via `OnceLock` keeps the hot dispatch branch-free.
 #[allow(clippy::needless_return)]
