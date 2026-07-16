@@ -372,7 +372,7 @@ mod tests {
         // a 19_800-step cosine band. progress ~ (10_000 - 200) / 19_800 ~ 0.495.
         // LR ~ floor + 0.5 * (peak - floor) * (1 + cos(pi * 0.495))
         //    ~ floor + 0.5 * peak * 0.0157  -> just above midpoint.
-        let lr_start = cosine_lr(0 + offset, warmup, total, peak, floor);
+        let lr_start = cosine_lr(offset, warmup, total, peak, floor);
         assert!(
             lr_start > floor && lr_start < peak,
             "resume step 0 LR {} outside (floor {}, peak {})",

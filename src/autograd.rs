@@ -1294,7 +1294,7 @@ mod tests {
         // First row of any RoPE-rotated tensor must equal the input row to
         // bit-exact f32 precision.
         let tape = Tape::new();
-        let x_data: Vec<f32> = (0..1 * 4).map(|i| i as f32 + 1.0).collect();
+        let x_data: Vec<f32> = (0..4).map(|i| i as f32 + 1.0).collect();
         let x = Var::leaf(&tape, Tensor::from_vec(x_data.clone(), vec![1, 4]));
         let y = x.rope();
         assert_eq!(y.value().data, x_data);
@@ -1542,7 +1542,7 @@ mod tests {
         let x_eff = x.quantise_acts_ste();
 
         let s = 2.0_f32 / 127.0;
-        let expected = vec![64.0 * s, 127.0 * s, -64.0 * s, 32.0 * s];
+        let expected = [64.0 * s, 127.0 * s, -64.0 * s, 32.0 * s];
         for i in 0..4 {
             assert!(
                 (x_eff.value().data[i] - expected[i]).abs() < 1e-5,

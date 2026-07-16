@@ -1905,7 +1905,7 @@ fn run_cuda_demo() {
         ),
     ];
 
-    let mut rng = Lcg::new(0x_C0FFEE_C001_u64);
+    let mut rng = Lcg::new(0x00C0_FFEE_C001_u64);
     let iters = 100usize;
 
     println!(
@@ -2157,7 +2157,7 @@ fn main() {
             let large = args[1] == "cuda-shakespeare-large";
             let resume_path = args
                 .get(2)
-                .map(|s| std::path::PathBuf::from(s))
+                .map(std::path::PathBuf::from)
                 .filter(|p| p.exists());
             run_shakespeare_training(resume_path, large, /*use_cuda=*/ true);
             return;
