@@ -273,165 +273,186 @@ extern "C" __global__ void rmsnorm_backward_row_f32(
     }
 }
 
-// Phase 5.a absmean-ternary weight quant, STE forward. Per-tensor
-// gamma = mean(|W|); output = clamp(round(W/(gamma+eps)), -1, +1) * gamma.
-// Two-stage: (1) per-row partial-sum-of-abs into a scratch [m] buffer
-// (one thread per row, simple per-row reduction over n); (2) per-cell
-// quant + scale-back using the partial sums (one thread per cell, reads
-// scratch + computes gamma = sum(scratch)/total). Stage 2 redundantly
-// computes gamma in every thread, which costs a scalar-divide per cell -
-// trivial vs the kernel-launch cost we'd pay to do a separate scalar
-// reduction. Matches `Tensor::quantise_weights_ste` byte-for-byte.
-extern "C" __global__ void quantise_weights_ste_partial_abs_sum_f32(
+// Phase 5.a absmean-ternary weight quant, STE forward - FUSED (issue
+// #2). Per-tensor gamma = mean(|W|); output =
+// clamp(round(W/(gamma+eps)), -1, +1) * gamma.
+//
+// The apply stage needs a reduction over the ENTIRE tensor, so the
+// fusion runs as ONE cooperative block (grid must be exactly 1):
+//   1. rows strided across threads, each row summed by a single
+//      thread in j-order - the same per-row accumulation order as the
+//      old two-stage kernel;
+//   2. __syncthreads() replaces the old kernel boundary;
+//   3. every thread re-sums row_abs_sum sequentially (r = 0..m, the
+//      old apply kernel's order) so gamma is bit-identical, then the
+//      cells are strided across threads.
+// One block trades SM occupancy for a saved launch: at these tensor
+// sizes the launch (~10-30 us) costs more than the whole kernel, and
+// launch count - not compute - is the step's bottleneck. Matches
+// `Tensor::quantise_weights_ste` byte-for-byte.
+extern "C" __global__ void quantise_weights_ste_fused_f32(
     const float* __restrict__ w,
     float* __restrict__ row_abs_sum,
-    int m, int n)
-{
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= m) return;
-    const float* wr = w + row * n;
-    float s = 0.0f;
-    for (int j = 0; j < n; ++j) s += fabsf(wr[j]);
-    row_abs_sum[row] = s;
-}
-
-extern "C" __global__ void quantise_weights_ste_apply_f32(
-    const float* __restrict__ w,
-    const float* __restrict__ row_abs_sum,
     float* __restrict__ out,
     int m, int n)
 {
-    int j = blockIdx.x * blockDim.x + threadIdx.x;
-    int i = blockIdx.y * blockDim.y + threadIdx.y;
-    if (i >= m || j >= n) return;
-    // gamma = total_abs / (m * n); (gamma + eps) divides forward, then
-    // round + clamp to {-1, 0, +1}, then multiply back by gamma.
+    for (int row = threadIdx.x; row < m; row += blockDim.x) {
+        const float* wr = w + row * n;
+        float s = 0.0f;
+        for (int j = 0; j < n; ++j) s += fabsf(wr[j]);
+        row_abs_sum[row] = s;
+    }
+    __syncthreads();
     float total_abs = 0.0f;
     for (int r = 0; r < m; ++r) total_abs += row_abs_sum[r];
     float gamma = total_abs / (float)(m * n);
     float denom = gamma + 1.0e-5f;
-    float v = w[i * n + j] / denom;
-    float q = roundf(v);
-    if (q < -1.0f) q = -1.0f;
-    else if (q > 1.0f) q = 1.0f;
-    out[i * n + j] = q * gamma;
-}
-
-// Phase 5.a absmax-INT8 per-row activation quant, STE forward.
-// Per row: alpha = max_j |x[i, j]|; x_q = clamp(round(x * 127/alpha),
-// -128, +127); out = (alpha/127) * x_q. Edge case: alpha = 0 yields
-// out = 0 directly (no NaN). Two-stage: (1) per-row absmax into [m]
-// buffer (one thread per row); (2) per-cell apply (one thread per
-// cell). Matches `Tensor::quantise_acts_ste` byte-for-byte.
-extern "C" __global__ void quantise_acts_ste_row_absmax_f32(
-    const float* __restrict__ x,
-    float* __restrict__ row_max,
-    int m, int n)
-{
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= m) return;
-    const float* xr = x + row * n;
-    float a = 0.0f;
-    for (int j = 0; j < n; ++j) {
-        float v = fabsf(xr[j]);
-        if (v > a) a = v;
+    int total = m * n;
+    for (int idx = threadIdx.x; idx < total; idx += blockDim.x) {
+        float v = w[idx] / denom;
+        float q = roundf(v);
+        if (q < -1.0f) q = -1.0f;
+        else if (q > 1.0f) q = 1.0f;
+        out[idx] = q * gamma;
     }
-    row_max[row] = a;
 }
 
-extern "C" __global__ void quantise_acts_ste_apply_f32(
+// Phase 5.a absmax-INT8 per-row activation quant, STE forward - FUSED
+// (issue #2). Per row: alpha = max_j |x[i, j]|; x_q =
+// clamp(round(x * 127/alpha), -128, +127); out = (alpha/127) * x_q.
+// Edge case: alpha = 0 yields out = 0 directly (no NaN).
+//
+// alpha is per-row (no cross-row dependency), so the fusion runs one
+// block PER ROW (grid = m blocks of QUANT_BLOCK threads): block-local
+// strided absmax into shared memory, tree-reduce (max is exact -
+// reassociation cannot change it), then the same block applies its
+// row's cells. Matches `Tensor::quantise_acts_ste` byte-for-byte.
+extern "C" __global__ void quantise_acts_ste_fused_f32(
     const float* __restrict__ x,
-    const float* __restrict__ row_max,
     float* __restrict__ out,
     int m, int n)
 {
-    int j = blockIdx.x * blockDim.x + threadIdx.x;
-    int i = blockIdx.y * blockDim.y + threadIdx.y;
-    if (i >= m || j >= n) return;
-    float a = row_max[i];
-    if (a == 0.0f) {
-        out[i * n + j] = 0.0f;
+    int row = blockIdx.x;
+    if (row >= m) return;
+    const float* xr = x + row * n;
+    float* or_ = out + row * n;
+    __shared__ float smax[256];
+    float a = 0.0f;
+    for (int j = threadIdx.x; j < n; j += blockDim.x) {
+        float v = fabsf(xr[j]);
+        if (v > a) a = v;
+    }
+    smax[threadIdx.x] = a;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s && smax[threadIdx.x + s] > smax[threadIdx.x]) {
+            smax[threadIdx.x] = smax[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+    float alpha = smax[0];
+    if (alpha == 0.0f) {
+        for (int j = threadIdx.x; j < n; j += blockDim.x) or_[j] = 0.0f;
         return;
     }
-    float scale_to_int = 127.0f / a;
-    float v = x[i * n + j] * scale_to_int;
-    float q = roundf(v);
-    if (q < -128.0f) q = -128.0f;
-    else if (q > 127.0f) q = 127.0f;
-    float row_dequant = a * (1.0f / 127.0f);
-    out[i * n + j] = q * row_dequant;
+    float scale_to_int = 127.0f / alpha;
+    float row_dequant = alpha * (1.0f / 127.0f);
+    for (int j = threadIdx.x; j < n; j += blockDim.x) {
+        float v = xr[j] * scale_to_int;
+        float q = roundf(v);
+        if (q < -128.0f) q = -128.0f;
+        else if (q > 127.0f) q = 127.0f;
+        or_[j] = q * row_dequant;
+    }
 }
 
-// Phase 5.b: int8 BitLinear forward. Three new kernels feed the
-// cublasGemmEx int8 GEMM path:
+// Phase 5.b: int8 BitLinear forward. Two fused quant kernels (issue
+// #2) feed the cublasGemmEx int8 GEMM path, plus the dequant step:
 //
-//   1. `quantise_weights_int8_partial_abs_sum` - same per-row abs sum
-//      reduction as the Phase 5.a version. Reused.
-//   2. `quantise_weights_int8_apply` - same shape as Phase 5.a's apply
-//      kernel but writes int8 (ternary {-1, 0, +1}) and a single-cell
-//      gamma scalar instead of a dequantised f32 tensor.
-//   3. `quantise_acts_int8_row_absmax` - same per-row absmax as
-//      Phase 5.a. Reused.
-//   4. `quantise_acts_int8_apply` - writes int8 in [-128, 127] +
-//      keeps alpha[m] as a separate f32 buffer.
-//   5. `scale_int32_to_f32` - the dequantisation step after the
+//   1. `quantise_weights_int8_fused` - same one-cooperative-block
+//      fusion as the f32 STE kernel, but writes int8 ternary
+//      {-1, 0, +1} plus a single-cell gamma scalar instead of a
+//      dequantised f32 tensor.
+//   2. `quantise_acts_int8_fused` - same block-per-row fusion as the
+//      f32 STE kernel, but writes int8 in [-128, 127] and keeps
+//      alpha[m] as a separate f32 buffer.
+//   3. `scale_int32_to_f32` - the dequantisation step after the
 //      int8 GEMM: y[i, j] = c_int[i, j] * (alpha[i] * gamma / 127).
-//
-// The reductions are reused from Phase 5.a (same layout, same math);
-// only the apply kernels and the scale kernel are new.
 
-// Per-cell apply for ternary weight quant, int8 output. `gamma_out`
-// is a single-element f32 buffer (written redundantly by every
-// thread - same trick the Phase 5.a apply kernel uses; one divide
-// per cell, trivial vs a separate scalar reduction kernel).
-extern "C" __global__ void quantise_weights_int8_apply_f32(
+// Fused ternary weight quant, int8 output. ONE cooperative block
+// (grid must be 1); see `quantise_weights_ste_fused_f32` for the
+// stage layout and the bit-identical-gamma argument. gamma lands in
+// a single-element f32 buffer for the dequant kernel.
+extern "C" __global__ void quantise_weights_int8_fused(
     const float* __restrict__ w,
-    const float* __restrict__ row_abs_sum,
+    float* __restrict__ row_abs_sum,
     signed char* __restrict__ w_q_out,
     float* __restrict__ gamma_out,
     int m, int n)
 {
-    int j = blockIdx.x * blockDim.x + threadIdx.x;
-    int i = blockIdx.y * blockDim.y + threadIdx.y;
-    if (i >= m || j >= n) return;
+    for (int row = threadIdx.x; row < m; row += blockDim.x) {
+        const float* wr = w + row * n;
+        float s = 0.0f;
+        for (int j = 0; j < n; ++j) s += fabsf(wr[j]);
+        row_abs_sum[row] = s;
+    }
+    __syncthreads();
     float total_abs = 0.0f;
     for (int r = 0; r < m; ++r) total_abs += row_abs_sum[r];
     float gamma = total_abs / (float)(m * n);
     float denom = gamma + 1.0e-5f;
-    float v = w[i * n + j] / denom;
-    float q = roundf(v);
-    if (q < -1.0f) q = -1.0f;
-    else if (q > 1.0f) q = 1.0f;
-    w_q_out[i * n + j] = (signed char)((int)q);
-    if (i == 0 && j == 0) {
-        gamma_out[0] = gamma;
+    if (threadIdx.x == 0) gamma_out[0] = gamma;
+    int total = m * n;
+    for (int idx = threadIdx.x; idx < total; idx += blockDim.x) {
+        float v = w[idx] / denom;
+        float q = roundf(v);
+        if (q < -1.0f) q = -1.0f;
+        else if (q > 1.0f) q = 1.0f;
+        w_q_out[idx] = (signed char)((int)q);
     }
 }
 
-// Per-cell apply for activation INT8 quant. Writes raw int8 values
-// in [-128, 127] (no dequant); the Phase 5.b BitLinear path scales
-// the int32 GEMM output by alpha[i] * gamma / 127 in a separate
-// kernel.
-extern "C" __global__ void quantise_acts_int8_apply_f32(
+// Fused per-row INT8 activation quant: one block per row (grid = m);
+// see `quantise_acts_ste_fused_f32` for the reduction layout. Writes
+// raw int8 (no dequant) + alpha[m] for the post-GEMM scale kernel.
+extern "C" __global__ void quantise_acts_int8_fused(
     const float* __restrict__ x,
-    const float* __restrict__ row_max,
     signed char* __restrict__ x_q_out,
+    float* __restrict__ alpha_out,
     int m, int n)
 {
-    int j = blockIdx.x * blockDim.x + threadIdx.x;
-    int i = blockIdx.y * blockDim.y + threadIdx.y;
-    if (i >= m || j >= n) return;
-    float a = row_max[i];
-    if (a == 0.0f) {
-        x_q_out[i * n + j] = 0;
+    int row = blockIdx.x;
+    if (row >= m) return;
+    const float* xr = x + row * n;
+    signed char* qr = x_q_out + row * n;
+    __shared__ float smax[256];
+    float a = 0.0f;
+    for (int j = threadIdx.x; j < n; j += blockDim.x) {
+        float v = fabsf(xr[j]);
+        if (v > a) a = v;
+    }
+    smax[threadIdx.x] = a;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s && smax[threadIdx.x + s] > smax[threadIdx.x]) {
+            smax[threadIdx.x] = smax[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+    float alpha = smax[0];
+    if (threadIdx.x == 0) alpha_out[row] = alpha;
+    if (alpha == 0.0f) {
+        for (int j = threadIdx.x; j < n; j += blockDim.x) qr[j] = 0;
         return;
     }
-    float scale_to_int = 127.0f / a;
-    float v = x[i * n + j] * scale_to_int;
-    float q = roundf(v);
-    if (q < -128.0f) q = -128.0f;
-    else if (q > 127.0f) q = 127.0f;
-    x_q_out[i * n + j] = (signed char)((int)q);
+    float scale_to_int = 127.0f / alpha;
+    for (int j = threadIdx.x; j < n; j += blockDim.x) {
+        float v = xr[j] * scale_to_int;
+        float q = roundf(v);
+        if (q < -128.0f) q = -128.0f;
+        else if (q > 127.0f) q = 127.0f;
+        qr[j] = (signed char)((int)q);
+    }
 }
 
 // Phase 5.b: dequantise the int32 cublasGemmEx output back to f32.
@@ -629,12 +650,10 @@ pub struct CudaContextHolder {
     pub rope_backward_fn: CudaFunction,
     pub cross_entropy_softmax_loss_fn: CudaFunction,
     pub cross_entropy_backward_fn: CudaFunction,
-    pub quantise_weights_partial_abs_sum_fn: CudaFunction,
-    pub quantise_weights_apply_fn: CudaFunction,
-    pub quantise_acts_row_absmax_fn: CudaFunction,
-    pub quantise_acts_apply_fn: CudaFunction,
-    pub quantise_weights_int8_apply_fn: CudaFunction,
-    pub quantise_acts_int8_apply_fn: CudaFunction,
+    pub quantise_weights_ste_fused_fn: CudaFunction,
+    pub quantise_acts_ste_fused_fn: CudaFunction,
+    pub quantise_weights_int8_fused_fn: CudaFunction,
+    pub quantise_acts_int8_fused_fn: CudaFunction,
     pub scale_int32_to_f32_fn: CudaFunction,
 
     /// Hand-rolled tile-based GEMM kernel from `MATMUL_KERNEL_SRC`.
@@ -689,12 +708,10 @@ pub fn cuda_state() -> Result<&'static CudaContextHolder, String> {
         let rope_backward_fn = load("rope_backward_f32")?;
         let cross_entropy_softmax_loss_fn = load("cross_entropy_softmax_loss_f32")?;
         let cross_entropy_backward_fn = load("cross_entropy_backward_f32")?;
-        let quantise_weights_partial_abs_sum_fn = load("quantise_weights_ste_partial_abs_sum_f32")?;
-        let quantise_weights_apply_fn = load("quantise_weights_ste_apply_f32")?;
-        let quantise_acts_row_absmax_fn = load("quantise_acts_ste_row_absmax_f32")?;
-        let quantise_acts_apply_fn = load("quantise_acts_ste_apply_f32")?;
-        let quantise_weights_int8_apply_fn = load("quantise_weights_int8_apply_f32")?;
-        let quantise_acts_int8_apply_fn = load("quantise_acts_int8_apply_f32")?;
+        let quantise_weights_ste_fused_fn = load("quantise_weights_ste_fused_f32")?;
+        let quantise_acts_ste_fused_fn = load("quantise_acts_ste_fused_f32")?;
+        let quantise_weights_int8_fused_fn = load("quantise_weights_int8_fused")?;
+        let quantise_acts_int8_fused_fn = load("quantise_acts_int8_fused")?;
         let scale_int32_to_f32_fn = load("scale_int32_to_f32")?;
 
         #[cfg(test)]
@@ -728,18 +745,30 @@ pub fn cuda_state() -> Result<&'static CudaContextHolder, String> {
             rope_backward_fn,
             cross_entropy_softmax_loss_fn,
             cross_entropy_backward_fn,
-            quantise_weights_partial_abs_sum_fn,
-            quantise_weights_apply_fn,
-            quantise_acts_row_absmax_fn,
-            quantise_acts_apply_fn,
-            quantise_weights_int8_apply_fn,
-            quantise_acts_int8_apply_fn,
+            quantise_weights_ste_fused_fn,
+            quantise_acts_ste_fused_fn,
+            quantise_weights_int8_fused_fn,
+            quantise_acts_int8_fused_fn,
             scale_int32_to_f32_fn,
             #[cfg(test)]
             matmul_fn,
         })
     });
     r.as_ref().map_err(|s| s.clone())
+}
+
+/// Cumulative count of quantisation kernel launches (f32 STE traits +
+/// the int8 `bit_linear` quant stages). Issue #2 observability: with
+/// ~3000+ launches per training step, launch overhead - not GEMM
+/// compute - is the GPU bottleneck, so tests pin the exact number of
+/// launches each quantise call may issue.
+pub static QUANT_KERNEL_LAUNCHES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Relaxed increment helper for `QUANT_KERNEL_LAUNCHES` - one call per
+/// quant kernel launch, next to the `launch` itself.
+fn count_quant_launch() {
+    QUANT_KERNEL_LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Device-resident f32 tensor. Owns its `CudaSlice<f32>`; the slice is
@@ -783,6 +812,23 @@ impl CudaTensor {
             data,
             shape: t.shape.clone(),
         })
+    }
+
+    /// Overwrite this tensor's device buffer in place from a CPU tensor
+    /// of identical shape. No allocation: the existing `CudaSlice` is
+    /// reused via `memcpy_htod` (stream-ordered, so later kernel
+    /// launches on the same stream see the new values).
+    pub fn copy_from_cpu(&mut self, t: &Tensor) -> Result<(), String> {
+        if self.shape != t.shape {
+            return Err(format!(
+                "copy_from_cpu shape mismatch: device {:?} vs host {:?}",
+                self.shape, t.shape
+            ));
+        }
+        let s = cuda_state()?;
+        s.stream
+            .memcpy_htod(&t.data, &mut self.data)
+            .map_err(|e| format!("memcpy_htod failed: {e:?}"))
     }
 
     /// Copy device memory back into a CPU `Tensor`. Synchronous.
@@ -1352,7 +1398,7 @@ impl crate::device::Rope for CudaTensor {
         let seq = self.shape[0];
         let head_dim = self.shape[1];
         assert!(
-            head_dim % 2 == 0,
+            head_dim.is_multiple_of(2),
             "rope: head_dim ({head_dim}) must be even"
         );
         let seq_i = i32::try_from(seq).expect("seq exceeds i32");
@@ -1394,7 +1440,7 @@ impl crate::device::RopeBackward for CudaTensor {
         let seq = self.shape[0];
         let head_dim = self.shape[1];
         assert!(
-            head_dim % 2 == 0,
+            head_dim.is_multiple_of(2),
             "rope_backward: head_dim ({head_dim}) must be even"
         );
         let seq_i = i32::try_from(seq).expect("seq exceeds i32");
@@ -1562,34 +1608,24 @@ impl crate::device::QuantiseWeightsSTE for CudaTensor {
         let n_i = i32::try_from(n).expect("n exceeds i32");
         let mut row_abs_sum = s.stream.alloc_zeros::<f32>(m).expect("alloc row_abs_sum");
         let mut out = s.stream.alloc_zeros::<f32>(m * n).expect("alloc out");
-        // Stage 1: per-row abs sum.
-        let cfg_rows = LaunchConfig {
-            grid_dim: ((m_i as u32).div_ceil(256), 1, 1),
+        // ONE fused launch (issue #2). The kernel is a single
+        // cooperative block, so the grid MUST stay (1, 1, 1): a second
+        // block would race the row_abs_sum scratch across the
+        // __syncthreads() stage boundary.
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        let mut l1 = s
-            .stream
-            .launch_builder(&s.quantise_weights_partial_abs_sum_fn);
-        l1.arg(&self.data);
-        l1.arg(&mut row_abs_sum);
-        l1.arg(&m_i);
-        l1.arg(&n_i);
+        let mut l = s.stream.launch_builder(&s.quantise_weights_ste_fused_fn);
+        l.arg(&self.data);
+        l.arg(&mut row_abs_sum);
+        l.arg(&mut out);
+        l.arg(&m_i);
+        l.arg(&n_i);
         // Safety: signature matches; both buffers correctly sized.
-        unsafe { l1.launch(cfg_rows) }.expect("quantise_weights_partial_abs_sum launch");
-        // Stage 2: per-cell quant + scale-back.
-        let cfg_cells = LaunchConfig {
-            grid_dim: ((n_i as u32).div_ceil(16), (m_i as u32).div_ceil(16), 1),
-            block_dim: (16, 16, 1),
-            shared_mem_bytes: 0,
-        };
-        let mut l2 = s.stream.launch_builder(&s.quantise_weights_apply_fn);
-        l2.arg(&self.data);
-        l2.arg(&row_abs_sum);
-        l2.arg(&mut out);
-        l2.arg(&m_i);
-        l2.arg(&n_i);
-        unsafe { l2.launch(cfg_cells) }.expect("quantise_weights_apply launch");
+        count_quant_launch();
+        unsafe { l.launch(cfg) }.expect("quantise_weights_ste_fused launch");
         Self {
             data: out,
             shape: vec![m, n],
@@ -1605,31 +1641,23 @@ impl crate::device::QuantiseActsSTE for CudaTensor {
         let n = self.shape[1];
         let m_i = i32::try_from(m).expect("m exceeds i32");
         let n_i = i32::try_from(n).expect("n exceeds i32");
-        let mut row_max = s.stream.alloc_zeros::<f32>(m).expect("alloc row_max");
         let mut out = s.stream.alloc_zeros::<f32>(m * n).expect("alloc out");
-        let cfg_rows = LaunchConfig {
-            grid_dim: ((m_i as u32).div_ceil(256), 1, 1),
+        // ONE fused launch (issue #2): one block per row. The block
+        // size must stay 256 to match the kernel's static smax[256].
+        // No scratch buffer at all - the row reduction lives in
+        // shared memory, so this also drops an alloc per call.
+        let cfg = LaunchConfig {
+            grid_dim: (m_i as u32, 1, 1),
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        let mut l1 = s.stream.launch_builder(&s.quantise_acts_row_absmax_fn);
-        l1.arg(&self.data);
-        l1.arg(&mut row_max);
-        l1.arg(&m_i);
-        l1.arg(&n_i);
-        unsafe { l1.launch(cfg_rows) }.expect("quantise_acts_row_absmax launch");
-        let cfg_cells = LaunchConfig {
-            grid_dim: ((n_i as u32).div_ceil(16), (m_i as u32).div_ceil(16), 1),
-            block_dim: (16, 16, 1),
-            shared_mem_bytes: 0,
-        };
-        let mut l2 = s.stream.launch_builder(&s.quantise_acts_apply_fn);
-        l2.arg(&self.data);
-        l2.arg(&row_max);
-        l2.arg(&mut out);
-        l2.arg(&m_i);
-        l2.arg(&n_i);
-        unsafe { l2.launch(cfg_cells) }.expect("quantise_acts_apply launch");
+        let mut l = s.stream.launch_builder(&s.quantise_acts_ste_fused_fn);
+        l.arg(&self.data);
+        l.arg(&mut out);
+        l.arg(&m_i);
+        l.arg(&n_i);
+        count_quant_launch();
+        unsafe { l.launch(cfg) }.expect("quantise_acts_ste_fused launch");
         Self {
             data: out,
             shape: vec![m, n],
@@ -1708,7 +1736,7 @@ impl crate::device::BitLinear for CudaTensor {
         // to the Phase 5.a f32 sgemm path (algebraically identical;
         // the only matmul in the project that hits this fallback is
         // the lm_head with n = vocab = 65).
-        if k % 4 != 0 || n % 4 != 0 {
+        if !k.is_multiple_of(4) || !n.is_multiple_of(4) {
             use crate::device::{MatMul, QuantiseActsSTE, QuantiseWeightsSTE};
             let x_eff = self.quantise_acts_ste();
             let w_eff = rhs.quantise_weights_ste();
@@ -1716,65 +1744,47 @@ impl crate::device::BitLinear for CudaTensor {
         }
 
         // ---- Stage 1: quantise self (acts) to INT8 + alpha[m]. ----
+        // ONE fused launch (issue #2): one block per row, block size
+        // pinned to the kernel's static smax[256].
         let mut alpha = st.stream.alloc_zeros::<f32>(m).expect("alloc alpha");
         let mut x_q = st.stream.alloc_zeros::<i8>(m * k).expect("alloc x_q");
-        let cfg_x_rows = LaunchConfig {
-            grid_dim: ((m_i as u32).div_ceil(256), 1, 1),
+        let cfg_x = LaunchConfig {
+            grid_dim: (m_i as u32, 1, 1),
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        let mut l = st.stream.launch_builder(&st.quantise_acts_row_absmax_fn);
+        let mut l = st.stream.launch_builder(&st.quantise_acts_int8_fused_fn);
         l.arg(&self.data);
+        l.arg(&mut x_q);
         l.arg(&mut alpha);
         l.arg(&m_i);
         l.arg(&k_i);
-        unsafe { l.launch(cfg_x_rows) }.expect("acts row absmax launch");
-        let cfg_x_cells = LaunchConfig {
-            grid_dim: ((k_i as u32).div_ceil(16), (m_i as u32).div_ceil(16), 1),
-            block_dim: (16, 16, 1),
-            shared_mem_bytes: 0,
-        };
-        let mut l = st.stream.launch_builder(&st.quantise_acts_int8_apply_fn);
-        l.arg(&self.data);
-        l.arg(&alpha);
-        l.arg(&mut x_q);
-        l.arg(&m_i);
-        l.arg(&k_i);
-        unsafe { l.launch(cfg_x_cells) }.expect("acts int8 apply launch");
+        count_quant_launch();
+        unsafe { l.launch(cfg_x) }.expect("acts int8 fused launch");
 
         // ---- Stage 2: quantise rhs (weights) to INT8 + gamma scalar. ----
+        // ONE fused launch (issue #2): a single cooperative block, so
+        // the grid MUST stay (1, 1, 1) - see the kernel comment.
         let mut gamma = st.stream.alloc_zeros::<f32>(1).expect("alloc gamma");
         let mut w_row_abs_sum = st
             .stream
             .alloc_zeros::<f32>(k)
             .expect("alloc w_row_abs_sum");
         let mut w_q = st.stream.alloc_zeros::<i8>(k * n).expect("alloc w_q");
-        let cfg_w_rows = LaunchConfig {
-            grid_dim: ((k_i as u32).div_ceil(256), 1, 1),
+        let cfg_w = LaunchConfig {
+            grid_dim: (1, 1, 1),
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        let mut l = st
-            .stream
-            .launch_builder(&st.quantise_weights_partial_abs_sum_fn);
+        let mut l = st.stream.launch_builder(&st.quantise_weights_int8_fused_fn);
         l.arg(&rhs.data);
         l.arg(&mut w_row_abs_sum);
-        l.arg(&k_i);
-        l.arg(&n_i);
-        unsafe { l.launch(cfg_w_rows) }.expect("weights row abs sum launch");
-        let cfg_w_cells = LaunchConfig {
-            grid_dim: ((n_i as u32).div_ceil(16), (k_i as u32).div_ceil(16), 1),
-            block_dim: (16, 16, 1),
-            shared_mem_bytes: 0,
-        };
-        let mut l = st.stream.launch_builder(&st.quantise_weights_int8_apply_fn);
-        l.arg(&rhs.data);
-        l.arg(&w_row_abs_sum);
         l.arg(&mut w_q);
         l.arg(&mut gamma);
         l.arg(&k_i);
         l.arg(&n_i);
-        unsafe { l.launch(cfg_w_cells) }.expect("weights int8 apply launch");
+        count_quant_launch();
+        unsafe { l.launch(cfg_w) }.expect("weights int8 fused launch");
 
         // ---- Stage 3: cublasGemmEx int8 -> int32. ----
         // Same row-major-via-column-major adapter as the f32 MatMul
@@ -1922,6 +1932,53 @@ impl CudaModel {
         }
     }
 
+    /// Refresh every device weight in place from the CPU masters
+    /// (issue #1). Same walk order as `from_cpu`, but the existing
+    /// device buffers are overwritten via `memcpy_htod` instead of
+    /// reallocated, so the per-step rebuild allocates zero new device
+    /// buffers. Weight shapes are step-invariant during training, so
+    /// an architecture mismatch is a caller bug and panics.
+    pub fn sync_from_cpu(&mut self, model: &crate::model::Model) {
+        assert_eq!(
+            self.blocks.len(),
+            model.blocks.len(),
+            "sync_from_cpu: block count changed"
+        );
+        for (db, hb) in self.blocks.iter_mut().zip(&model.blocks) {
+            assert_eq!(
+                db.heads.len(),
+                hb.heads.len(),
+                "sync_from_cpu: head count changed"
+            );
+            for (dh, hh) in db.heads.iter_mut().zip(&hb.heads) {
+                dh.w_q.copy_from_cpu(&hh.w_q).expect("H->D w_q sync failed");
+                dh.w_k.copy_from_cpu(&hh.w_k).expect("H->D w_k sync failed");
+                dh.w_v.copy_from_cpu(&hh.w_v).expect("H->D w_v sync failed");
+                dh.w_o.copy_from_cpu(&hh.w_o).expect("H->D w_o sync failed");
+            }
+            db.ffn
+                .w_gate
+                .copy_from_cpu(&hb.ffn_gate_w)
+                .expect("H->D w_gate sync failed");
+            db.ffn
+                .w_up
+                .copy_from_cpu(&hb.ffn_up_w)
+                .expect("H->D w_up sync failed");
+            db.ffn
+                .w_down
+                .copy_from_cpu(&hb.ffn_down_w)
+                .expect("H->D w_down sync failed");
+        }
+        // Host-side embed copy: overwrite in place too (shapes match),
+        // so the per-step rebuild allocates nothing on either side.
+        self.token_embed_cpu
+            .data
+            .copy_from_slice(&model.token_embed.data);
+        self.token_embed_device
+            .copy_from_cpu(&model.token_embed)
+            .expect("H->D token_embed sync failed");
+    }
+
     /// End-to-end forward pass: token ids -> logits `[seq, vocab]`.
     ///
     /// Pipeline:
@@ -1991,6 +2048,7 @@ impl CudaModel {
     ///      backward (transposed [vocab, hidden] grad slab)
     ///   2. for each block: per-head q/k/v/o, then ffn_gate, ffn_up,
     ///      ffn_down
+    ///
     /// (No trailing lm_head: tied to token_embed.)
     pub fn compute_grads_for_window(
         &self,
@@ -2781,6 +2839,77 @@ mod tests {
         assert_eq!(cpu_argmax, gpu_argmax, "greedy-token disagreement");
     }
 
+    /// Issue #1: `sync_from_cpu` must refresh the device weights in
+    /// place - same device buffers (zero new allocations), new values.
+    /// Bitwise agreement with a freshly built `from_cpu` model proves
+    /// the copy is complete; device-pointer equality proves the
+    /// existing allocations were reused rather than replaced.
+    #[test]
+    fn cuda_model_sync_from_cpu_reuses_buffers_and_matches_rebuild() {
+        if cuda_state().is_err() {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        }
+        use crate::model::{Model, ModelConfig};
+        use cudarc::driver::DevicePtr;
+        let config = ModelConfig {
+            vocab_size: 17,
+            hidden_dim: 32,
+            n_heads: 4,
+            head_dim: 8,
+            ffn_dim: 64,
+            max_seq_len: 16,
+            n_blocks: 2,
+        };
+        let mut model = Model::new(&config, 42);
+        let ids: Vec<usize> = vec![0, 3, 7, 11, 5, 1, 9];
+        let mut cuda_model = CudaModel::from_cpu(&model);
+        let stale_logits = cuda_model.forward(&ids).to_cpu().unwrap();
+
+        let st = cuda_state().unwrap();
+        let w_q_ptr_before = cuda_model.blocks[0].heads[0]
+            .w_q
+            .data
+            .device_ptr(&st.stream)
+            .0;
+        let embed_ptr_before = cuda_model.token_embed_device.data.device_ptr(&st.stream).0;
+
+        // Simulate an optimiser step: every master weight moves.
+        model.for_each_param_mut(|t| {
+            for v in t.data.iter_mut() {
+                *v += 0.25;
+            }
+        });
+
+        cuda_model.sync_from_cpu(&model);
+
+        let w_q_ptr_after = cuda_model.blocks[0].heads[0]
+            .w_q
+            .data
+            .device_ptr(&st.stream)
+            .0;
+        let embed_ptr_after = cuda_model.token_embed_device.data.device_ptr(&st.stream).0;
+        assert_eq!(
+            w_q_ptr_before, w_q_ptr_after,
+            "w_q device buffer was reallocated"
+        );
+        assert_eq!(
+            embed_ptr_before, embed_ptr_after,
+            "token_embed device buffer was reallocated"
+        );
+
+        let synced = cuda_model.forward(&ids).to_cpu().unwrap();
+        let rebuilt = CudaModel::from_cpu(&model).forward(&ids).to_cpu().unwrap();
+        assert_eq!(
+            synced.data, rebuilt.data,
+            "synced forward differs from a fresh from_cpu rebuild"
+        );
+        assert_ne!(
+            synced.data, stale_logits.data,
+            "sync_from_cpu left the device weights stale"
+        );
+    }
+
     /// **The headline test of Chunk 2.4.** Full transformer block
     /// (pre-norm, multi-head attention with residual, FFN with
     /// residual) runs on both backends from the same source line and
@@ -2948,6 +3077,64 @@ mod tests {
         }
     }
 
+    /// Issue #2: launch overhead dominates the GPU step, so each
+    /// quantise call must issue exactly ONE fused kernel launch
+    /// (reduction + apply together), not a two-stage pair.
+    #[test]
+    fn quantise_ste_and_int8_paths_use_one_fused_launch_per_operand() {
+        if cuda_state().is_err() {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        }
+        use crate::device::{BitLinear, QuantiseActsSTE, QuantiseWeightsSTE};
+        use std::sync::atomic::Ordering;
+        let m = 32usize;
+        let k = 64usize;
+        let n = 16usize;
+        let x = CudaTensor::from_cpu(&Tensor::from_vec(
+            (0..m * k).map(|i| (i as f32 * 0.05).sin()).collect(),
+            vec![m, k],
+        ))
+        .unwrap();
+        let w = CudaTensor::from_cpu(&Tensor::from_vec(
+            (0..k * n).map(|i| (i as f32 * 0.09).cos()).collect(),
+            vec![k, n],
+        ))
+        .unwrap();
+
+        // The counter is process-global and other tests launch quant
+        // kernels concurrently, so a single-call delta is racy. Run N
+        // iterations and assert the total stays under the two-stage
+        // count (4 per pair = 4N): fused lands at 2N + a little
+        // cross-test noise, two-stage at 4N - cleanly separable at
+        // the 3N midpoint.
+        const N: usize = 50;
+        let before = QUANT_KERNEL_LAUNCHES.load(Ordering::Relaxed);
+        for _ in 0..N {
+            let _ = w.quantise_weights_ste();
+            let _ = x.quantise_acts_ste();
+        }
+        let ste_delta = QUANT_KERNEL_LAUNCHES.load(Ordering::Relaxed) - before;
+        assert!(
+            ste_delta < 3 * N,
+            "f32 STE pair must be 1 fused launch per operand: {N} pairs cost {ste_delta} \
+             launches (two-stage would cost {})",
+            4 * N
+        );
+
+        let before = QUANT_KERNEL_LAUNCHES.load(Ordering::Relaxed);
+        for _ in 0..N {
+            let _ = x.bit_linear(&w); // k, n multiples of 4: int8 path
+        }
+        let int8_delta = QUANT_KERNEL_LAUNCHES.load(Ordering::Relaxed) - before;
+        assert!(
+            int8_delta < 3 * N,
+            "int8 bit_linear must quantise with 1 fused launch per operand: {N} calls cost \
+             {int8_delta} launches (two-stage would cost {})",
+            4 * N
+        );
+    }
+
     /// Phase 5.a quant cross-backend agreement. STE quant is a fixed
     /// transform per row / per tensor, so CPU and GPU outputs should
     /// match to within f32 round-off (the only source of drift is
@@ -3063,6 +3250,7 @@ mod tests {
     /// - every gradient tensor is finite (no NaN / inf);
     /// - the gradient norm is non-zero (a fully-zero set would mean
     ///   the chain dropped a branch somewhere).
+    ///
     /// Together with chunks 4.5.a-d's correctness gates, this is
     /// enough sanity that the orchestration is right; tighter
     /// validation lives in chunk 4.5.f's "loss decreases when we

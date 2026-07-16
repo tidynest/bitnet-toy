@@ -2457,7 +2457,7 @@ mod tests {
     // ---- Phase 4 chunk 4.5.c: full transformer block forward+backward ----
 
     /// Helper for chunk-4.5.c tests: build a small `HeadWeights<Tensor>`
-    /// + `FfnWeights<Tensor>` set with deterministic non-trivial values.
+    /// and `FfnWeights<Tensor>` set with deterministic non-trivial values.
     /// Shapes match the standard sum-of-projections invariant
     /// `n_heads * head_dim == hidden`.
     #[allow(dead_code)]

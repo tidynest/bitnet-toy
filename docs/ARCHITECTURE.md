@@ -23,10 +23,10 @@ How the modules compose, top-down.
 
 ```
                                  main.rs
-                  (TrainConfig, CLI: shakespeare /
+                  (TrainConfig, CLI: train / shakespeare /
                    shakespeare-large / sample / cuda-demo /
                    cuda-forward-bench / cuda-train-demo /
-                   cuda-shakespeare[-large], demos, tests)
+                   cuda-shakespeare[-large] / --help, demos, tests)
                                     |
        ┌────────────────────────────┼────────────────────────────┐
        |                            |                            |
@@ -375,7 +375,7 @@ semantics on the GPU.
 
 Phases 1-3 (matmul, per-op traits, end-to-end forward), Phase 4 (full GPU
 autograd, chunks 4.1-4.5.f), and Phase 5.a/5.b (real ternary BitNet training on
-int8 tensor cores) — all optional, gated behind `--features cuda`. Default
+int8 tensor cores) - all optional, gated behind `--features cuda`. Default
 `cargo build` stays
 dependency-free; CUDA work uses `cudarc 0.19` with `dynamic-loading`
 so the same binary loads on machines with the toolkit at non-default
@@ -448,11 +448,11 @@ of how much each matters (tracked as
 [GitHub issues](https://github.com/tidynest/bitnet-toy/issues)):
 
 1. **GPU is slower than CPU at this scale.** The ternary int8 GEMM is correct
-   and runs on Ada tensor cores, but each training step issues ~3000+ kernel
-   launches and per-launch driver overhead dominates the microsecond GEMMs.
-   Realising the speedup needs device-buffer reuse (`sync_from_cpu`),
-   quant-kernel fusion, CUDA graphs, and larger batches — milestone
-   **Phase 5.c — GPU perf** (issues #1-#4).
+   and runs on Ada tensor cores, but per-launch driver overhead dominates the
+   microsecond GEMMs. Device-buffer reuse (`sync_from_cpu`, issue #1) and
+   quant-kernel fusion (one launch per operand, issue #2) have landed;
+   realising the full speedup still needs CUDA graphs and larger batches -
+   milestone **Phase 5.c - GPU perf** (issues #3-#4).
 
 2. **f32 master weights.** Real BitNet keeps BF16 masters; the GEMM is now int8
    on tensor cores, but the master weights and the AdamW optimiser state remain
