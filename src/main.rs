@@ -965,50 +965,7 @@ fn run_shakespeare_training(resume_path: Option<std::path::PathBuf>, large: bool
 
     // If a resume path is provided, load the model and seed the config with it.
     if let Some(p) = resume_path {
-        let mut f = match std::fs::File::open(&p) {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!("could not open resume file {}: {}", p.display(), e);
-                std::process::exit(1);
-            }
-        };
-        match export::import(&mut f) {
-            Ok((m, fmt, optim)) => {
-                let optim_msg = if optim.is_some() {
-                    "with optim state"
-                } else {
-                    "no optim state (will reset AdamW momentum)"
-                };
-                println!(
-                    "loaded {:?}-format checkpoint from {} ({})",
-                    fmt,
-                    p.display(),
-                    optim_msg
-                );
-                cfg.start_from = Some(m);
-                // Continue the cosine LR schedule from where the previous
-                // run left off, instead of restarting at warmup-zero.
-                // Diagnosed in the v0.13 cumulative-30k run: warmup-restart
-                // perturbs converged 5M-param weights and consumed ~2k of
-                // each 10k-step resume's productive budget. Reading the
-                // step_count from the OPTM payload makes the new schedule
-                // pick up at the right position automatically.
-                if let Some(state) = optim.as_ref() {
-                    cfg.start_step_offset = state.step_count as usize;
-                    cfg.cosine_total_steps = Some(cfg.start_step_offset + cfg.n_steps);
-                    println!(
-                        "continuing cosine LR schedule: offset {} -> total {}",
-                        cfg.start_step_offset,
-                        cfg.cosine_total_steps.unwrap()
-                    );
-                }
-                cfg.start_from_optim = optim;
-            }
-            Err(e) => {
-                eprintln!("could not parse resume file {}: {}", p.display(), e);
-                std::process::exit(1);
-            }
-        }
+        apply_resume_checkpoint(&mut cfg, &p);
     }
 
     let (initial, min_seen, model, vocab, optim_state) = train_bitnet_lm(cfg);
@@ -1020,25 +977,79 @@ fn run_shakespeare_training(resume_path: Option<std::path::PathBuf>, large: bool
     );
 
     print_generation_samples(&model, &vocab, DEFAULT_PROMPTS);
+    save_train_artefacts(&model, &optim_state, "shakespeare");
+}
 
-    // Two artefacts side by side, each carrying only what its role needs:
-    //
-    //   - `shakespeare.f32.bin`  full-precision masters + AdamW optim state.
-    //     A save+load cycle is a true identity: resuming from this path picks
-    //     up at the same val_ppl the run ended on. This is the file
-    //     `cargo run --release -- shakespeare <path>` should consume for
-    //     clean continuations.
-    //
-    //   - `shakespeare.ternary_packed.bin`  the compact 1.58-bit-per-weight
-    //     deployment artefact. Optim state is *not* included here: the AdamW
-    //     `m`/`v` buffers are f32, and at the v0.9 ~2M-param scale they
-    //     dominate the file (~8 MB vs ~200 KB of packed weights). The packed
-    //     file is meant for distribution / inference, where momentum is
-    //     irrelevant; resume always uses the .f32.bin instead.
+/// Load a checkpoint into `cfg` for a resumed run: masters into
+/// `start_from`, AdamW moments into `start_from_optim`, and the cosine
+/// LR schedule continued from the checkpoint's step count instead of
+/// restarting at warmup-zero (diagnosed in the v0.13 cumulative-30k
+/// run: a warmup restart perturbs converged weights and burns ~2k of
+/// each resume's productive budget). Exits with a message on IO/parse
+/// failure - shared CLI behaviour for `shakespeare*` and `train`.
+fn apply_resume_checkpoint(cfg: &mut TrainConfig, p: &std::path::Path) {
+    let mut f = match std::fs::File::open(p) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("could not open resume file {}: {}", p.display(), e);
+            std::process::exit(1);
+        }
+    };
+    match export::import(&mut f) {
+        Ok((m, fmt, optim)) => {
+            let optim_msg = if optim.is_some() {
+                "with optim state"
+            } else {
+                "no optim state (will reset AdamW momentum)"
+            };
+            println!(
+                "loaded {:?}-format checkpoint from {} ({})",
+                fmt,
+                p.display(),
+                optim_msg
+            );
+            cfg.start_from = Some(m);
+            if let Some(state) = optim.as_ref() {
+                cfg.start_step_offset = state.step_count as usize;
+                cfg.cosine_total_steps = Some(cfg.start_step_offset + cfg.n_steps);
+                println!(
+                    "continuing cosine LR schedule: offset {} -> total {}",
+                    cfg.start_step_offset,
+                    cfg.cosine_total_steps.unwrap()
+                );
+            }
+            cfg.start_from_optim = optim;
+        }
+        Err(e) => {
+            eprintln!("could not parse resume file {}: {}", p.display(), e);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Write the two post-training artefacts under `models/<stem>.*`, each
+/// carrying only what its role needs:
+///
+///   - `<stem>.f32.bin`  full-precision masters + AdamW optim state.
+///     A save+load cycle is a true identity: resuming from this path
+///     picks up at the same val_ppl the run ended on. This is the file
+///     the `shakespeare`/`train --resume` continuations should consume.
+///
+///   - `<stem>.ternary_packed.bin`  the compact 1.58-bit-per-weight
+///     deployment artefact. Optim state is *not* included here: the
+///     AdamW `m`/`v` buffers are f32 and dominate the file at toy
+///     scales (~8 MB vs ~200 KB of packed weights). Meant for
+///     distribution / inference, where momentum is irrelevant; resume
+///     always uses the .f32.bin instead.
+fn save_train_artefacts(
+    model: &crate::model::Model,
+    optim_state: &crate::optim::OptimState,
+    stem: &str,
+) {
     let mut f32_buf = Vec::new();
-    export::export_f32(&model, &mut f32_buf, Some(&optim_state))
+    export::export_f32(model, &mut f32_buf, Some(optim_state))
         .expect("f32 export to Vec cannot fail");
-    let f32_path = models_path("shakespeare.f32.bin");
+    let f32_path = models_path(&format!("{stem}.f32.bin"));
     let _ = std::fs::write(&f32_path, &f32_buf);
     println!(
         "\nwrote {} ({:.2} KB)  resume from this for byte-identical continuation",
@@ -1047,15 +1058,255 @@ fn run_shakespeare_training(resume_path: Option<std::path::PathBuf>, large: bool
     );
 
     let mut packed = Vec::new();
-    export::export_ternary_packed(&model, &mut packed, None)
+    export::export_ternary_packed(model, &mut packed, None)
         .expect("packed export to Vec cannot fail");
-    let path = models_path("shakespeare.ternary_packed.bin");
+    let path = models_path(&format!("{stem}.ternary_packed.bin"));
     let _ = std::fs::write(&path, &packed);
     println!(
         "wrote {} ({:.2} KB)  compact deployment artefact (no optim state; resume from .f32.bin)",
         path.display(),
         packed.len() as f32 / 1024.0
     );
+}
+
+/// Parsed `train` subcommand arguments (issue #8): the fully resolved
+/// training config plus the runner-level concerns that are not part of
+/// `TrainConfig` (which checkpoint to resume from, artefact name stem).
+struct TrainArgs {
+    cfg: TrainConfig,
+    resume: Option<std::path::PathBuf>,
+    out_stem: String,
+}
+
+/// Usage text for `train`. One source of truth, printed both by
+/// `--help` and on any parse error.
+const TRAIN_USAGE: &str = "\
+usage: bitnet-toy train <corpus.txt> [options]
+
+Train a BitNet b1.58 LM on any UTF-8 text corpus. The character vocab
+is built from the corpus itself. Defaults are the `shakespeare` preset.
+
+options:
+  --steps N        training steps                    (default 10000)
+  --lr F           peak learning rate; the cosine floor follows at
+                   peak/10, matching the presets     (default 3e-3)
+  --batch-size N   windows per step                  (default 4)
+  --seed N         weight-init + shuffle seed        (default 1337)
+  --hidden N       hidden (embedding) dimension      (default 192)
+  --ffn N          FFN inner dimension               (default 2*hidden)
+  --heads N        attention heads                   (default hidden/head_dim)
+  --head-dim N     per-head dimension, must be even  (default 16)
+  --blocks N       transformer blocks                (default 6)
+  --seq-len N      training window length            (default 64)
+  --val-split F    held-out validation fraction 0..1 (default 0.10)
+  --out STEM       artefact name: models/<STEM>.f32.bin and
+                   models/<STEM>.ternary_packed.bin  (default custom)
+  --resume PATH    continue from a checkpoint (.f32.bin for identity)
+  --cuda           run forward+backward on the GPU (needs a build with
+                   --features cuda); forces n_workers = 1
+
+geometry rule: heads * head_dim must equal hidden. Omitted values are
+derived from the ones given; conflicting explicit values are an error.
+";
+
+/// Hand-rolled parser for `train <corpus> [--flag value ...]`. No clap:
+/// the project is std-only by design and a dozen flags do not justify a
+/// dependency. Pure function (no IO, no exit) so it is unit-testable;
+/// `run_train_cli` owns printing and process exit.
+fn parse_train_args(args: &[String]) -> Result<TrainArgs, String> {
+    /// Fetch the value following a `--flag`, advancing the cursor.
+    fn value<'a>(args: &'a [String], i: &mut usize, flag: &str) -> Result<&'a str, String> {
+        *i += 1;
+        args.get(*i)
+            .map(String::as_str)
+            .ok_or_else(|| format!("{flag} needs a value"))
+    }
+    /// Parse a flag value, naming the flag in the error.
+    fn num<T: std::str::FromStr>(v: &str, flag: &str) -> Result<T, String> {
+        v.parse()
+            .map_err(|_| format!("{flag}: could not parse '{v}'"))
+    }
+
+    let mut cfg = TrainConfig::shakespeare();
+    let mut corpus: Option<String> = None;
+    let mut resume: Option<std::path::PathBuf> = None;
+    let mut out_stem = "custom".to_string();
+    // Geometry is resolved after the loop, because the derivations
+    // depend on which of the three flags were given.
+    let mut hidden = cfg.model.hidden_dim;
+    let mut heads: Option<usize> = None;
+    let mut head_dim = cfg.model.head_dim;
+    let mut ffn: Option<usize> = None;
+    let mut lr: Option<f32> = None;
+
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--steps" => cfg.n_steps = num(value(args, &mut i, "--steps")?, "--steps")?,
+            "--lr" => lr = Some(num(value(args, &mut i, "--lr")?, "--lr")?),
+            "--batch-size" => {
+                cfg.batch_size = num(value(args, &mut i, "--batch-size")?, "--batch-size")?;
+            }
+            "--seed" => cfg.seed = num(value(args, &mut i, "--seed")?, "--seed")?,
+            "--hidden" => hidden = num(value(args, &mut i, "--hidden")?, "--hidden")?,
+            "--ffn" => ffn = Some(num(value(args, &mut i, "--ffn")?, "--ffn")?),
+            "--heads" => heads = Some(num(value(args, &mut i, "--heads")?, "--heads")?),
+            "--head-dim" => head_dim = num(value(args, &mut i, "--head-dim")?, "--head-dim")?,
+            "--blocks" => cfg.model.n_blocks = num(value(args, &mut i, "--blocks")?, "--blocks")?,
+            "--seq-len" => {
+                cfg.model.max_seq_len = num(value(args, &mut i, "--seq-len")?, "--seq-len")?;
+            }
+            "--val-split" => {
+                cfg.val_split = num(value(args, &mut i, "--val-split")?, "--val-split")?;
+            }
+            "--out" => out_stem = value(args, &mut i, "--out")?.to_string(),
+            "--resume" => {
+                resume = Some(std::path::PathBuf::from(value(args, &mut i, "--resume")?));
+            }
+            "--cuda" => {
+                cfg.use_cuda_backward = true;
+                // GPU is the parallelism layer; multiple dispatch
+                // threads would serialise on the default stream anyway.
+                cfg.n_workers = 1;
+            }
+            flag if flag.starts_with("--") => return Err(format!("unknown flag: {flag}")),
+            positional => {
+                if corpus.is_some() {
+                    return Err(format!(
+                        "unexpected extra argument '{positional}' (corpus already given)"
+                    ));
+                }
+                corpus = Some(positional.to_string());
+            }
+        }
+        i += 1;
+    }
+
+    let corpus = corpus.ok_or("missing <corpus> argument")?;
+    if head_dim == 0 || !head_dim.is_multiple_of(2) {
+        return Err(format!(
+            "--head-dim must be a positive even number (RoPE rotates pairs), got {head_dim}"
+        ));
+    }
+    let heads = match heads {
+        Some(h) => h,
+        None => {
+            if !hidden.is_multiple_of(head_dim) {
+                return Err(format!(
+                    "hidden {hidden} is not divisible by head_dim {head_dim}; \
+                     pass --heads explicitly or adjust --hidden/--head-dim"
+                ));
+            }
+            hidden / head_dim
+        }
+    };
+    if heads == 0 || heads * head_dim != hidden {
+        return Err(format!(
+            "geometry mismatch: {heads} heads x {head_dim} head_dim != hidden {hidden}"
+        ));
+    }
+    if let Some(lr) = lr {
+        if lr <= 0.0 {
+            return Err(format!("--lr must be positive, got {lr}"));
+        }
+        cfg.peak_lr = lr;
+        cfg.floor_lr = lr / 10.0; // same 10:1 ratio as the presets
+    }
+    cfg.model.hidden_dim = hidden;
+    cfg.model.n_heads = heads;
+    cfg.model.head_dim = head_dim;
+    cfg.model.ffn_dim = ffn.unwrap_or(2 * hidden); // preset ratio
+    cfg.corpus_path = Some(std::path::PathBuf::from(corpus));
+    Ok(TrainArgs {
+        cfg,
+        resume,
+        out_stem,
+    })
+}
+
+/// `train` subcommand runner (issue #8): parse, validate IO, train,
+/// sample, save. IO and process-exit live here so the parser stays a
+/// pure function.
+fn run_train_cli(raw: &[String]) {
+    let TrainArgs {
+        mut cfg,
+        resume,
+        out_stem,
+    } = match parse_train_args(raw) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("error: {e}\n");
+            eprint!("{TRAIN_USAGE}");
+            std::process::exit(2);
+        }
+    };
+    let corpus = cfg
+        .corpus_path
+        .clone()
+        .expect("parser always sets corpus_path");
+    // Fail loud here rather than letting train_bitnet_lm fall back to
+    // the embedded TINY_CORPUS - silently training on the wrong corpus
+    // is exactly the kind of skip a user cannot see in the output.
+    if !corpus.exists() {
+        eprintln!("error: corpus file not found: {}", corpus.display());
+        std::process::exit(1);
+    }
+    if let Some(p) = resume {
+        if !p.exists() {
+            eprintln!("error: resume checkpoint not found: {}", p.display());
+            std::process::exit(1);
+        }
+        apply_resume_checkpoint(&mut cfg, &p);
+    }
+
+    let (initial, min_seen, model, vocab, optim_state) = train_bitnet_lm(cfg);
+    println!(
+        "\nTraining done.  initial = {:.4}   min seen = {:.4}   ratio = {:.2}",
+        initial,
+        min_seen,
+        min_seen / initial
+    );
+
+    // An arbitrary corpus may not contain every char of the stock
+    // Shakespeare prompts, and Vocab::encode panics (by design) on
+    // unknown chars. Sample only with the prompts this vocab can carry.
+    let usable: Vec<&str> = DEFAULT_PROMPTS
+        .iter()
+        .copied()
+        .filter(|p| vocab.can_encode(p))
+        .collect();
+    if usable.is_empty() {
+        println!(
+            "\n(generation tail skipped: none of the default prompts fit this corpus's vocab;\n \
+             use `sample models/{out_stem}.f32.bin --corpus {} <your prompt>` instead)",
+            corpus.display()
+        );
+    } else {
+        print_generation_samples(&model, &vocab, &usable);
+    }
+    save_train_artefacts(&model, &optim_state, &out_stem);
+}
+
+/// Top-level `--help` text: every subcommand on one screen. The `train`
+/// flag detail lives in `TRAIN_USAGE`.
+fn print_help() {
+    println!(
+        "bitnet-toy - a from-scratch BitNet b1.58 language model in pure Rust\n\n\
+         usage: bitnet-toy [subcommand] [args]\n\n\
+         subcommands:\n  \
+         (none)                        run the M4-M10 curriculum demo\n  \
+         train <corpus> [options]      train on any UTF-8 corpus (see below)\n  \
+         shakespeare [resume]          ~5M-param TinyShakespeare training\n  \
+         shakespeare-large [resume]    ~8.5M-param variant, seq_len 128\n  \
+         sample <checkpoint> [--corpus <path>] [prompt]\n                                generate from a checkpoint, no training; --corpus\n                                rebuilds the vocab for `train`-made checkpoints\n  \
+         cuda-shakespeare [resume]     GPU ~5M training        (needs --features cuda)\n  \
+         cuda-shakespeare-large        GPU ~8.5M training      (needs --features cuda)\n  \
+         cuda-demo                     CPU vs CUDA matmul timings (needs --features cuda)\n  \
+         cuda-forward-bench            end-to-end forward bench   (needs --features cuda)\n  \
+         cuda-train-demo               GPU train wiring proof     (needs --features cuda)\n  \
+         help | --help | -h            this text\n"
+    );
+    print!("{TRAIN_USAGE}");
 }
 
 /// Print the same five generation passes the trainer prints at the end
@@ -1303,18 +1554,68 @@ fn enabled_sample_modes() -> Vec<SampleMode> {
 /// without paying the ~50-minute cost of a fresh training run; especially
 /// useful for verifying inference-path bug fixes (e.g. the v0.16.1
 /// KV-cache sliding-window fix) against an existing checkpoint.
-fn run_sample_only(path: std::path::PathBuf) {
+/// Parse `sample <checkpoint> [--corpus PATH] [prompt words...]`.
+/// Pure function (issue #8 discipline): no IO, no exit, unit-testable.
+/// `--corpus` may appear anywhere after the checkpoint; every other
+/// token joins the prompt with single spaces (so multi-word prompts
+/// need no shell quoting). Returns (checkpoint, corpus, prompt).
+type SampleArgs = (
+    std::path::PathBuf,
+    Option<std::path::PathBuf>,
+    Option<String>,
+);
+
+fn parse_sample_args(args: &[String]) -> Result<SampleArgs, String> {
+    let mut it = args.iter();
+    let ckpt = it
+        .next()
+        .ok_or("missing <checkpoint> argument")?
+        .to_string();
+    let mut corpus: Option<std::path::PathBuf> = None;
+    let mut prompt_words: Vec<&str> = Vec::new();
+    while let Some(a) = it.next() {
+        if a == "--corpus" {
+            let p = it.next().ok_or("--corpus needs a value")?;
+            corpus = Some(std::path::PathBuf::from(p));
+        } else {
+            prompt_words.push(a);
+        }
+    }
+    let prompt = if prompt_words.is_empty() {
+        None
+    } else {
+        Some(prompt_words.join(" "))
+    };
+    Ok((std::path::PathBuf::from(ckpt), corpus, prompt))
+}
+
+/// Standalone sampling entry point: load a checkpoint, rebuild the
+/// vocab from its training corpus (TinyShakespeare unless `--corpus`
+/// points elsewhere - required for checkpoints made by
+/// `train <corpus>`), and run every enabled sampling mode.
+///
+/// With a caller prompt, that single prompt is used; out-of-vocab
+/// characters are dropped with a warning instead of panicking, so
+/// "feed it random BS" stays friendly. Without one, the stock prompts
+/// run, filtered to those the vocab can actually encode.
+fn run_sample_cli(
+    path: std::path::PathBuf,
+    corpus_override: Option<std::path::PathBuf>,
+    raw_prompt: Option<String>,
+) {
     use crate::data::{Vocab, read_corpus};
 
     if !path.exists() {
         eprintln!("checkpoint not found: {}", path.display());
         std::process::exit(1);
     }
-    let corpus_path = std::path::PathBuf::from("data/tinyshakespeare.txt");
+    let corpus_path =
+        corpus_override.unwrap_or_else(|| std::path::PathBuf::from("data/tinyshakespeare.txt"));
     if !corpus_path.exists() {
         eprintln!(
             "Could not find {} (needed to rebuild the same vocab the model was trained against).\n\
-             Download it with:\n  \
+             For a model trained via `train <corpus>`, pass the same corpus with --corpus.\n\
+             For the Shakespeare models, download it with:\n  \
              curl -sSL https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt \\\n    \
              -o data/tinyshakespeare.txt",
             corpus_path.display()
@@ -1358,102 +1659,52 @@ fn run_sample_only(path: std::path::PathBuf) {
     if vocab.size() != model.config.vocab_size {
         eprintln!(
             "vocab size mismatch: corpus has {} chars, checkpoint expects {}.\n\
-             The corpus on disk has drifted from the one this model was trained on.",
+             The corpus on disk is not the one this model was trained on\n\
+             (wrong --corpus, or the file drifted).",
             vocab.size(),
             model.config.vocab_size
         );
         std::process::exit(1);
     }
 
-    print_generation_samples(&model, &vocab, DEFAULT_PROMPTS);
-}
-
-/// Variant of `run_sample_only` that takes a caller-supplied prompt and
-/// runs all six sampling modes on just that one prompt. The prompt is
-/// silently filtered to the trained vocab (out-of-vocab characters get
-/// dropped instead of panicking, so "feed it random BS" stays friendly).
-fn run_sample_only_with_prompt(path: std::path::PathBuf, raw_prompt: String) {
-    use crate::data::{Vocab, read_corpus};
-
-    if !path.exists() {
-        eprintln!("checkpoint not found: {}", path.display());
-        std::process::exit(1);
-    }
-    let corpus_path = std::path::PathBuf::from("data/tinyshakespeare.txt");
-    if !corpus_path.exists() {
-        eprintln!(
-            "Could not find {} (needed to rebuild the same vocab the model was trained against).",
-            corpus_path.display()
-        );
-        std::process::exit(1);
-    }
-
-    let mut f = match std::fs::File::open(&path) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("could not open checkpoint {}: {}", path.display(), e);
-            std::process::exit(1);
+    match raw_prompt {
+        Some(raw) => {
+            // Filter the prompt to chars in the trained vocab; report
+            // what got dropped so the user knows what the model saw.
+            let filtered: String = raw.chars().filter(|c| vocab.can_encode_char(*c)).collect();
+            let dropped_count = raw.chars().count() - filtered.chars().count();
+            if dropped_count > 0 {
+                eprintln!("warning: dropped {dropped_count} out-of-vocab char(s) from prompt");
+            }
+            if filtered.is_empty() {
+                eprintln!("prompt empty after vocab filter; nothing to feed the model");
+                std::process::exit(1);
+            }
+            println!(
+                "prompt (in-vocab) = {:?}  ({} chars)",
+                filtered,
+                filtered.chars().count()
+            );
+            print_generation_samples(&model, &vocab, &[filtered.as_str()]);
         }
-    };
-    let (model, fmt, _optim) = match export::import(&mut f) {
-        Ok(triple) => triple,
-        Err(e) => {
-            eprintln!("could not parse checkpoint {}: {}", path.display(), e);
-            std::process::exit(1);
+        None => {
+            let usable: Vec<&str> = DEFAULT_PROMPTS
+                .iter()
+                .copied()
+                .filter(|p| vocab.can_encode(p))
+                .collect();
+            if usable.is_empty() {
+                eprintln!(
+                    "none of the default prompts fit this corpus's vocab; pass a prompt:\n  \
+                     sample {} --corpus {} <your prompt>",
+                    path.display(),
+                    corpus_path.display()
+                );
+                std::process::exit(1);
+            }
+            print_generation_samples(&model, &vocab, &usable);
         }
-    };
-    println!("loaded {:?}-format checkpoint from {}", fmt, path.display());
-
-    let corpus = match read_corpus(&corpus_path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("could not read {}: {}", corpus_path.display(), e);
-            std::process::exit(1);
-        }
-    };
-    let vocab = Vocab::from_text(&corpus);
-    if vocab.size() != model.config.vocab_size {
-        eprintln!(
-            "vocab size mismatch: corpus has {} chars, checkpoint expects {}.\n\
-             The corpus on disk has drifted from the one this model was trained on.",
-            vocab.size(),
-            model.config.vocab_size
-        );
-        std::process::exit(1);
     }
-
-    // Filter prompt to chars present in the trained vocab; report what
-    // got dropped (if anything) so the user knows. Vocab is the 65 chars
-    // of TinyShakespeare - mostly printable ASCII letters / digits /
-    // common punctuation / newline / space - so most natural English
-    // prompts pass through unchanged.
-    let in_vocab: std::collections::HashSet<char> = corpus.chars().collect();
-    let filtered: String = raw_prompt
-        .chars()
-        .filter(|c| in_vocab.contains(c))
-        .collect();
-    let dropped: String = raw_prompt
-        .chars()
-        .filter(|c| !in_vocab.contains(c))
-        .collect();
-    if !dropped.is_empty() {
-        eprintln!(
-            "warning: dropped {} out-of-vocab char(s) from prompt: {:?}",
-            dropped.chars().count(),
-            dropped
-        );
-    }
-    if filtered.is_empty() {
-        eprintln!("prompt empty after vocab filter; nothing to feed the model");
-        std::process::exit(1);
-    }
-    println!(
-        "prompt (in-vocab) = {:?}  ({} chars)",
-        filtered,
-        filtered.chars().count()
-    );
-
-    print_generation_samples(&model, &vocab, &[filtered.as_str()]);
 }
 
 /// End-to-end CPU vs GPU model forward benchmark. Builds a tiny model
@@ -1848,7 +2099,9 @@ fn run_cuda_train_demo() {
 }
 
 fn main() {
-    // CLI dispatch:
+    // CLI dispatch (see `print_help` for the user-facing list):
+    //   cargo run --release -- --help                             -- all subcommands + train flags
+    //   cargo run --release -- train <corpus> [options]           -- train arbitrary corpus (issue #8)
     //   cargo run --release                                       -- runs M4-M10 demo
     //   cargo run --release -- shakespeare                        -- fresh ~5M training
     //   cargo run --release -- shakespeare <resume_path>          -- resume ~5M
@@ -1863,6 +2116,14 @@ fn main() {
     //   cargo run --release --features cuda -- cuda-forward-bench -- end-to-end CudaModel forward bench
     //   cargo run --release --features cuda -- cuda-train-demo    -- Phase 4 GPU forward+backward proof
     let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 && (args[1] == "--help" || args[1] == "-h" || args[1] == "help") {
+        print_help();
+        return;
+    }
+    if args.len() > 1 && args[1] == "train" {
+        run_train_cli(&args[2..]);
+        return;
+    }
     if args.len() > 1 && (args[1] == "shakespeare" || args[1] == "shakespeare-large") {
         let large = args[1] == "shakespeare-large";
         let resume_path = args
@@ -1873,27 +2134,20 @@ fn main() {
         return;
     }
     if args.len() > 1 && args[1] == "sample" {
-        let path = match args.get(2) {
-            Some(s) => std::path::PathBuf::from(s),
-            None => {
+        match parse_sample_args(&args[2..]) {
+            Ok((path, corpus, prompt)) => run_sample_cli(path, corpus, prompt),
+            Err(e) => {
                 eprintln!(
-                    "usage: cargo run --release -- sample <checkpoint_path> [prompt...]\n\
+                    "error: {e}\n\
+                     usage: cargo run --release -- sample <checkpoint_path> [--corpus <path>] [prompt...]\n\
                      examples:\n  \
                      cargo run --release -- sample models/shakespeare.f32.bin\n  \
                      cargo run --release -- sample models/shakespeare.f32.bin \"BANANA:\"\n  \
-                     cargo run --release -- sample models/shakespeare.f32.bin Look thee well"
+                     cargo run --release -- sample models/shakespeare.f32.bin Look thee well\n  \
+                     cargo run --release -- sample models/custom.f32.bin --corpus data/my.txt hello"
                 );
                 std::process::exit(2);
             }
-        };
-        // Anything after the path is treated as the prompt. Joining with
-        // single spaces lets the user skip shell-quoting for multi-word
-        // prompts ("Look thee well" works, as does "Look\\ thee\\ well").
-        if args.len() > 3 {
-            let raw_prompt = args[3..].join(" ");
-            run_sample_only_with_prompt(path, raw_prompt);
-        } else {
-            run_sample_only(path);
         }
         return;
     }
@@ -2267,5 +2521,141 @@ mod tests {
         let (loss_b, ppl_b) = eval_val_perplexity(&model, &dummy, 0);
         assert!(loss_b.is_nan(), "expected NaN val_loss for n_samples=0");
         assert!(ppl_b.is_nan(), "expected NaN val_ppl for n_samples=0");
+    }
+
+    /// Helper: string-vec from literals, keeps the CLI tests readable.
+    fn cli(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn train_cli_defaults_use_shakespeare_preset() {
+        // Issue #8: `train <corpus>` with no flags trains the standard
+        // preset on the given corpus. Only the corpus path changes.
+        let a = parse_train_args(&cli(&["my_corpus.txt"])).unwrap();
+        assert_eq!(
+            a.cfg.corpus_path.as_deref(),
+            Some(std::path::Path::new("my_corpus.txt"))
+        );
+        let preset = TrainConfig::shakespeare();
+        assert_eq!(a.cfg.n_steps, preset.n_steps);
+        assert_eq!(a.cfg.seed, preset.seed);
+        assert_eq!(a.cfg.model.hidden_dim, preset.model.hidden_dim);
+        assert_eq!(a.out_stem, "custom");
+        assert!(a.resume.is_none());
+        assert!(!a.cfg.use_cuda_backward);
+    }
+
+    #[test]
+    fn train_cli_overrides_hyperparameters() {
+        let a = parse_train_args(&cli(&[
+            "c.txt",
+            "--steps",
+            "500",
+            "--lr",
+            "0.001",
+            "--batch-size",
+            "2",
+            "--seed",
+            "7",
+            "--hidden",
+            "64",
+            "--ffn",
+            "128",
+            "--blocks",
+            "3",
+            "--seq-len",
+            "32",
+            "--out",
+            "tiny",
+            "--cuda",
+        ]))
+        .unwrap();
+        assert_eq!(a.cfg.n_steps, 500);
+        assert!((a.cfg.peak_lr - 1e-3).abs() < 1e-9, "peak_lr not applied");
+        assert!(
+            (a.cfg.floor_lr - 1e-4).abs() < 1e-9,
+            "floor_lr should follow peak_lr at the preset 10:1 ratio"
+        );
+        assert_eq!(a.cfg.batch_size, 2);
+        assert_eq!(a.cfg.seed, 7);
+        assert_eq!(a.cfg.model.hidden_dim, 64);
+        // Heads derived from hidden / head_dim when --heads is absent.
+        assert_eq!(a.cfg.model.head_dim, 16);
+        assert_eq!(a.cfg.model.n_heads, 4);
+        assert_eq!(a.cfg.model.ffn_dim, 128);
+        assert_eq!(a.cfg.model.n_blocks, 3);
+        assert_eq!(a.cfg.model.max_seq_len, 32);
+        assert_eq!(a.out_stem, "tiny");
+        assert!(a.cfg.use_cuda_backward);
+        assert_eq!(a.cfg.n_workers, 1, "GPU path must force serial workers");
+    }
+
+    #[test]
+    fn train_cli_geometry_flags_compose() {
+        // Explicit --heads + --head-dim must agree with --hidden.
+        let a = parse_train_args(&cli(&[
+            "c.txt",
+            "--hidden",
+            "96",
+            "--heads",
+            "12",
+            "--head-dim",
+            "8",
+        ]))
+        .unwrap();
+        assert_eq!(a.cfg.model.n_heads, 12);
+        assert_eq!(a.cfg.model.head_dim, 8);
+        // Resume path is carried through for the runner to load.
+        let b = parse_train_args(&cli(&["c.txt", "--resume", "models/x.f32.bin"])).unwrap();
+        assert_eq!(
+            b.resume.as_deref(),
+            Some(std::path::Path::new("models/x.f32.bin"))
+        );
+    }
+
+    #[test]
+    fn sample_cli_parses_corpus_flag_and_prompt() {
+        // Issue #8 companion: sampling a checkpoint trained on an
+        // arbitrary corpus needs that corpus to rebuild the vocab.
+        let (ckpt, corpus, prompt) =
+            parse_sample_args(&cli(&["m.bin", "--corpus", "c.txt", "Look", "thee"])).unwrap();
+        assert_eq!(ckpt, std::path::PathBuf::from("m.bin"));
+        assert_eq!(corpus.as_deref(), Some(std::path::Path::new("c.txt")));
+        assert_eq!(prompt.as_deref(), Some("Look thee"));
+
+        // Plain form: checkpoint only, defaults elsewhere.
+        let (_, corpus2, prompt2) = parse_sample_args(&cli(&["m.bin"])).unwrap();
+        assert!(corpus2.is_none());
+        assert!(prompt2.is_none());
+
+        // Flag order does not matter relative to prompt words.
+        let (_, corpus3, prompt3) =
+            parse_sample_args(&cli(&["m.bin", "Look", "--corpus", "c.txt", "thee"])).unwrap();
+        assert_eq!(corpus3.as_deref(), Some(std::path::Path::new("c.txt")));
+        assert_eq!(prompt3.as_deref(), Some("Look thee"));
+
+        assert!(parse_sample_args(&cli(&[])).is_err());
+        assert!(parse_sample_args(&cli(&["m.bin", "--corpus"])).is_err());
+    }
+
+    #[test]
+    fn train_cli_rejects_bad_input() {
+        // No corpus at all.
+        assert!(parse_train_args(&cli(&[])).is_err());
+        // Unknown flag.
+        assert!(parse_train_args(&cli(&["c.txt", "--bogus", "1"])).is_err());
+        // Flag missing its value.
+        assert!(parse_train_args(&cli(&["c.txt", "--steps"])).is_err());
+        // Unparsable value.
+        assert!(parse_train_args(&cli(&["c.txt", "--steps", "abc"])).is_err());
+        // hidden not divisible by head_dim (16): cannot derive heads.
+        assert!(parse_train_args(&cli(&["c.txt", "--hidden", "100"])).is_err());
+        // Inconsistent geometry: 5 heads x 16 head_dim != 64 hidden.
+        assert!(parse_train_args(&cli(&["c.txt", "--heads", "5", "--hidden", "64"])).is_err());
+        // RoPE rotates pairs: odd head_dim is invalid.
+        assert!(parse_train_args(&cli(&["c.txt", "--head-dim", "7", "--hidden", "56"])).is_err());
+        // Two positional corpus arguments.
+        assert!(parse_train_args(&cli(&["a.txt", "b.txt"])).is_err());
     }
 }

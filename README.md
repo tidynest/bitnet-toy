@@ -96,13 +96,19 @@ f32 baseline.
 ## CLI
 
 ```text
+cargo run --release -- --help                             # all subcommands + train flags
 cargo run --release                                       # M4-M10 demos
+cargo run --release -- train <corpus> [options]           # train any UTF-8 corpus; see `--help` for
+                                                          #   --steps --lr --batch-size --seed --hidden --ffn
+                                                          #   --heads --head-dim --blocks --seq-len --val-split
+                                                          #   --out --resume --cuda
 cargo run --release -- shakespeare                        # fresh Shakespeare training (~5M params)
 cargo run --release -- shakespeare <path>                 # resume ~5M training from checkpoint
 cargo run --release -- shakespeare-large                  # fresh ~8.5M training (seq_len 128)
 cargo run --release -- shakespeare-large <path>           # resume ~8.5M training from checkpoint
 cargo run --release -- sample <path>                      # skip training; print samples on the 3 default prompts
 cargo run --release -- sample <path> <prompt...>          # skip training; sample from a caller-supplied prompt
+cargo run --release -- sample <path> --corpus <corpus> .. # rebuild vocab from a custom training corpus
 BITNET_SAMPLE_MODES=min cargo run --release -- sample ... # only the 2 highest-signal modes (top-p T=0.5 + KV-cache)
 BITNET_SAMPLE_MODES=topp_low,kv cargo run -- shakespeare  # subset; same env var also gates the post-train tail
 cargo run --release --features cuda -- cuda-demo          # CPU-vs-cuBLAS matmul microbench
@@ -111,6 +117,18 @@ cargo run --release --features cuda -- cuda-train-demo    # Phase 4 end-to-end G
 cargo run --release --features cuda -- cuda-shakespeare    # Phase 5.a real BitNet ternary training on GPU
 cargo run --release --features cuda -- cuda-shakespeare-large  # Phase 5.a, ~8.5M-param config, seq_len 128
 ```
+
+Training an arbitrary corpus end to end:
+
+```text
+cargo run --release -- train data/my_corpus.txt --steps 2000 --out mymodel
+cargo run --release -- train data/my_corpus.txt --resume models/mymodel.f32.bin --out mymodel
+cargo run --release -- sample models/mymodel.f32.bin --corpus data/my_corpus.txt "once upon"
+```
+
+The char vocab is built from the corpus itself, so `sample` needs the same
+corpus (via `--corpus`) to rebuild it; the vocab-size check catches a
+mismatched file.
 
 ## Project layout
 
@@ -154,9 +172,11 @@ and how the pieces compose.
 
 Brief recipe (full guide in [docs/TRAINING.md](docs/TRAINING.md)):
 
-1. Place a UTF-8 corpus at `data/tinyshakespeare.txt` (or any path you set in
-   `TrainConfig.corpus_path`).
-2. Run `cargo run --release -- shakespeare`.
+1. Place a UTF-8 corpus at `data/tinyshakespeare.txt` (or anywhere, and use
+   `train <path>` instead).
+2. Run `cargo run --release -- shakespeare` (preset) or
+   `cargo run --release -- train <corpus> [options]` (any corpus,
+   hyperparameters overridable from the command line).
 3. Watch the four-column status line every 100 steps:
    `train_loss`, `anchor_loss` (smooth signal), `min_seen`, `lr`, `|g|`.
 4. After training completes, the model is exported to both `models/shakespeare.f32.bin`
