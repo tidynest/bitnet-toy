@@ -785,6 +785,23 @@ impl CudaTensor {
         })
     }
 
+    /// Overwrite this tensor's device buffer in place from a CPU tensor
+    /// of identical shape. No allocation: the existing `CudaSlice` is
+    /// reused via `memcpy_htod` (stream-ordered, so later kernel
+    /// launches on the same stream see the new values).
+    pub fn copy_from_cpu(&mut self, t: &Tensor) -> Result<(), String> {
+        if self.shape != t.shape {
+            return Err(format!(
+                "copy_from_cpu shape mismatch: device {:?} vs host {:?}",
+                self.shape, t.shape
+            ));
+        }
+        let s = cuda_state()?;
+        s.stream
+            .memcpy_htod(&t.data, &mut self.data)
+            .map_err(|e| format!("memcpy_htod failed: {e:?}"))
+    }
+
     /// Copy device memory back into a CPU `Tensor`. Synchronous.
     pub fn to_cpu(&self) -> Result<Tensor, String> {
         let s = cuda_state()?;
@@ -1922,6 +1939,53 @@ impl CudaModel {
         }
     }
 
+    /// Refresh every device weight in place from the CPU masters
+    /// (issue #1). Same walk order as `from_cpu`, but the existing
+    /// device buffers are overwritten via `memcpy_htod` instead of
+    /// reallocated, so the per-step rebuild allocates zero new device
+    /// buffers. Weight shapes are step-invariant during training, so
+    /// an architecture mismatch is a caller bug and panics.
+    pub fn sync_from_cpu(&mut self, model: &crate::model::Model) {
+        assert_eq!(
+            self.blocks.len(),
+            model.blocks.len(),
+            "sync_from_cpu: block count changed"
+        );
+        for (db, hb) in self.blocks.iter_mut().zip(&model.blocks) {
+            assert_eq!(
+                db.heads.len(),
+                hb.heads.len(),
+                "sync_from_cpu: head count changed"
+            );
+            for (dh, hh) in db.heads.iter_mut().zip(&hb.heads) {
+                dh.w_q.copy_from_cpu(&hh.w_q).expect("H->D w_q sync failed");
+                dh.w_k.copy_from_cpu(&hh.w_k).expect("H->D w_k sync failed");
+                dh.w_v.copy_from_cpu(&hh.w_v).expect("H->D w_v sync failed");
+                dh.w_o.copy_from_cpu(&hh.w_o).expect("H->D w_o sync failed");
+            }
+            db.ffn
+                .w_gate
+                .copy_from_cpu(&hb.ffn_gate_w)
+                .expect("H->D w_gate sync failed");
+            db.ffn
+                .w_up
+                .copy_from_cpu(&hb.ffn_up_w)
+                .expect("H->D w_up sync failed");
+            db.ffn
+                .w_down
+                .copy_from_cpu(&hb.ffn_down_w)
+                .expect("H->D w_down sync failed");
+        }
+        // Host-side embed copy: overwrite in place too (shapes match),
+        // so the per-step rebuild allocates nothing on either side.
+        self.token_embed_cpu
+            .data
+            .copy_from_slice(&model.token_embed.data);
+        self.token_embed_device
+            .copy_from_cpu(&model.token_embed)
+            .expect("H->D token_embed sync failed");
+    }
+
     /// End-to-end forward pass: token ids -> logits `[seq, vocab]`.
     ///
     /// Pipeline:
@@ -2779,6 +2843,77 @@ mod tests {
             })
             .unwrap();
         assert_eq!(cpu_argmax, gpu_argmax, "greedy-token disagreement");
+    }
+
+    /// Issue #1: `sync_from_cpu` must refresh the device weights in
+    /// place - same device buffers (zero new allocations), new values.
+    /// Bitwise agreement with a freshly built `from_cpu` model proves
+    /// the copy is complete; device-pointer equality proves the
+    /// existing allocations were reused rather than replaced.
+    #[test]
+    fn cuda_model_sync_from_cpu_reuses_buffers_and_matches_rebuild() {
+        if cuda_state().is_err() {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        }
+        use crate::model::{Model, ModelConfig};
+        use cudarc::driver::DevicePtr;
+        let config = ModelConfig {
+            vocab_size: 17,
+            hidden_dim: 32,
+            n_heads: 4,
+            head_dim: 8,
+            ffn_dim: 64,
+            max_seq_len: 16,
+            n_blocks: 2,
+        };
+        let mut model = Model::new(&config, 42);
+        let ids: Vec<usize> = vec![0, 3, 7, 11, 5, 1, 9];
+        let mut cuda_model = CudaModel::from_cpu(&model);
+        let stale_logits = cuda_model.forward(&ids).to_cpu().unwrap();
+
+        let st = cuda_state().unwrap();
+        let w_q_ptr_before = cuda_model.blocks[0].heads[0]
+            .w_q
+            .data
+            .device_ptr(&st.stream)
+            .0;
+        let embed_ptr_before = cuda_model.token_embed_device.data.device_ptr(&st.stream).0;
+
+        // Simulate an optimiser step: every master weight moves.
+        model.for_each_param_mut(|t| {
+            for v in t.data.iter_mut() {
+                *v += 0.25;
+            }
+        });
+
+        cuda_model.sync_from_cpu(&model);
+
+        let w_q_ptr_after = cuda_model.blocks[0].heads[0]
+            .w_q
+            .data
+            .device_ptr(&st.stream)
+            .0;
+        let embed_ptr_after = cuda_model.token_embed_device.data.device_ptr(&st.stream).0;
+        assert_eq!(
+            w_q_ptr_before, w_q_ptr_after,
+            "w_q device buffer was reallocated"
+        );
+        assert_eq!(
+            embed_ptr_before, embed_ptr_after,
+            "token_embed device buffer was reallocated"
+        );
+
+        let synced = cuda_model.forward(&ids).to_cpu().unwrap();
+        let rebuilt = CudaModel::from_cpu(&model).forward(&ids).to_cpu().unwrap();
+        assert_eq!(
+            synced.data, rebuilt.data,
+            "synced forward differs from a fresh from_cpu rebuild"
+        );
+        assert_ne!(
+            synced.data, stale_logits.data,
+            "sync_from_cpu left the device weights stale"
+        );
     }
 
     /// **The headline test of Chunk 2.4.** Full transformer block
