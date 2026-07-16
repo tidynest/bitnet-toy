@@ -46,6 +46,21 @@ impl Vocab {
         self.id_to_char.len()
     }
 
+    /// True when `c` is in the vocab. Single-char building block for
+    /// `can_encode`; public so prompt filters can drop out-of-vocab
+    /// chars without rebuilding a char set from the corpus.
+    pub fn can_encode_char(&self, c: char) -> bool {
+        self.char_to_id.contains_key(&c)
+    }
+
+    /// True when every char of `text` is in the vocab, i.e. `encode`
+    /// would succeed. Lets callers with *runtime* text (CLI prompts
+    /// against an arbitrary training corpus, issue #8) check first
+    /// instead of hitting `encode`'s intentional bug-catching panic.
+    pub fn can_encode(&self, text: &str) -> bool {
+        text.chars().all(|c| self.can_encode_char(c))
+    }
+
     /// Encode a string to a vec of token ids.
     /// Panics if a char isn't in the vocab - a corpus/text mismatch is a bug,
     /// not a runtime condition. Failing loud here saves debugging later.
@@ -192,6 +207,14 @@ mod tests {
         // Vocab has only 'a', 'b', 'c'; encoding 'z' must fail loudly.
         let v = Vocab::from_text("abc");
         let _ = v.encode("z");
+    }
+
+    #[test]
+    fn can_encode_reports_vocab_membership() {
+        let v = Vocab::from_text("abc");
+        assert!(v.can_encode("cab"));
+        assert!(v.can_encode("")); // vacuously encodable
+        assert!(!v.can_encode("abz"));
     }
 
     #[test]

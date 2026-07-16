@@ -2,7 +2,7 @@
 
 ![version](https://img.shields.io/badge/version-v0.19.0-3b6ea5)
 ![Rust](https://img.shields.io/badge/Rust-2024%20edition-ce412b?logo=rust&logoColor=white)
-![tests](https://img.shields.io/badge/tests-140%20passing-3f9142)
+![tests](https://img.shields.io/badge/tests-147%20passing-3f9142)
 ![CUDA](https://img.shields.io/badge/CUDA-optional%20(cudarc%200.19)-76b900?logo=nvidia&logoColor=white)
 ![ML dependencies](https://img.shields.io/badge/ML%20dependencies-none-3f9142)
 
@@ -28,7 +28,7 @@ inference, binary export. No third-party ML dependencies.
 
 ## Status
 
-- **140** tests passing on `cargo test`; **172** with `cargo test --features cuda`.
+- **147** tests passing on `cargo test`; **181** with `cargo test --features cuda`.
 - **0** warnings on `cargo build --release` (or `--features cuda`).
 - `cargo audit` clean for the default build (stdlib-only); the optional
   `cuda` feature pulls `cudarc` and its small dynamic-loading deps.
@@ -46,8 +46,9 @@ inference, binary export. No third-party ML dependencies.
   v0.13 scale (loss trajectory matches CPU). Empirically GPU is
   ~300 ms/step vs CPU ~180 ms/step at v0.13 scale: per-step
   launch overhead dominates (~3000+ kernel launches per step).
-  Kernel fusion + CUDA graphs + larger batches are the
-  follow-ups to actually realise tensor-core throughput.
+  Device-buffer reuse (#1) and quant-kernel fusion (#2, one
+  launch per operand) have landed; CUDA graphs + larger batches
+  are the follow-ups to actually realise tensor-core throughput.
 
 ## Quick start
 
@@ -96,13 +97,19 @@ f32 baseline.
 ## CLI
 
 ```text
+cargo run --release -- --help                             # all subcommands + train flags
 cargo run --release                                       # M4-M10 demos
+cargo run --release -- train <corpus> [options]           # train any UTF-8 corpus; see `--help` for
+                                                          #   --steps --lr --batch-size --seed --hidden --ffn
+                                                          #   --heads --head-dim --blocks --seq-len --val-split
+                                                          #   --out --resume --cuda
 cargo run --release -- shakespeare                        # fresh Shakespeare training (~5M params)
 cargo run --release -- shakespeare <path>                 # resume ~5M training from checkpoint
 cargo run --release -- shakespeare-large                  # fresh ~8.5M training (seq_len 128)
 cargo run --release -- shakespeare-large <path>           # resume ~8.5M training from checkpoint
 cargo run --release -- sample <path>                      # skip training; print samples on the 3 default prompts
 cargo run --release -- sample <path> <prompt...>          # skip training; sample from a caller-supplied prompt
+cargo run --release -- sample <path> --corpus <corpus> .. # rebuild vocab from a custom training corpus
 BITNET_SAMPLE_MODES=min cargo run --release -- sample ... # only the 2 highest-signal modes (top-p T=0.5 + KV-cache)
 BITNET_SAMPLE_MODES=topp_low,kv cargo run -- shakespeare  # subset; same env var also gates the post-train tail
 cargo run --release --features cuda -- cuda-demo          # CPU-vs-cuBLAS matmul microbench
@@ -111,6 +118,18 @@ cargo run --release --features cuda -- cuda-train-demo    # Phase 4 end-to-end G
 cargo run --release --features cuda -- cuda-shakespeare    # Phase 5.a real BitNet ternary training on GPU
 cargo run --release --features cuda -- cuda-shakespeare-large  # Phase 5.a, ~8.5M-param config, seq_len 128
 ```
+
+Training an arbitrary corpus end to end:
+
+```text
+cargo run --release -- train data/my_corpus.txt --steps 2000 --out mymodel
+cargo run --release -- train data/my_corpus.txt --resume models/mymodel.f32.bin --out mymodel
+cargo run --release -- sample models/mymodel.f32.bin --corpus data/my_corpus.txt "once upon"
+```
+
+The char vocab is built from the corpus itself, so `sample` needs the same
+corpus (via `--corpus`) to rebuild it; the vocab-size check catches a
+mismatched file.
 
 ## Project layout
 
@@ -154,9 +173,11 @@ and how the pieces compose.
 
 Brief recipe (full guide in [docs/TRAINING.md](docs/TRAINING.md)):
 
-1. Place a UTF-8 corpus at `data/tinyshakespeare.txt` (or any path you set in
-   `TrainConfig.corpus_path`).
-2. Run `cargo run --release -- shakespeare`.
+1. Place a UTF-8 corpus at `data/tinyshakespeare.txt` (or anywhere, and use
+   `train <path>` instead).
+2. Run `cargo run --release -- shakespeare` (preset) or
+   `cargo run --release -- train <corpus> [options]` (any corpus,
+   hyperparameters overridable from the command line).
 3. Watch the four-column status line every 100 steps:
    `train_loss`, `anchor_loss` (smooth signal), `min_seen`, `lr`, `|g|`.
 4. After training completes, the model is exported to both `models/shakespeare.f32.bin`
@@ -244,14 +265,15 @@ Planned work is tracked on GitHub:
 
 Milestones, in priority order:
 
-1. **Phase 5.c — GPU perf** — realise the tensor-core speedup. Per-step launch
-   overhead currently makes the GPU slower than the CPU despite correct ternary
-   int8 GEMM; reuse device buffers, fuse the quant kernels, capture the step as
-   a CUDA graph, then benchmark at scale.
-2. **CPU SIMD & threading** — an ARM64 NEON path and a persistent thread pool
-   (Zen 4 AVX2 auto-select landed in v0.19).
-3. **CLI ergonomics** — train arbitrary corpora with overridable hyperparameters
-   from the command line.
+1. **Phase 5.c - GPU perf** - realise the tensor-core speedup. Device buffers
+   are now reused across steps (`sync_from_cpu`, #1) and the quant kernels are
+   fused to one launch per operand (#2); remaining: capture the step as a CUDA
+   graph (#3), then benchmark at scale (#4).
+2. **CPU SIMD & threading** - the persistent matmul thread pool landed (#7)
+   and Zen 4 AVX2 auto-select in v0.19; remaining: an ARM64 NEON path (#6,
+   needs ARM hardware to validate).
+3. **CLI ergonomics** - done (#8): `train <corpus>` with overridable
+   hyperparameters, `--help`, and `sample --corpus` for custom checkpoints.
 
 ## Further reading
 

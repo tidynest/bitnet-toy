@@ -8,14 +8,19 @@
 //!   gives us for free, and master precision is thrown away at export anyway.
 //! - Owned data only (no views, no `Rc`). Sharing arrives in M3 where autograd needs it.
 //!
-//! Parallelism (v0.10): `Tensor::matmul` shards the output rows across threads
-//! when the result is large enough to amortise thread-spawn overhead. Each
-//! thread owns a contiguous, disjoint slice of the output `Vec<f32>` via
-//! `chunks_mut`, so no atomics or locks are needed and the result is
-//! **bit-identical** to the serial version regardless of thread count
-//! (per-row summation order is preserved, and rows do not combine). Thread
-//! count is read once via `OnceLock` from the env var
-//! `BITNET_MATMUL_THREADS`, defaulting to `min(available_parallelism(), 8)`.
+//! Parallelism (v0.10, pooled since issue #7): `Tensor::matmul` shards the
+//! output rows across threads when the result is large enough to amortise
+//! dispatch overhead. Each band is a contiguous, disjoint slice of the
+//! output `Vec<f32>` via `chunks_mut`, so no atomics or locks guard the
+//! data and the result is **bit-identical** to the serial version
+//! regardless of thread count (per-row summation order is preserved, and
+//! rows do not combine). Bands beyond the first are executed by a
+//! long-lived channel-fed worker pool (`matmul_pool`) instead of freshly
+//! spawned OS threads - a channel send is ~1-5 us vs ~10-30 us per spawn,
+//! about x2 per call at training shapes. Thread (band) count is read once
+//! via `OnceLock` from the env var `BITNET_MATMUL_THREADS`; default 1
+//! (serial) because the outer batch level is the productive place to
+//! spend parallelism during training.
 //!
 //! SIMD (v0.11): the inner kernel is rewritten as register-blocked AXPY
 //! (loop order i, kk, j) so the innermost loop becomes
@@ -38,12 +43,126 @@
 //! scalar`) to force the scalar path. All paths are byte-identical per cell.
 
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
 
-/// Output-element count below which `matmul` stays serial. Spawning a handful
-/// of OS threads costs ~10-30 us; for tiny matmuls (e.g. per-position attention
-/// scoring on small `head_dim`) the spawn overhead dominates. 256 elements is
-/// the empirical break-even on the 7940HS for the v0.9 model shapes.
+/// Output-element count below which `matmul` stays serial. Handing a band to
+/// a pool worker costs a channel send + wake (~1-5 us); for tiny matmuls
+/// (e.g. per-position attention scoring on small `head_dim`) that overhead
+/// dominates. 256 elements is the empirical break-even on the 7940HS for the
+/// v0.9 model shapes (measured against thread-spawn cost; the pool only
+/// lowers the constant, so the threshold stays conservative).
 const MATMUL_PARALLEL_THRESHOLD: usize = 256;
+
+/// Lifetime count of pool workers spawned. Observability hook for the
+/// issue #7 invariant: workers are spawned once, then reused forever.
+static POOL_WORKERS_SPAWNED: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+fn matmul_pool_spawned_workers() -> usize {
+    POOL_WORKERS_SPAWNED.load(Ordering::Relaxed)
+}
+
+/// One output band of a sharded matmul, sent to a pool worker. Raw
+/// pointers rather than slices because the job must cross an mpsc
+/// channel into a long-lived thread (`'static` bound); the submitting
+/// thread restores borrow discipline by blocking until every band it
+/// dispatched has acked, so the pointed-to buffers outlive every
+/// worker-side access (see `AckDrain`).
+struct MatmulJob {
+    lhs: *const f32,
+    rhs: *const f32,
+    out: *mut f32,
+    rows: usize,
+    k: usize,
+    n: usize,
+    ack: mpsc::Sender<()>,
+}
+
+// Safety: the pointers are dereferenced only between job receipt and
+// ack send. The submitter keeps the buffers alive until all acks are
+// in, and each job's `out` band is a disjoint chunk of the output, so
+// no two threads ever alias the same writable memory.
+unsafe impl Send for MatmulJob {}
+
+impl MatmulJob {
+    /// Reconstruct the slices and run the shared AXPY kernel.
+    fn run(self) {
+        // Safety: submitter guarantees liveness and disjointness for
+        // the duration of this call (it is still blocked in AckDrain).
+        let lhs = unsafe { std::slice::from_raw_parts(self.lhs, self.rows * self.k) };
+        let rhs = unsafe { std::slice::from_raw_parts(self.rhs, self.k * self.n) };
+        let out = unsafe { std::slice::from_raw_parts_mut(self.out, self.rows * self.n) };
+        matmul_kernel(lhs, rhs, out, self.rows, self.k, self.n);
+        // A closed receiver just means the submitter is already
+        // draining after a panic; the buffers stayed valid throughout.
+        let _ = self.ack.send(());
+    }
+}
+
+/// Blocks until `remaining` acks arrive - **including on unwind**. This
+/// is what makes the raw-pointer jobs sound: the submitter creates the
+/// drain before dispatching and only counts successfully sent jobs, so
+/// no code path (early return, panic, assert) can free the lhs/rhs/out
+/// buffers while a worker still holds pointers into them. `recv` only
+/// errors once every outstanding job's ack sender is gone, i.e. when
+/// no worker can touch the buffers any more, so breaking on `Err` is
+/// safe and avoids deadlock if a worker dies.
+struct AckDrain<'a> {
+    rx: &'a mpsc::Receiver<()>,
+    remaining: usize,
+}
+
+impl Drop for AckDrain<'_> {
+    fn drop(&mut self) {
+        while self.remaining > 0 {
+            if self.rx.recv().is_err() {
+                break;
+            }
+            self.remaining -= 1;
+        }
+    }
+}
+
+/// The long-lived matmul worker pool (issue #7). One mpsc channel per
+/// worker: band `i` of a call goes to worker `(i - 1) % workers` while
+/// band 0 runs on the calling thread, so a `threads = t` call keeps the
+/// same banding (and therefore bit-identical output) as the old
+/// spawn-per-call path. Workers park in `recv` between matmuls; an
+/// idle pool costs zero CPU.
+struct MatmulPool {
+    senders: Vec<mpsc::Sender<MatmulJob>>,
+}
+
+/// Pool accessor. Spawned once on first parallel matmul: one worker
+/// per hardware thread up to 8 total, minus the calling thread (which
+/// always computes band 0 itself rather than idling in a wait).
+fn matmul_pool() -> &'static MatmulPool {
+    static POOL: OnceLock<MatmulPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let workers = std::thread::available_parallelism()
+            .map_or(1, std::num::NonZero::get)
+            .min(8)
+            .saturating_sub(1)
+            .max(1);
+        let senders = (0..workers)
+            .map(|i| {
+                let (tx, rx) = mpsc::channel::<MatmulJob>();
+                std::thread::Builder::new()
+                    .name(format!("bitnet-matmul-{i}"))
+                    .spawn(move || {
+                        while let Ok(job) = rx.recv() {
+                            job.run();
+                        }
+                    })
+                    .expect("matmul pool: worker spawn failed");
+                POOL_WORKERS_SPAWNED.fetch_add(1, Ordering::Relaxed);
+                tx
+            })
+            .collect();
+        MatmulPool { senders }
+    })
+}
 
 /// Cached thread budget for `Tensor::matmul`. Resolved on first call and held
 /// for the rest of the process. The env-var override (`BITNET_MATMUL_THREADS`)
@@ -501,15 +620,81 @@ impl Tensor {
         }
     }
 
-    /// Row-sharded matmul. Splits the output rows into `threads` contiguous
-    /// bands, hands each thread its own `&mut [f32]` slice plus the matching
-    /// `&[f32]` lhs band, runs the shared AXPY kernel inside the thread.
-    /// No locks, no atomics, no shared mutable state - the slices handed to
-    /// each thread cover disjoint memory and the original Vec stays
-    /// exclusively borrowed for the duration of `std::thread::scope`. Output
-    /// is bit-identical to `matmul_serial_inner` because the kernel runs
-    /// per-band with the same per-cell accumulation order.
+    /// Row-sharded matmul on the long-lived worker pool (issue #7).
+    /// Splits the output rows into `threads` contiguous bands - the
+    /// same banding as the old spawn-per-call path, so output stays
+    /// bit-identical to `matmul_serial_inner` (same kernel, same
+    /// per-cell accumulation order, band boundaries do not change
+    /// per-cell maths). Band 0 runs on the calling thread; bands
+    /// 1..threads are round-robined onto the pool workers via one
+    /// channel send each (~1-5 us vs ~10-30 us per OS thread spawn).
+    ///
+    /// Memory safety: `AckDrain` is constructed before any job is
+    /// dispatched and only counts jobs whose `send` succeeded. Its
+    /// `Drop` blocks until every dispatched band acks, so `out`, `lhs`
+    /// and `rhs` (declared before it, dropped after it) can never be
+    /// freed while a worker still holds pointers into them - even if
+    /// this thread panics mid-call.
     fn matmul_parallel_inner(
+        &self,
+        rhs: &[f32],
+        m: usize,
+        k: usize,
+        n: usize,
+        threads: usize,
+    ) -> Tensor {
+        let rows_per_thread = m.div_ceil(threads);
+        let mut out = vec![0.0f32; m * n];
+        let lhs: &[f32] = &self.data;
+        let pool = matmul_pool();
+        let (ack_tx, ack_rx) = mpsc::channel::<()>();
+        let mut drain = AckDrain {
+            rx: &ack_rx,
+            remaining: 0,
+        };
+
+        let mut bands = out.chunks_mut(rows_per_thread * n).enumerate();
+        // Detach band 0 for the calling thread; dispatch the rest first
+        // so the workers overlap with the local compute.
+        let local_band = bands.next();
+        for (b_idx, chunk) in bands {
+            let row_start = b_idx * rows_per_thread;
+            let chunk_rows = chunk.len() / n;
+            let job = MatmulJob {
+                lhs: lhs[row_start * k..].as_ptr(),
+                rhs: rhs.as_ptr(),
+                out: chunk.as_mut_ptr(),
+                rows: chunk_rows,
+                k,
+                n,
+                ack: ack_tx.clone(),
+            };
+            pool.senders[(b_idx - 1) % pool.senders.len()]
+                .send(job)
+                .expect("matmul pool: worker channel closed");
+            drain.remaining += 1;
+        }
+        // Drop the local ack sender so `recv` can observe worker death
+        // (channel error) instead of hanging, should a worker ever die
+        // mid-job. With it gone, only in-flight jobs hold senders.
+        drop(ack_tx);
+        if let Some((_, chunk)) = local_band {
+            let chunk_rows = chunk.len() / n;
+            matmul_kernel(&lhs[..chunk_rows * k], rhs, chunk, chunk_rows, k, n);
+        }
+        drop(drain); // blocks until every dispatched band has finished
+
+        Tensor {
+            data: out,
+            shape: vec![m, n],
+        }
+    }
+
+    /// The pre-pool implementation: spawn fresh scoped OS threads per
+    /// call. Kept (test-only) as the A/B baseline for the issue #7
+    /// microbenchmark and as a second bit-identity witness.
+    #[cfg(test)]
+    fn matmul_parallel_scoped_inner(
         &self,
         rhs: &[f32],
         m: usize,
@@ -1272,6 +1457,85 @@ mod tests {
                 threads
             );
         }
+    }
+
+    #[test]
+    fn parallel_matmul_reuses_pool_workers() {
+        // Issue #7: the parallel path must run on a long-lived worker
+        // pool, not fresh OS threads per call. The pool's lifetime
+        // spawn counter must not move after warm-up, no matter how many
+        // parallel matmuls run.
+        let (m, k, n) = (64usize, 32usize, 64usize); // m*n over the threshold
+        let lhs = Tensor::from_vec(
+            (0..m * k).map(|i| (i as f32 * 0.3).sin()).collect(),
+            vec![m, k],
+        );
+        let rhs = Tensor::from_vec(
+            (0..k * n).map(|i| (i as f32 * 0.7).cos()).collect(),
+            vec![k, n],
+        );
+        let serial = lhs.matmul_serial(&rhs);
+
+        let _ = lhs.matmul_with_threads(&rhs, 4); // warm-up: pool spawns here
+        let spawned_after_warmup = matmul_pool_spawned_workers();
+        assert!(spawned_after_warmup >= 1, "pool spawned no workers");
+
+        for _ in 0..100 {
+            let pooled = lhs.matmul_with_threads(&rhs, 4);
+            assert_eq!(
+                pooled.data, serial.data,
+                "pooled matmul drifted from serial"
+            );
+        }
+        assert_eq!(
+            matmul_pool_spawned_workers(),
+            spawned_after_warmup,
+            "workers were respawned: pool is not long-lived"
+        );
+    }
+
+    /// Issue #7 microbench: pooled dispatch vs the old spawn-per-call
+    /// scoped path, at a training-realistic shape. Not a correctness
+    /// gate (timing-dependent), so ignored by default. Run with:
+    /// `cargo test --release matmul_pool_bench -- --ignored --nocapture`
+    #[test]
+    #[ignore = "benchmark, run explicitly with --ignored --nocapture"]
+    fn matmul_pool_bench_vs_scoped() {
+        let (m, k, n) = (64usize, 128usize, 256usize); // seq x hidden @ hidden x ffn
+        let lhs = Tensor::from_vec(
+            (0..m * k).map(|i| (i as f32 * 0.137).sin()).collect(),
+            vec![m, k],
+        );
+        let rhs = Tensor::from_vec(
+            (0..k * n).map(|i| (i as f32 * 0.041).cos()).collect(),
+            vec![k, n],
+        );
+        let threads = 8usize;
+        let iters = 2000usize;
+
+        // Same maths on both paths, or the timing is meaningless.
+        let pooled_out = lhs.matmul_with_threads(&rhs, threads);
+        let scoped_out = lhs.matmul_parallel_scoped_inner(&rhs.data, m, k, n, threads);
+        assert_eq!(pooled_out.data, scoped_out.data, "paths diverged");
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            let _ = lhs.matmul_with_threads(&rhs, threads);
+        }
+        let pooled = t0.elapsed();
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            let _ = lhs.matmul_parallel_scoped_inner(&rhs.data, m, k, n, threads);
+        }
+        let scoped = t0.elapsed();
+
+        println!(
+            "matmul [{m}x{k}]@[{k}x{n}], {threads} threads, {iters} iters:\n  pooled: {:>8.1} us/call\n  scoped: {:>8.1} us/call\n  speedup: x{:.2}",
+            pooled.as_secs_f64() * 1e6 / iters as f64,
+            scoped.as_secs_f64() * 1e6 / iters as f64,
+            scoped.as_secs_f64() / pooled.as_secs_f64(),
+        );
     }
 
     #[test]
