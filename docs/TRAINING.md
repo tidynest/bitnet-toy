@@ -9,6 +9,7 @@ How to train, what to expect, what to watch for, and what knobs to turn.
 
 - [Smoke test](#smoke-test-no-setup-required)
 - [Real training: TinyShakespeare](#real-training-tinyshakespeare)
+- [Training any corpus: the train subcommand](#training-any-corpus-the-train-subcommand)
 - [Watching the run](#watching-the-run)
 - [Generation modes](#generation-modes)
 - [Tuning](#tuning)
@@ -106,6 +107,39 @@ roughly 500 wasted steps re-establishing the master values from the
 lossy `γ · W_q` decomposition. Visible as a "step 0 val_ppl" spike well
 above the value the previous run ended on. Use the packed file for
 distribution, the `.f32.bin` for development resumes.
+
+## Training any corpus: the train subcommand
+
+The `train` subcommand removes the need to edit `TrainConfig` in source:
+any UTF-8 text file trains directly, with the key hyperparameters
+overridable as flags. Defaults are the `shakespeare()` preset.
+
+```sh
+cargo run --release -- train data/my_corpus.txt \
+    --steps 2000 --lr 3e-3 --batch-size 4 --seed 7 \
+    --hidden 128 --blocks 4 --seq-len 64 --out mymodel
+```
+
+Run `cargo run --release -- --help` for the full flag list. The rules
+worth knowing:
+
+- The char vocab is built from the corpus itself. To sample the
+  resulting checkpoint later, hand the same corpus back:
+  `sample models/mymodel.f32.bin --corpus data/my_corpus.txt "prompt"`.
+  A vocab-size check refuses a mismatched corpus.
+- Geometry must satisfy `heads * head_dim == hidden`. Omitted values
+  are derived (`--head-dim` defaults to 16; `--heads` to
+  `hidden / head_dim`; `--ffn` to `2 * hidden`); conflicting explicit
+  values are an error, not a silent adjustment.
+- `--lr` moves the cosine floor with it at the preset 10:1 ratio.
+- `--resume models/mymodel.f32.bin` continues a previous `train` run,
+  including AdamW moments and the cosine LR schedule position, exactly
+  like the `shakespeare <path>` resume path (they share the code).
+- `--cuda` runs forward+backward on the GPU (build with
+  `--features cuda`); it forces `n_workers = 1` since the GPU is the
+  parallelism layer.
+- The post-training generation tail only uses the stock prompts the
+  corpus vocab can encode, and says so when none fit.
 
 ## Watching the run
 

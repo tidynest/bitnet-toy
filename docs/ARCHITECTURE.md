@@ -23,10 +23,10 @@ How the modules compose, top-down.
 
 ```
                                  main.rs
-                  (TrainConfig, CLI: shakespeare /
+                  (TrainConfig, CLI: train / shakespeare /
                    shakespeare-large / sample / cuda-demo /
                    cuda-forward-bench / cuda-train-demo /
-                   cuda-shakespeare[-large], demos, tests)
+                   cuda-shakespeare[-large] / --help, demos, tests)
                                     |
        ┌────────────────────────────┼────────────────────────────┐
        |                            |                            |
