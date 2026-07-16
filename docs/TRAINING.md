@@ -141,6 +141,20 @@ worth knowing:
 - The post-training generation tail only uses the stock prompts the
   corpus vocab can encode, and says so when none fit.
 
+### CUDA graph capture (issue #3)
+
+On the GPU path the whole per-window forward+backward is captured once
+as a CUDA graph and replayed thereafter - one driver call per window
+instead of thousands of individual kernel launches. The capture runs
+on a private stream, so it is invisible to other CUDA work; weight
+freshness comes from `sync_from_cpu` overwriting the same device
+buffers the graph references. The loss trajectory is bit-identical to
+the eager path (pinned by `cuda_step_graph_loss_trajectory_matches_eager`).
+
+Set `BITNET_CUDA_GRAPH=0` to force the eager per-kernel path (A/B
+timing, or as an escape hatch on a misbehaving driver). A failed
+capture falls back to eager with a warning instead of aborting.
+
 ## Watching the run
 
 Most log lines look like this:

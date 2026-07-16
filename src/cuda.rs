@@ -665,6 +665,62 @@ pub struct CudaContextHolder {
     pub matmul_fn: CudaFunction,
 }
 
+thread_local! {
+    /// Per-thread stream/cuBLAS override (issue #3, CUDA graphs).
+    /// When set, every CUDA op issued from THIS thread enqueues onto
+    /// the override stream (and routes GEMMs through the override
+    /// cuBLAS handle) instead of the process-wide defaults. Graph
+    /// capture uses this so a training step can be recorded on a
+    /// private stream while other threads keep using the default
+    /// stream completely unaffected - work from another thread can
+    /// neither leak into the captured graph nor be blocked by the
+    /// capture (mode `THREAD_LOCAL`).
+    static STREAM_OVERRIDE: std::cell::RefCell<Option<(Arc<CudaStream>, Arc<CudaBlas>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// RAII guard installing the thread-local stream/cuBLAS override;
+/// restores the defaults on drop (including on unwind, so a panicked
+/// capture cannot leave later ops on this thread pointing at the
+/// capture stream).
+struct StreamOverrideGuard;
+
+impl StreamOverrideGuard {
+    fn install(stream: Arc<CudaStream>, blas: Arc<CudaBlas>) -> Self {
+        STREAM_OVERRIDE.with(|o| *o.borrow_mut() = Some((stream, blas)));
+        StreamOverrideGuard
+    }
+}
+
+impl Drop for StreamOverrideGuard {
+    fn drop(&mut self) {
+        STREAM_OVERRIDE.with(|o| *o.borrow_mut() = None);
+    }
+}
+
+impl CudaContextHolder {
+    /// The stream ops on this thread must enqueue onto: the
+    /// thread-local capture override when installed, else the shared
+    /// default stream. Every launch/alloc/memcpy in this module goes
+    /// through here so a graph capture sees the whole op sequence.
+    fn active_stream(&self) -> Arc<CudaStream> {
+        STREAM_OVERRIDE
+            .with(|o| o.borrow().as_ref().map(|(s, _)| s.clone()))
+            .unwrap_or_else(|| self.stream.clone())
+    }
+
+    /// cuBLAS handle counterpart of `active_stream`: GEMMs must run on
+    /// the same stream as the surrounding kernels or a captured graph
+    /// would miss them (a cuBLAS handle is bound to one stream).
+    fn with_active_blas<R>(&self, f: impl FnOnce(&CudaBlas) -> R) -> R {
+        let over = STREAM_OVERRIDE.with(|o| o.borrow().as_ref().map(|(_, b)| b.clone()));
+        match over {
+            Some(b) => f(&b),
+            None => f(&self.blas),
+        }
+    }
+}
+
 /// Lazy global handle. First call attaches to GPU 0, instantiates a
 /// cuBLAS handle on the default stream, and NVRTC-compiles the
 /// production kernel module (Phase 2.2 op kernels). In test builds it
@@ -676,6 +732,18 @@ pub fn cuda_state() -> Result<&'static CudaContextHolder, String> {
     static STATE: OnceLock<Result<CudaContextHolder, String>> = OnceLock::new();
     let r = STATE.get_or_init(|| {
         let ctx = CudaContext::new(0).map_err(|e| format!("CudaContext::new(0) failed: {e:?}"))?;
+        // Manual stream synchronisation (issue #3). cudarc's automatic
+        // event tracking is dormant in single-stream mode, but the
+        // moment `build_step_graph` creates its private capture stream
+        // the tracking would activate and inject `cuStreamWaitEvent`
+        // calls on events recorded before the capture started - which
+        // invalidates CUDA-graph capture. Disabling it keeps every op
+        // exactly as stream-ordered as it always was; the one real
+        // cross-stream edge (default-stream weight uploads vs capture-
+        // stream reads) is ordered explicitly by the graph code.
+        // Safety (per cudarc docs): only affects slices created after
+        // this call; nothing has been allocated yet.
+        unsafe { ctx.disable_event_tracking() };
         let stream = ctx.default_stream();
         let blas =
             CudaBlas::new(stream.clone()).map_err(|e| format!("CudaBlas::new failed: {e:?}"))?;
@@ -757,18 +825,21 @@ pub fn cuda_state() -> Result<&'static CudaContextHolder, String> {
     r.as_ref().map_err(|s| s.clone())
 }
 
-/// Cumulative count of quantisation kernel launches (f32 STE traits +
-/// the int8 `bit_linear` quant stages). Issue #2 observability: with
-/// ~3000+ launches per training step, launch overhead - not GEMM
-/// compute - is the GPU bottleneck, so tests pin the exact number of
-/// launches each quantise call may issue.
-pub static QUANT_KERNEL_LAUNCHES: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    /// Count of quantisation kernel launches issued BY THIS THREAD
+    /// (f32 STE traits + the int8 `bit_linear` quant stages). Issue #2
+    /// observability: with thousands of launches per training step,
+    /// launch overhead - not GEMM compute - is the GPU bottleneck, so
+    /// tests pin the exact number of launches each quantise call may
+    /// issue. Thread-local so parallel tests cannot perturb each
+    /// other's measurements.
+    pub static QUANT_KERNEL_LAUNCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
-/// Relaxed increment helper for `QUANT_KERNEL_LAUNCHES` - one call per
-/// quant kernel launch, next to the `launch` itself.
+/// Increment helper for `QUANT_KERNEL_LAUNCHES` - one call per quant
+/// kernel launch, next to the `launch` itself.
 fn count_quant_launch() {
-    QUANT_KERNEL_LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    QUANT_KERNEL_LAUNCHES.with(|c| c.set(c.get() + 1));
 }
 
 /// Device-resident f32 tensor. Owns its `CudaSlice<f32>`; the slice is
@@ -789,7 +860,7 @@ impl Clone for CudaTensor {
     fn clone(&self) -> Self {
         let s = cuda_state().expect("cuda_state failed");
         let new_data = s
-            .stream
+            .active_stream()
             .clone_dtod(&self.data)
             .expect("CudaTensor clone (clone_dtod) failed");
         Self {
@@ -805,7 +876,7 @@ impl CudaTensor {
     pub fn from_cpu(t: &Tensor) -> Result<Self, String> {
         let s = cuda_state()?;
         let data = s
-            .stream
+            .active_stream()
             .clone_htod(&t.data)
             .map_err(|e| format!("clone_htod failed: {e:?}"))?;
         Ok(Self {
@@ -826,16 +897,33 @@ impl CudaTensor {
             ));
         }
         let s = cuda_state()?;
-        s.stream
+        s.active_stream()
             .memcpy_htod(&t.data, &mut self.data)
             .map_err(|e| format!("memcpy_htod failed: {e:?}"))
+    }
+
+    /// Overwrite this tensor's device buffer in place from another
+    /// device tensor of identical shape (device-to-device memcpy, no
+    /// allocation). Used to land step outputs in persistent buffers
+    /// that outlive a captured graph (issue #3).
+    pub fn copy_from_device(&mut self, src: &CudaTensor) -> Result<(), String> {
+        if self.shape != src.shape {
+            return Err(format!(
+                "copy_from_device shape mismatch: dst {:?} vs src {:?}",
+                self.shape, src.shape
+            ));
+        }
+        let s = cuda_state()?;
+        s.active_stream()
+            .memcpy_dtod(&src.data, &mut self.data)
+            .map_err(|e| format!("memcpy_dtod failed: {e:?}"))
     }
 
     /// Copy device memory back into a CPU `Tensor`. Synchronous.
     pub fn to_cpu(&self) -> Result<Tensor, String> {
         let s = cuda_state()?;
         let v = s
-            .stream
+            .active_stream()
             .clone_dtoh(&self.data)
             .map_err(|e| format!("clone_dtoh failed: {e:?}"))?;
         Ok(Tensor::from_vec(v, self.shape.clone()))
@@ -860,7 +948,7 @@ impl CudaTensor {
         let k_i = i32::try_from(k).expect("k exceeds i32");
         let n_i = i32::try_from(n).expect("n exceeds i32");
         let mut out: CudaSlice<f32> = s
-            .stream
+            .active_stream()
             .alloc_zeros::<f32>(m * n)
             .expect("alloc_zeros failed");
         const TILE: u32 = 16;
@@ -869,7 +957,8 @@ impl CudaTensor {
             block_dim: (TILE, TILE, 1),
             shared_mem_bytes: 0,
         };
-        let mut launcher = s.stream.launch_builder(&s.matmul_fn);
+        let stream = s.active_stream();
+        let mut launcher = stream.launch_builder(&s.matmul_fn);
         launcher.arg(&self.data);
         launcher.arg(&rhs.data);
         launcher.arg(&mut out);
@@ -924,7 +1013,7 @@ impl crate::device::MatMul for CudaTensor {
         let n_i = i32::try_from(n).expect("n exceeds i32");
 
         let mut out: CudaSlice<f32> = s
-            .stream
+            .active_stream()
             .alloc_zeros::<f32>(m * n)
             .expect("alloc_zeros failed");
 
@@ -951,7 +1040,8 @@ impl crate::device::MatMul for CudaTensor {
         // adapter described in the doc comment; alloc_zeros above gave us
         // exactly m*n f32 of writable device memory; self.data and
         // rhs.data are owned device slices of size m*k and k*n.
-        unsafe { s.blas.gemm(cfg, &rhs.data, &self.data, &mut out) }.expect("cuBLAS sgemm failed");
+        s.with_active_blas(|blas| unsafe { blas.gemm(cfg, &rhs.data, &self.data, &mut out) })
+            .expect("cuBLAS sgemm failed");
 
         Self {
             data: out,
@@ -984,13 +1074,17 @@ impl crate::device::Add for CudaTensor {
         let s = cuda_state().expect("cuda_state failed");
         let n = self.data.len();
         let n_i = i32::try_from(n).expect("n exceeds i32");
-        let mut out = s.stream.alloc_zeros::<f32>(n).expect("alloc_zeros failed");
+        let mut out = s
+            .active_stream()
+            .alloc_zeros::<f32>(n)
+            .expect("alloc_zeros failed");
         let cfg = LaunchConfig {
             grid_dim: ((n_i as u32).div_ceil(256), 1, 1),
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        let mut l = s.stream.launch_builder(&s.add_fn);
+        let stream = s.active_stream();
+        let mut l = stream.launch_builder(&s.add_fn);
         l.arg(&self.data);
         l.arg(&rhs.data);
         l.arg(&mut out);
@@ -1011,13 +1105,17 @@ impl crate::device::MulScalar for CudaTensor {
         let st = cuda_state().expect("cuda_state failed");
         let n = self.data.len();
         let n_i = i32::try_from(n).expect("n exceeds i32");
-        let mut out = st.stream.alloc_zeros::<f32>(n).expect("alloc_zeros failed");
+        let mut out = st
+            .active_stream()
+            .alloc_zeros::<f32>(n)
+            .expect("alloc_zeros failed");
         let cfg = LaunchConfig {
             grid_dim: ((n_i as u32).div_ceil(256), 1, 1),
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        let mut l = st.stream.launch_builder(&st.mul_scalar_fn);
+        let stream = st.active_stream();
+        let mut l = stream.launch_builder(&st.mul_scalar_fn);
         l.arg(&self.data);
         l.arg(&s);
         l.arg(&mut out);
@@ -1046,7 +1144,7 @@ impl crate::device::Transpose2D for CudaTensor {
         let r_i = i32::try_from(r).expect("r exceeds i32");
         let c_i = i32::try_from(c).expect("c exceeds i32");
         let mut out = s
-            .stream
+            .active_stream()
             .alloc_zeros::<f32>(r * c)
             .expect("alloc_zeros failed");
         const TILE: u32 = 16;
@@ -1055,7 +1153,8 @@ impl crate::device::Transpose2D for CudaTensor {
             block_dim: (TILE, TILE, 1),
             shared_mem_bytes: 0,
         };
-        let mut l = s.stream.launch_builder(&s.transpose_2d_fn);
+        let stream = s.active_stream();
+        let mut l = stream.launch_builder(&s.transpose_2d_fn);
         l.arg(&self.data);
         l.arg(&mut out);
         l.arg(&r_i);
@@ -1084,7 +1183,7 @@ impl crate::device::CausalMask for CudaTensor {
         let m_i = i32::try_from(m).expect("m exceeds i32");
         let n_i = i32::try_from(n).expect("n exceeds i32");
         let mut out = s
-            .stream
+            .active_stream()
             .alloc_zeros::<f32>(m * n)
             .expect("alloc_zeros failed");
         const TILE: u32 = 16;
@@ -1093,7 +1192,8 @@ impl crate::device::CausalMask for CudaTensor {
             block_dim: (TILE, TILE, 1),
             shared_mem_bytes: 0,
         };
-        let mut l = s.stream.launch_builder(&s.causal_mask_fn);
+        let stream = s.active_stream();
+        let mut l = stream.launch_builder(&s.causal_mask_fn);
         l.arg(&self.data);
         l.arg(&mut out);
         l.arg(&m_i);
@@ -1122,7 +1222,7 @@ impl crate::device::Softmax for CudaTensor {
         let m_i = i32::try_from(m).expect("m exceeds i32");
         let n_i = i32::try_from(n).expect("n exceeds i32");
         let mut out = s
-            .stream
+            .active_stream()
             .alloc_zeros::<f32>(m * n)
             .expect("alloc_zeros failed");
         // One thread per row. 256 rows per block; covers shakespeare
@@ -1132,7 +1232,8 @@ impl crate::device::Softmax for CudaTensor {
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        let mut l = s.stream.launch_builder(&s.softmax_row_fn);
+        let stream = s.active_stream();
+        let mut l = stream.launch_builder(&s.softmax_row_fn);
         l.arg(&self.data);
         l.arg(&mut out);
         l.arg(&m_i);
@@ -1161,7 +1262,7 @@ impl crate::device::SoftmaxBackward for CudaTensor {
         let m_i = i32::try_from(m).expect("m exceeds i32");
         let n_i = i32::try_from(n).expect("n exceeds i32");
         let mut out = s
-            .stream
+            .active_stream()
             .alloc_zeros::<f32>(m * n)
             .expect("alloc_zeros failed");
         let cfg = LaunchConfig {
@@ -1169,7 +1270,8 @@ impl crate::device::SoftmaxBackward for CudaTensor {
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        let mut l = s.stream.launch_builder(&s.softmax_backward_row_fn);
+        let stream = s.active_stream();
+        let mut l = stream.launch_builder(&s.softmax_backward_row_fn);
         l.arg(&self.data);
         l.arg(&s_out.data);
         l.arg(&mut out);
@@ -1195,7 +1297,7 @@ impl crate::device::CausalMaskBackward for CudaTensor {
         let m_i = i32::try_from(m).expect("m exceeds i32");
         let n_i = i32::try_from(n).expect("n exceeds i32");
         let mut out = st
-            .stream
+            .active_stream()
             .alloc_zeros::<f32>(m * n)
             .expect("alloc_zeros failed");
         // 16x16 threads per block matches the forward `causal_mask_f32`
@@ -1205,7 +1307,8 @@ impl crate::device::CausalMaskBackward for CudaTensor {
             block_dim: (16, 16, 1),
             shared_mem_bytes: 0,
         };
-        let mut l = st.stream.launch_builder(&st.causal_mask_backward_fn);
+        let stream = st.active_stream();
+        let mut l = stream.launch_builder(&st.causal_mask_backward_fn);
         l.arg(&self.data);
         l.arg(&mut out);
         l.arg(&m_i);
@@ -1225,13 +1328,17 @@ impl crate::device::Silu for CudaTensor {
         let s = cuda_state().expect("cuda_state failed");
         let n = self.data.len();
         let n_i = i32::try_from(n).expect("n exceeds i32");
-        let mut out = s.stream.alloc_zeros::<f32>(n).expect("alloc_zeros failed");
+        let mut out = s
+            .active_stream()
+            .alloc_zeros::<f32>(n)
+            .expect("alloc_zeros failed");
         let cfg = LaunchConfig {
             grid_dim: ((n_i as u32).div_ceil(256), 1, 1),
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        let mut l = s.stream.launch_builder(&s.silu_fn);
+        let stream = s.active_stream();
+        let mut l = stream.launch_builder(&s.silu_fn);
         l.arg(&self.data);
         l.arg(&mut out);
         l.arg(&n_i);
@@ -1255,13 +1362,17 @@ impl crate::device::SiluBackward for CudaTensor {
         let s = cuda_state().expect("cuda_state failed");
         let n = self.data.len();
         let n_i = i32::try_from(n).expect("n exceeds i32");
-        let mut out = s.stream.alloc_zeros::<f32>(n).expect("alloc_zeros failed");
+        let mut out = s
+            .active_stream()
+            .alloc_zeros::<f32>(n)
+            .expect("alloc_zeros failed");
         let cfg = LaunchConfig {
             grid_dim: ((n_i as u32).div_ceil(256), 1, 1),
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        let mut l = s.stream.launch_builder(&s.silu_backward_fn);
+        let stream = s.active_stream();
+        let mut l = stream.launch_builder(&s.silu_backward_fn);
         l.arg(&self.data);
         l.arg(&x.data);
         l.arg(&mut out);
@@ -1291,7 +1402,7 @@ impl crate::device::RmsNorm for CudaTensor {
         let m_i = i32::try_from(m).expect("m exceeds i32");
         let n_i = i32::try_from(n).expect("n exceeds i32");
         let mut out = s
-            .stream
+            .active_stream()
             .alloc_zeros::<f32>(m * n)
             .expect("alloc_zeros failed");
         let cfg = LaunchConfig {
@@ -1299,7 +1410,8 @@ impl crate::device::RmsNorm for CudaTensor {
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        let mut l = s.stream.launch_builder(&s.rmsnorm_row_fn);
+        let stream = s.active_stream();
+        let mut l = stream.launch_builder(&s.rmsnorm_row_fn);
         l.arg(&self.data);
         l.arg(&mut out);
         l.arg(&m_i);
@@ -1328,7 +1440,7 @@ impl crate::device::RmsNormBackward for CudaTensor {
         let m_i = i32::try_from(m).expect("m exceeds i32");
         let n_i = i32::try_from(n).expect("n exceeds i32");
         let mut out = s
-            .stream
+            .active_stream()
             .alloc_zeros::<f32>(m * n)
             .expect("alloc_zeros failed");
         // Same launch shape as forward `rmsnorm_row_f32`: one thread per row.
@@ -1337,7 +1449,8 @@ impl crate::device::RmsNormBackward for CudaTensor {
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        let mut l = s.stream.launch_builder(&s.rmsnorm_backward_row_fn);
+        let stream = s.active_stream();
+        let mut l = stream.launch_builder(&s.rmsnorm_backward_row_fn);
         l.arg(&self.data);
         l.arg(&x_saved.data);
         l.arg(&mut out);
@@ -1364,13 +1477,17 @@ impl crate::device::Mul for CudaTensor {
         let s = cuda_state().expect("cuda_state failed");
         let n = self.data.len();
         let n_i = i32::try_from(n).expect("n exceeds i32");
-        let mut out = s.stream.alloc_zeros::<f32>(n).expect("alloc_zeros failed");
+        let mut out = s
+            .active_stream()
+            .alloc_zeros::<f32>(n)
+            .expect("alloc_zeros failed");
         let cfg = LaunchConfig {
             grid_dim: ((n_i as u32).div_ceil(256), 1, 1),
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        let mut l = s.stream.launch_builder(&s.mul_fn);
+        let stream = s.active_stream();
+        let mut l = stream.launch_builder(&s.mul_fn);
         l.arg(&self.data);
         l.arg(&rhs.data);
         l.arg(&mut out);
@@ -1405,7 +1522,7 @@ impl crate::device::Rope for CudaTensor {
         let hd_i = i32::try_from(head_dim).expect("head_dim exceeds i32");
         let half_i = hd_i / 2;
         let mut out = s
-            .stream
+            .active_stream()
             .alloc_zeros::<f32>(seq * head_dim)
             .expect("alloc_zeros failed");
         const TILE: u32 = 16;
@@ -1418,7 +1535,8 @@ impl crate::device::Rope for CudaTensor {
             block_dim: (TILE, TILE, 1),
             shared_mem_bytes: 0,
         };
-        let mut l = s.stream.launch_builder(&s.rope_fn);
+        let stream = s.active_stream();
+        let mut l = stream.launch_builder(&s.rope_fn);
         l.arg(&self.data);
         l.arg(&mut out);
         l.arg(&seq_i);
@@ -1447,7 +1565,7 @@ impl crate::device::RopeBackward for CudaTensor {
         let hd_i = i32::try_from(head_dim).expect("head_dim exceeds i32");
         let half_i = hd_i / 2;
         let mut out = s
-            .stream
+            .active_stream()
             .alloc_zeros::<f32>(seq * head_dim)
             .expect("alloc_zeros failed");
         // Same 2-D 16x16 launch shape as forward `rope_f32` - one
@@ -1462,7 +1580,8 @@ impl crate::device::RopeBackward for CudaTensor {
             block_dim: (TILE, TILE, 1),
             shared_mem_bytes: 0,
         };
-        let mut l = s.stream.launch_builder(&s.rope_backward_fn);
+        let stream = s.active_stream();
+        let mut l = stream.launch_builder(&s.rope_backward_fn);
         l.arg(&self.data);
         l.arg(&mut out);
         l.arg(&seq_i);
@@ -1478,12 +1597,61 @@ impl crate::device::RopeBackward for CudaTensor {
     }
 }
 
-impl crate::device::CrossEntropy for CudaTensor {
-    fn cross_entropy_forward_save(&self, targets: &[usize]) -> (f32, Self) {
+impl CudaTensor {
+    /// Device-resident cross-entropy forward: fused softmax + per-row
+    /// loss, targets already on the device, NO host transfer. Returns
+    /// the `[seq]` per-row loss buffer and the saved softmax. This is
+    /// the capture-safe core (issue #3): the trait method wraps it
+    /// with the targets htod and the host-side mean.
+    fn cross_entropy_forward_device(
+        &self,
+        targets_dev: &CudaSlice<i32>,
+    ) -> (CudaSlice<f32>, CudaTensor) {
         assert_eq!(self.shape.len(), 2, "cross_entropy: rank-2 logits");
         let seq = self.shape[0];
         let vocab = self.shape[1];
-        assert_eq!(targets.len(), seq, "cross_entropy: target len mismatch");
+        assert_eq!(targets_dev.len(), seq, "cross_entropy: target len mismatch");
+        let s = cuda_state().expect("cuda_state failed");
+        let mut softmax = s
+            .active_stream()
+            .alloc_zeros::<f32>(seq * vocab)
+            .expect("alloc softmax");
+        let mut per_row_loss = s
+            .active_stream()
+            .alloc_zeros::<f32>(seq)
+            .expect("alloc loss");
+        let seq_i = i32::try_from(seq).expect("seq exceeds i32");
+        let vocab_i = i32::try_from(vocab).expect("vocab exceeds i32");
+        // One thread per row, 256 rows per block.
+        let cfg = LaunchConfig {
+            grid_dim: ((seq_i as u32).div_ceil(256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let stream = s.active_stream();
+        let mut l = stream.launch_builder(&s.cross_entropy_softmax_loss_fn);
+        l.arg(&self.data);
+        l.arg(targets_dev);
+        l.arg(&mut softmax);
+        l.arg(&mut per_row_loss);
+        l.arg(&seq_i);
+        l.arg(&vocab_i);
+        // Safety: signature (const float* logits, const int* targets,
+        // float* softmax, float* per_row_loss, int seq, int vocab)
+        // matches; logits / softmax sized seq*vocab; loss sized seq.
+        unsafe { l.launch(cfg) }.expect("cross_entropy_softmax_loss_f32 launch");
+        (
+            per_row_loss,
+            CudaTensor {
+                data: softmax,
+                shape: vec![seq, vocab],
+            },
+        )
+    }
+
+    /// Host-target convenience used by both trait impls below: usize
+    /// targets validated + converted + copied H->D once.
+    fn targets_to_device(targets: &[usize], vocab: usize) -> CudaSlice<i32> {
         let s = cuda_state().expect("cuda_state failed");
         // Targets to device as i32 (kernel reads `int*`); usize -> i32
         // panics on out-of-range (only realistic at vocab >= 2^31, which
@@ -1495,55 +1663,39 @@ impl crate::device::CrossEntropy for CudaTensor {
                 i32::try_from(t).expect("target exceeds i32")
             })
             .collect();
-        let targets_dev = s
-            .stream
+        s.active_stream()
             .clone_htod(&targets_i32)
-            .expect("clone_htod targets");
-        let mut softmax = s
-            .stream
-            .alloc_zeros::<f32>(seq * vocab)
-            .expect("alloc softmax");
-        let mut per_row_loss = s.stream.alloc_zeros::<f32>(seq).expect("alloc loss");
-        let seq_i = i32::try_from(seq).expect("seq exceeds i32");
-        let vocab_i = i32::try_from(vocab).expect("vocab exceeds i32");
-        // One thread per row, 256 rows per block.
-        let cfg = LaunchConfig {
-            grid_dim: ((seq_i as u32).div_ceil(256), 1, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let mut l = s.stream.launch_builder(&s.cross_entropy_softmax_loss_fn);
-        l.arg(&self.data);
-        l.arg(&targets_dev);
-        l.arg(&mut softmax);
-        l.arg(&mut per_row_loss);
-        l.arg(&seq_i);
-        l.arg(&vocab_i);
-        // Safety: signature (const float* logits, const int* targets,
-        // float* softmax, float* per_row_loss, int seq, int vocab)
-        // matches; logits / softmax sized seq*vocab; loss sized seq.
-        unsafe { l.launch(cfg) }.expect("cross_entropy_softmax_loss_f32 launch");
+            .expect("clone_htod targets")
+    }
+}
+
+impl crate::device::CrossEntropy for CudaTensor {
+    fn cross_entropy_forward_save(&self, targets: &[usize]) -> (f32, Self) {
+        assert_eq!(self.shape.len(), 2, "cross_entropy: rank-2 logits");
+        let seq = self.shape[0];
+        let vocab = self.shape[1];
+        assert_eq!(targets.len(), seq, "cross_entropy: target len mismatch");
+        let s = cuda_state().expect("cuda_state failed");
+        let targets_dev = Self::targets_to_device(targets, vocab);
+        let (per_row_loss, softmax) = self.cross_entropy_forward_device(&targets_dev);
         // Copy per-row losses back and average. seq is small (~64) so
         // this is far cheaper than fighting GPU atomic-add or a second
         // reduction kernel.
         let losses_host = s
-            .stream
+            .active_stream()
             .clone_dtoh(&per_row_loss)
             .expect("D->H per_row_loss");
         let total: f32 = losses_host.iter().sum();
         let loss = total / seq as f32;
-        (
-            loss,
-            Self {
-                data: softmax,
-                shape: vec![seq, vocab],
-            },
-        )
+        (loss, softmax)
     }
 }
 
-impl crate::device::CrossEntropyBackward for CudaTensor {
-    fn cross_entropy_backward(&self, targets: &[usize], seq: usize) -> Self {
+impl CudaTensor {
+    /// Device-resident cross-entropy backward: targets already on the
+    /// device, no host transfer. Capture-safe core (issue #3); the
+    /// trait method wraps it with the targets htod.
+    fn cross_entropy_backward_device(&self, targets_dev: &CudaSlice<i32>, seq: usize) -> Self {
         assert_eq!(
             self.shape.len(),
             2,
@@ -1552,21 +1704,13 @@ impl crate::device::CrossEntropyBackward for CudaTensor {
         assert_eq!(seq, self.shape[0], "cross_entropy_backward: seq mismatch");
         let vocab = self.shape[1];
         assert_eq!(
-            targets.len(),
+            targets_dev.len(),
             seq,
             "cross_entropy_backward: target len mismatch"
         );
         let s = cuda_state().expect("cuda_state failed");
-        let targets_i32: Vec<i32> = targets
-            .iter()
-            .map(|&t| i32::try_from(t).expect("target exceeds i32"))
-            .collect();
-        let targets_dev = s
-            .stream
-            .clone_htod(&targets_i32)
-            .expect("clone_htod targets");
         let mut out = s
-            .stream
+            .active_stream()
             .alloc_zeros::<f32>(seq * vocab)
             .expect("alloc grad_logits");
         let seq_i = i32::try_from(seq).expect("seq exceeds i32");
@@ -1581,9 +1725,10 @@ impl crate::device::CrossEntropyBackward for CudaTensor {
             block_dim: (16, 16, 1),
             shared_mem_bytes: 0,
         };
-        let mut l = s.stream.launch_builder(&s.cross_entropy_backward_fn);
+        let stream = s.active_stream();
+        let mut l = stream.launch_builder(&s.cross_entropy_backward_fn);
         l.arg(&self.data);
-        l.arg(&targets_dev);
+        l.arg(targets_dev);
         l.arg(&mut out);
         l.arg(&seq_i);
         l.arg(&vocab_i);
@@ -1598,6 +1743,14 @@ impl crate::device::CrossEntropyBackward for CudaTensor {
     }
 }
 
+impl crate::device::CrossEntropyBackward for CudaTensor {
+    fn cross_entropy_backward(&self, targets: &[usize], seq: usize) -> Self {
+        let vocab = self.shape[1];
+        let targets_dev = Self::targets_to_device(targets, vocab);
+        self.cross_entropy_backward_device(&targets_dev, seq)
+    }
+}
+
 impl crate::device::QuantiseWeightsSTE for CudaTensor {
     fn quantise_weights_ste(&self) -> Self {
         assert_eq!(self.shape.len(), 2, "quantise_weights_ste: rank-2 only");
@@ -1606,8 +1759,14 @@ impl crate::device::QuantiseWeightsSTE for CudaTensor {
         let n = self.shape[1];
         let m_i = i32::try_from(m).expect("m exceeds i32");
         let n_i = i32::try_from(n).expect("n exceeds i32");
-        let mut row_abs_sum = s.stream.alloc_zeros::<f32>(m).expect("alloc row_abs_sum");
-        let mut out = s.stream.alloc_zeros::<f32>(m * n).expect("alloc out");
+        let mut row_abs_sum = s
+            .active_stream()
+            .alloc_zeros::<f32>(m)
+            .expect("alloc row_abs_sum");
+        let mut out = s
+            .active_stream()
+            .alloc_zeros::<f32>(m * n)
+            .expect("alloc out");
         // ONE fused launch (issue #2). The kernel is a single
         // cooperative block, so the grid MUST stay (1, 1, 1): a second
         // block would race the row_abs_sum scratch across the
@@ -1617,7 +1776,8 @@ impl crate::device::QuantiseWeightsSTE for CudaTensor {
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        let mut l = s.stream.launch_builder(&s.quantise_weights_ste_fused_fn);
+        let stream = s.active_stream();
+        let mut l = stream.launch_builder(&s.quantise_weights_ste_fused_fn);
         l.arg(&self.data);
         l.arg(&mut row_abs_sum);
         l.arg(&mut out);
@@ -1641,7 +1801,10 @@ impl crate::device::QuantiseActsSTE for CudaTensor {
         let n = self.shape[1];
         let m_i = i32::try_from(m).expect("m exceeds i32");
         let n_i = i32::try_from(n).expect("n exceeds i32");
-        let mut out = s.stream.alloc_zeros::<f32>(m * n).expect("alloc out");
+        let mut out = s
+            .active_stream()
+            .alloc_zeros::<f32>(m * n)
+            .expect("alloc out");
         // ONE fused launch (issue #2): one block per row. The block
         // size must stay 256 to match the kernel's static smax[256].
         // No scratch buffer at all - the row reduction lives in
@@ -1651,7 +1814,8 @@ impl crate::device::QuantiseActsSTE for CudaTensor {
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        let mut l = s.stream.launch_builder(&s.quantise_acts_ste_fused_fn);
+        let stream = s.active_stream();
+        let mut l = stream.launch_builder(&s.quantise_acts_ste_fused_fn);
         l.arg(&self.data);
         l.arg(&mut out);
         l.arg(&m_i);
@@ -1746,14 +1910,21 @@ impl crate::device::BitLinear for CudaTensor {
         // ---- Stage 1: quantise self (acts) to INT8 + alpha[m]. ----
         // ONE fused launch (issue #2): one block per row, block size
         // pinned to the kernel's static smax[256].
-        let mut alpha = st.stream.alloc_zeros::<f32>(m).expect("alloc alpha");
-        let mut x_q = st.stream.alloc_zeros::<i8>(m * k).expect("alloc x_q");
+        let mut alpha = st
+            .active_stream()
+            .alloc_zeros::<f32>(m)
+            .expect("alloc alpha");
+        let mut x_q = st
+            .active_stream()
+            .alloc_zeros::<i8>(m * k)
+            .expect("alloc x_q");
         let cfg_x = LaunchConfig {
             grid_dim: (m_i as u32, 1, 1),
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        let mut l = st.stream.launch_builder(&st.quantise_acts_int8_fused_fn);
+        let stream = st.active_stream();
+        let mut l = stream.launch_builder(&st.quantise_acts_int8_fused_fn);
         l.arg(&self.data);
         l.arg(&mut x_q);
         l.arg(&mut alpha);
@@ -1765,18 +1936,25 @@ impl crate::device::BitLinear for CudaTensor {
         // ---- Stage 2: quantise rhs (weights) to INT8 + gamma scalar. ----
         // ONE fused launch (issue #2): a single cooperative block, so
         // the grid MUST stay (1, 1, 1) - see the kernel comment.
-        let mut gamma = st.stream.alloc_zeros::<f32>(1).expect("alloc gamma");
+        let mut gamma = st
+            .active_stream()
+            .alloc_zeros::<f32>(1)
+            .expect("alloc gamma");
         let mut w_row_abs_sum = st
-            .stream
+            .active_stream()
             .alloc_zeros::<f32>(k)
             .expect("alloc w_row_abs_sum");
-        let mut w_q = st.stream.alloc_zeros::<i8>(k * n).expect("alloc w_q");
+        let mut w_q = st
+            .active_stream()
+            .alloc_zeros::<i8>(k * n)
+            .expect("alloc w_q");
         let cfg_w = LaunchConfig {
             grid_dim: (1, 1, 1),
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        let mut l = st.stream.launch_builder(&st.quantise_weights_int8_fused_fn);
+        let stream = st.active_stream();
+        let mut l = stream.launch_builder(&st.quantise_weights_int8_fused_fn);
         l.arg(&rhs.data);
         l.arg(&mut w_row_abs_sum);
         l.arg(&mut w_q);
@@ -1790,17 +1968,21 @@ impl crate::device::BitLinear for CudaTensor {
         // Same row-major-via-column-major adapter as the f32 MatMul
         // impl: ask for C_col = B_col @ A_col of shape (N, M); the
         // bytes that come out match the desired C_row = A_row @ B_row.
-        let mut c_int = st.stream.alloc_zeros::<i32>(m * n).expect("alloc c_int");
+        let mut c_int = st
+            .active_stream()
+            .alloc_zeros::<i32>(m * n)
+            .expect("alloc c_int");
         let alpha_h: i32 = 1;
         let beta_h: i32 = 0;
-        let blas_handle = *st.blas.handle();
+        let blas_handle = st.with_active_blas(|blas| *blas.handle());
         // Safety: pointer arithmetic + raw FFI call. Buffers are
         // sized correctly above. Stride / shape / type tags below
         // match the col-major view of the row-major data.
         unsafe {
-            let (b_ptr, _b_keep) = w_q.device_ptr(&st.stream);
-            let (a_ptr, _a_keep) = x_q.device_ptr(&st.stream);
-            let (c_ptr, _c_keep) = c_int.device_ptr_mut(&st.stream);
+            let gemm_stream = st.active_stream();
+            let (b_ptr, _b_keep) = w_q.device_ptr(&gemm_stream);
+            let (a_ptr, _a_keep) = x_q.device_ptr(&gemm_stream);
+            let (c_ptr, _c_keep) = c_int.device_ptr_mut(&gemm_stream);
             gemm_ex(
                 blas_handle,
                 sys::cublasOperation_t::CUBLAS_OP_N,
@@ -1826,13 +2008,17 @@ impl crate::device::BitLinear for CudaTensor {
         }
 
         // ---- Stage 4: dequantise int32 -> f32 with per-row alpha + scalar gamma. ----
-        let mut out = st.stream.alloc_zeros::<f32>(m * n).expect("alloc out");
+        let mut out = st
+            .active_stream()
+            .alloc_zeros::<f32>(m * n)
+            .expect("alloc out");
         let cfg_scale = LaunchConfig {
             grid_dim: ((n_i as u32).div_ceil(16), (m_i as u32).div_ceil(16), 1),
             block_dim: (16, 16, 1),
             shared_mem_bytes: 0,
         };
-        let mut l = st.stream.launch_builder(&st.scale_int32_to_f32_fn);
+        let stream = st.active_stream();
+        let mut l = stream.launch_builder(&st.scale_int32_to_f32_fn);
         l.arg(&c_int);
         l.arg(&alpha);
         l.arg(&gamma);
@@ -2206,16 +2392,33 @@ impl CudaModel {
     /// Returns `(Vec<Tensor>, f32)` in the **canonical visitor order**
     /// matching `Model::for_each_grad`, drop-in compatible with the
     /// existing CPU optimiser.
+    ///
+    /// Internally this is `alloc_step_buffers` + `step_core_into` +
+    /// `assemble_grads`: the same device-only core a captured CUDA
+    /// graph replays (issue #3), so the eager path doubles as the
+    /// correctness witness for the graph path.
     pub fn compute_grads_for_window_bitnet(
         &self,
         input_ids: &[usize],
         target_ids: &[usize],
     ) -> (Vec<Tensor>, f32) {
-        use crate::device::{
-            BitLinear, BlockSaved, RmsNorm, RmsNormBackward, Transpose2D, bit_linear_backward,
-            block_backward_bitnet, block_forward_save_bitnet, cross_entropy_backward,
-            cross_entropy_forward_save,
-        };
+        let seq = input_ids.len();
+        let mut bufs = self.alloc_step_buffers(seq);
+        let (x_embed, targets_dev) = self.upload_step_inputs(input_ids, target_ids, None);
+        self.step_core_into(&x_embed, &targets_dev, &mut bufs);
+        self.assemble_grads(&bufs, input_ids)
+    }
+
+    /// Gather the embed slab for `input_ids` on the host and upload it
+    /// plus the i32 targets. With `reuse = Some((x_embed, targets))`
+    /// the persistent buffers are overwritten in place (graph path);
+    /// otherwise fresh device buffers are allocated (eager path).
+    fn upload_step_inputs(
+        &self,
+        input_ids: &[usize],
+        target_ids: &[usize],
+        reuse: Option<(&mut CudaTensor, &mut CudaSlice<i32>)>,
+    ) -> (CudaTensor, CudaSlice<i32>) {
         assert_eq!(
             input_ids.len(),
             target_ids.len(),
@@ -2230,9 +2433,9 @@ impl CudaModel {
         let seq = input_ids.len();
         let h = self.config.hidden_dim;
         let vocab = self.config.vocab_size;
-        let head_dim = self.config.head_dim;
+        let s = cuda_state().expect("cuda_state failed");
 
-        // Step 1: CPU embed gather + H->D.
+        // CPU embed gather.
         let table = &self.token_embed_cpu.data;
         let mut slab: Vec<f32> = Vec::with_capacity(seq * h);
         for &id in input_ids {
@@ -2240,13 +2443,117 @@ impl CudaModel {
             slab.extend_from_slice(&table[id * h..(id + 1) * h]);
         }
         let x_cpu = Tensor::from_vec(slab, vec![seq, h]);
-        let x_post_embed = CudaTensor::from_cpu(&x_cpu).expect("H->D embed");
+        let targets_i32: Vec<i32> = target_ids
+            .iter()
+            .map(|&t| {
+                assert!(
+                    t < vocab,
+                    "compute_grads_bitnet: target {t} >= vocab {vocab}"
+                );
+                i32::try_from(t).expect("target exceeds i32")
+            })
+            .collect();
 
-        // Step 2: blocks via the bitnet variants.
+        match reuse {
+            Some((x_embed, targets_dev)) => {
+                x_embed.copy_from_cpu(&x_cpu).expect("H->D embed sync");
+                s.active_stream()
+                    .memcpy_htod(&targets_i32, targets_dev)
+                    .expect("H->D targets sync");
+                (
+                    CudaTensor {
+                        data: x_embed.data.clone(),
+                        shape: x_embed.shape.clone(),
+                    },
+                    targets_dev.clone(),
+                )
+            }
+            None => {
+                let x_embed = CudaTensor::from_cpu(&x_cpu).expect("H->D embed");
+                let targets_dev = s
+                    .active_stream()
+                    .clone_htod(&targets_i32)
+                    .expect("H->D targets");
+                (x_embed, targets_dev)
+            }
+        }
+    }
+
+    /// Persistent output slots for one training step. Allocated once,
+    /// written by `step_core_into` via device-to-device copies, read
+    /// back by `assemble_grads`. Stable addresses are what let a
+    /// captured graph (issue #3) deliver its results across replays.
+    fn alloc_step_buffers(&self, seq: usize) -> StepBuffers {
+        let s = cuda_state().expect("cuda_state failed");
+        let h = self.config.hidden_dim;
+        let vocab = self.config.vocab_size;
+        let zeros = |shape: Vec<usize>| -> CudaTensor {
+            let len = shape.iter().product();
+            CudaTensor {
+                data: s
+                    .active_stream()
+                    .alloc_zeros::<f32>(len)
+                    .expect("alloc step buffer"),
+                shape,
+            }
+        };
+        let blocks = self
+            .blocks
+            .iter()
+            .map(|b| BlockGradBuffers {
+                heads: b
+                    .heads
+                    .iter()
+                    .map(|hw| HeadGradBuffers {
+                        w_q: zeros(hw.w_q.shape.clone()),
+                        w_k: zeros(hw.w_k.shape.clone()),
+                        w_v: zeros(hw.w_v.shape.clone()),
+                        w_o: zeros(hw.w_o.shape.clone()),
+                    })
+                    .collect(),
+                w_gate: zeros(b.ffn.w_gate.shape.clone()),
+                w_up: zeros(b.ffn.w_up.shape.clone()),
+                w_down: zeros(b.ffn.w_down.shape.clone()),
+            })
+            .collect();
+        StepBuffers {
+            per_row_loss: s
+                .active_stream()
+                .alloc_zeros::<f32>(seq)
+                .expect("alloc per_row_loss"),
+            grad_lm_head_w_t: zeros(vec![vocab, h]),
+            grad_x_pre_blocks: zeros(vec![seq, h]),
+            blocks,
+        }
+    }
+
+    /// The device-only step core: forward through every block, tied
+    /// lm_head, fused softmax+CE, then the full backward chain -
+    /// finishing with device-to-device copies of every output into the
+    /// caller's persistent `StepBuffers`. **No host transfer and no
+    /// synchronisation anywhere**, which is exactly what makes this
+    /// capturable as a CUDA graph (issue #3): intermediates are
+    /// stream-ordered `cuMemAllocAsync`/`cuMemFreeAsync` pairs that
+    /// capture as alloc/free nodes, so a replay reuses the same
+    /// physical memory step after step.
+    fn step_core_into(
+        &self,
+        x_embed: &CudaTensor,
+        targets_dev: &CudaSlice<i32>,
+        bufs: &mut StepBuffers,
+    ) {
+        use crate::device::{
+            BitLinear, BlockSaved, RmsNorm, RmsNormBackward, Transpose2D, bit_linear_backward,
+            block_backward_bitnet, block_forward_save_bitnet,
+        };
+        let seq = x_embed.shape[0];
+        let head_dim = self.config.head_dim;
+
+        // ---- Forward. ----
         let n_blocks = self.blocks.len();
         let mut block_inputs: Vec<CudaTensor> = Vec::with_capacity(n_blocks + 1);
         let mut block_saveds: Vec<BlockSaved<CudaTensor>> = Vec::with_capacity(n_blocks);
-        block_inputs.push(x_post_embed);
+        block_inputs.push(x_embed.clone());
         for (i, block) in self.blocks.iter().enumerate() {
             let (out, saved) =
                 block_forward_save_bitnet(&block_inputs[i], &block.heads, &block.ffn, head_dim);
@@ -2263,21 +2570,14 @@ impl CudaModel {
         let lm_head_w = self.token_embed_device.transpose_2d(); // [hidden, vocab]
         let logits = pre_lm_head.bit_linear(&lm_head_w);
 
-        // Step 3: cross-entropy.
-        let (loss, softmax_saved) = cross_entropy_forward_save(&logits, target_ids);
+        // ---- Loss (device-resident; host mean happens in assemble). ----
+        let (per_row_loss, softmax_saved) = logits.cross_entropy_forward_device(targets_dev);
 
         // ---- Backward chain. ----
-        let grad_logits = cross_entropy_backward(&softmax_saved, target_ids, seq);
+        let grad_logits = softmax_saved.cross_entropy_backward_device(targets_dev, seq);
         // logits = bit_linear(pre_lm_head, lm_head_w = token_embed_device.T)
         let (grad_pre_lm_head, grad_lm_head_w) =
             bit_linear_backward(&grad_logits, &pre_lm_head, &lm_head_w);
-        // Tied-embedding gradient contribution: transpose [hidden, vocab]
-        // -> [vocab, hidden], pulled to host so we can sum it into the
-        // embed-gather gradient below.
-        let grad_token_embed_from_lm = grad_lm_head_w
-            .transpose_2d()
-            .to_cpu()
-            .expect("D->H grad_lm");
         let grad_final_x = grad_pre_lm_head.rmsnorm_backward(final_x);
 
         let mut grad_x = grad_final_x;
@@ -2298,9 +2598,61 @@ impl CudaModel {
         let block_grads: Vec<crate::device::BlockGrads<CudaTensor>> =
             block_grads_rev.into_iter().rev().collect();
 
+        // ---- Land every output in the persistent buffers. ----
+        let s = cuda_state().expect("cuda_state failed");
+        s.active_stream()
+            .memcpy_dtod(&per_row_loss, &mut bufs.per_row_loss)
+            .expect("D->D per_row_loss");
+        // Tied-embedding contribution transposed to [vocab, hidden] so
+        // the host side can sum it straight into the embed-gather grad.
+        bufs.grad_lm_head_w_t
+            .copy_from_device(&grad_lm_head_w.transpose_2d())
+            .expect("D->D grad_lm_head_w_t");
+        bufs.grad_x_pre_blocks
+            .copy_from_device(&grad_x)
+            .expect("D->D grad_x_pre_blocks");
+        for (bb, bg) in bufs.blocks.iter_mut().zip(&block_grads) {
+            for (hb, hg) in bb.heads.iter_mut().zip(&bg.head_grads) {
+                hb.w_q.copy_from_device(&hg.grad_w_q).expect("D->D w_q");
+                hb.w_k.copy_from_device(&hg.grad_w_k).expect("D->D w_k");
+                hb.w_v.copy_from_device(&hg.grad_w_v).expect("D->D w_v");
+                hb.w_o.copy_from_device(&hg.grad_w_o).expect("D->D w_o");
+            }
+            bb.w_gate
+                .copy_from_device(&bg.grad_w_gate)
+                .expect("D->D w_gate");
+            bb.w_up.copy_from_device(&bg.grad_w_up).expect("D->D w_up");
+            bb.w_down
+                .copy_from_device(&bg.grad_w_down)
+                .expect("D->D w_down");
+        }
+    }
+
+    /// Pull the step outputs off the device and build the CPU-side
+    /// result: mean loss, embed scatter-add + tied-lm_head sum, and
+    /// the flat gradient list in the **canonical visitor order**
+    /// matching `Model::for_each_grad`. Shared verbatim by the eager
+    /// and graph paths, so the two can only differ in what the device
+    /// computed - which is what the graph test pins bitwise.
+    fn assemble_grads(&self, bufs: &StepBuffers, input_ids: &[usize]) -> (Vec<Tensor>, f32) {
+        let s = cuda_state().expect("cuda_state failed");
+        let seq = input_ids.len();
+        let h = self.config.hidden_dim;
+        let vocab = self.config.vocab_size;
+
+        let losses_host = s
+            .active_stream()
+            .clone_dtoh(&bufs.per_row_loss)
+            .expect("D->H per_row_loss");
+        let loss = losses_host.iter().sum::<f32>() / seq as f32;
+
         // Embed scatter-add (CPU side), then sum in the LM-head's
         // tied-embedding contribution.
-        let grad_x_pre_blocks_cpu = grad_x.to_cpu().expect("D->H grad_x_pre_blocks");
+        let grad_x_pre_blocks_cpu = bufs
+            .grad_x_pre_blocks
+            .to_cpu()
+            .expect("D->H grad_x_pre_blocks");
+        let grad_token_embed_from_lm = bufs.grad_lm_head_w_t.to_cpu().expect("D->H grad_lm");
         let mut grad_token_embed = vec![0.0_f32; vocab * h];
         for (pos, &id) in input_ids.iter().enumerate() {
             let dst_start = id * h;
@@ -2325,20 +2677,173 @@ impl CudaModel {
         // to token_embed since v0.17 / BNT5.
         let mut grads: Vec<Tensor> = Vec::new();
         grads.push(grad_token_embed_t);
-        for bg in &block_grads {
-            for hg in &bg.head_grads {
-                grads.push(hg.grad_w_q.to_cpu().expect("D->H w_q"));
-                grads.push(hg.grad_w_k.to_cpu().expect("D->H w_k"));
-                grads.push(hg.grad_w_v.to_cpu().expect("D->H w_v"));
-                grads.push(hg.grad_w_o.to_cpu().expect("D->H w_o"));
+        for bb in &bufs.blocks {
+            for hb in &bb.heads {
+                grads.push(hb.w_q.to_cpu().expect("D->H w_q"));
+                grads.push(hb.w_k.to_cpu().expect("D->H w_k"));
+                grads.push(hb.w_v.to_cpu().expect("D->H w_v"));
+                grads.push(hb.w_o.to_cpu().expect("D->H w_o"));
             }
-            grads.push(bg.grad_w_gate.to_cpu().expect("D->H w_gate"));
-            grads.push(bg.grad_w_up.to_cpu().expect("D->H w_up"));
-            grads.push(bg.grad_w_down.to_cpu().expect("D->H w_down"));
+            grads.push(bb.w_gate.to_cpu().expect("D->H w_gate"));
+            grads.push(bb.w_up.to_cpu().expect("D->H w_up"));
+            grads.push(bb.w_down.to_cpu().expect("D->H w_down"));
         }
 
         (grads, loss)
     }
+
+    /// Capture the whole device-side training step as a CUDA graph
+    /// (issue #3). One eager warm-up run primes the NVRTC modules,
+    /// the cuBLAS int8 workspace, and the stream-ordered memory pool
+    /// (none of which may first-allocate mid-capture); the second run
+    /// is recorded on a **private stream** with capture mode
+    /// `THREAD_LOCAL`, so concurrent CUDA work from other threads can
+    /// neither leak into the graph nor be blocked by it.
+    ///
+    /// Validity across steps: the graph references every weight
+    /// buffer by address, and `sync_from_cpu` (issue #1) refreshes
+    /// those buffers strictly in place - so a replay always reads the
+    /// current weights. The persistent input/output buffers live in
+    /// the returned `CudaStepGraph`.
+    pub fn build_step_graph(&self, seq: usize) -> Result<CudaStepGraph, String> {
+        use cudarc::driver::sys::{CUgraphInstantiate_flags, CUstreamCaptureMode};
+        let s = cuda_state()?;
+        // Cross-stream edge: weight buffers are written on the default
+        // stream (from_cpu / sync_from_cpu). Drain it before the
+        // private stream starts reading them.
+        s.stream
+            .synchronize()
+            .map_err(|e| format!("default-stream sync failed: {e:?}"))?;
+        let capture_stream = s
+            .ctx
+            .new_stream()
+            .map_err(|e| format!("new_stream failed: {e:?}"))?;
+        let capture_blas = Arc::new(
+            CudaBlas::new(capture_stream.clone())
+                .map_err(|e| format!("CudaBlas::new (capture) failed: {e:?}"))?,
+        );
+        let _guard = StreamOverrideGuard::install(capture_stream.clone(), capture_blas.clone());
+
+        let h = self.config.hidden_dim;
+        let x_embed = CudaTensor {
+            data: capture_stream
+                .alloc_zeros::<f32>(seq * h)
+                .map_err(|e| format!("alloc x_embed failed: {e:?}"))?,
+            shape: vec![seq, h],
+        };
+        let targets_dev = capture_stream
+            .alloc_zeros::<i32>(seq)
+            .map_err(|e| format!("alloc targets failed: {e:?}"))?;
+        let mut bufs = self.alloc_step_buffers(seq);
+
+        // Warm-up (eager, on the capture stream).
+        self.step_core_into(&x_embed, &targets_dev, &mut bufs);
+        capture_stream
+            .synchronize()
+            .map_err(|e| format!("warm-up sync failed: {e:?}"))?;
+
+        // Recorded run.
+        capture_stream
+            .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+            .map_err(|e| format!("begin_capture failed: {e:?}"))?;
+        self.step_core_into(&x_embed, &targets_dev, &mut bufs);
+        let graph = capture_stream
+            .end_capture(CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
+            .map_err(|e| format!("end_capture failed: {e:?}"))?
+            .ok_or_else(|| "end_capture returned no graph".to_string())?;
+        graph
+            .upload()
+            .map_err(|e| format!("graph upload failed: {e:?}"))?;
+
+        Ok(CudaStepGraph {
+            graph,
+            stream: capture_stream,
+            blas: capture_blas,
+            x_embed,
+            targets_dev,
+            bufs,
+            seq,
+        })
+    }
+
+    /// Replay the captured step for one window: overwrite the
+    /// persistent input buffers, launch the graph (ONE driver call for
+    /// the whole forward+backward), then assemble the grads on the
+    /// host. Weight freshness is the caller's business via
+    /// `sync_from_cpu`, same as the eager path.
+    pub fn run_step_graph(
+        &self,
+        g: &mut CudaStepGraph,
+        input_ids: &[usize],
+        target_ids: &[usize],
+    ) -> (Vec<Tensor>, f32) {
+        assert_eq!(
+            input_ids.len(),
+            g.seq,
+            "run_step_graph: seq {} does not match captured seq {}",
+            input_ids.len(),
+            g.seq,
+        );
+        // Cross-stream edge: `sync_from_cpu` uploads the fresh weights
+        // on the default stream; drain it so the replay reads them.
+        cuda_state()
+            .expect("cuda_state failed")
+            .stream
+            .synchronize()
+            .expect("default-stream sync failed");
+        // Everything below must ride the graph's private stream: the
+        // input htod precedes the launch, the assemble dtoh follows it,
+        // and stream order is what sequences them correctly.
+        let _guard = StreamOverrideGuard::install(g.stream.clone(), g.blas.clone());
+        let _ = self.upload_step_inputs(
+            input_ids,
+            target_ids,
+            Some((&mut g.x_embed, &mut g.targets_dev)),
+        );
+        g.graph.launch().expect("graph launch failed");
+        self.assemble_grads(&g.bufs, input_ids)
+    }
+}
+
+/// Persistent per-step output slots (issue #3). See
+/// `CudaModel::alloc_step_buffers`.
+struct HeadGradBuffers {
+    w_q: CudaTensor,
+    w_k: CudaTensor,
+    w_v: CudaTensor,
+    w_o: CudaTensor,
+}
+
+struct BlockGradBuffers {
+    heads: Vec<HeadGradBuffers>,
+    w_gate: CudaTensor,
+    w_up: CudaTensor,
+    w_down: CudaTensor,
+}
+
+struct StepBuffers {
+    per_row_loss: CudaSlice<f32>,
+    grad_lm_head_w_t: CudaTensor,
+    grad_x_pre_blocks: CudaTensor,
+    blocks: Vec<BlockGradBuffers>,
+}
+
+/// A captured training step: the instantiated CUDA graph plus every
+/// buffer it references that must outlive and feed each replay. Built
+/// by `CudaModel::build_step_graph`, driven by `run_step_graph`.
+pub struct CudaStepGraph {
+    graph: cudarc::driver::CudaGraph,
+    /// The private stream the graph was captured on; replays and their
+    /// surrounding H<->D copies are ordered on it.
+    stream: Arc<CudaStream>,
+    /// cuBLAS handle bound to `stream` - kept alive because the
+    /// captured GEMM nodes were recorded through it.
+    #[allow(dead_code)]
+    blas: Arc<CudaBlas>,
+    x_embed: CudaTensor,
+    targets_dev: CudaSlice<i32>,
+    bufs: StepBuffers,
+    seq: usize,
 }
 
 /// Convenience: copy two CPU tensors to device, multiply, copy back.
@@ -2839,6 +3344,180 @@ mod tests {
         assert_eq!(cpu_argmax, gpu_argmax, "greedy-token disagreement");
     }
 
+    /// Issue #3: a captured training-step graph must replay the exact
+    /// eager computation. First replay: bitwise-equal grads + loss for
+    /// the same window (same kernels, same order, same values). Then
+    /// the weights move (simulated optimiser step, synced in place via
+    /// `sync_from_cpu`) and a different window is fed: the replay must
+    /// see both the refreshed weights and the new inputs, because the
+    /// graph references the persistent buffers by address.
+    #[test]
+    fn cuda_step_graph_replay_matches_eager() {
+        if cuda_state().is_err() {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        }
+        use crate::model::{Model, ModelConfig};
+        // Every matmul dimension a multiple of 4 so the int8 GEMM path
+        // (not the f32 fallback) is what gets captured.
+        let config = ModelConfig {
+            vocab_size: 12,
+            hidden_dim: 32,
+            n_heads: 4,
+            head_dim: 8,
+            ffn_dim: 64,
+            max_seq_len: 8,
+            n_blocks: 2,
+        };
+        let mut model = Model::new(&config, 7);
+        let mut cuda_model = CudaModel::from_cpu(&model);
+        let win_a: Vec<usize> = vec![0, 3, 7, 11, 5, 1, 9, 2];
+        let tgt_a: Vec<usize> = vec![3, 7, 11, 5, 1, 9, 2, 0];
+
+        let (eager_grads, eager_loss) = cuda_model.compute_grads_for_window_bitnet(&win_a, &tgt_a);
+
+        let mut graph = cuda_model
+            .build_step_graph(win_a.len())
+            .expect("graph capture failed");
+        let (graph_grads, graph_loss) = cuda_model.run_step_graph(&mut graph, &win_a, &tgt_a);
+        assert_eq!(eager_loss, graph_loss, "loss diverged on first replay");
+        assert_eq!(eager_grads.len(), graph_grads.len());
+        for (i, (e, g)) in eager_grads.iter().zip(&graph_grads).enumerate() {
+            assert_eq!(e.data, g.data, "grad {i} diverged on first replay");
+        }
+
+        // Simulated optimiser step + fresh window.
+        model.for_each_param_mut(|t| {
+            for v in t.data.iter_mut() {
+                *v *= 0.9;
+            }
+        });
+        cuda_model.sync_from_cpu(&model);
+        let win_b: Vec<usize> = vec![5, 5, 2, 8, 1, 0, 4, 6];
+        let tgt_b: Vec<usize> = vec![5, 2, 8, 1, 0, 4, 6, 3];
+        let (eager_b, loss_b) = cuda_model.compute_grads_for_window_bitnet(&win_b, &tgt_b);
+        let (graph_b, graph_loss_b) = cuda_model.run_step_graph(&mut graph, &win_b, &tgt_b);
+        assert_eq!(loss_b, graph_loss_b, "loss diverged after weight sync");
+        for (i, (e, g)) in eager_b.iter().zip(&graph_b).enumerate() {
+            assert_eq!(e.data, g.data, "grad {i} diverged after weight sync");
+        }
+    }
+
+    /// Issue #3 DoD: the loss trajectory of a short training run must
+    /// be identical between the eager path and the graph replay path.
+    /// Each step computes grads both ways on the same weights, asserts
+    /// bitwise agreement, then applies a plain SGD update and syncs
+    /// the device copy in place - so any divergence compounds and
+    /// cannot hide.
+    #[test]
+    fn cuda_step_graph_loss_trajectory_matches_eager() {
+        if cuda_state().is_err() {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        }
+        use crate::model::{Model, ModelConfig};
+        let config = ModelConfig {
+            vocab_size: 12,
+            hidden_dim: 32,
+            n_heads: 4,
+            head_dim: 8,
+            ffn_dim: 64,
+            max_seq_len: 8,
+            n_blocks: 2,
+        };
+        let mut model = Model::new(&config, 21);
+        let mut cuda_model = CudaModel::from_cpu(&model);
+        let mut graph = cuda_model
+            .build_step_graph(8)
+            .expect("graph capture failed");
+        let windows: [(Vec<usize>, Vec<usize>); 2] = [
+            (vec![0, 3, 7, 11, 5, 1, 9, 2], vec![3, 7, 11, 5, 1, 9, 2, 0]),
+            (vec![5, 5, 2, 8, 1, 0, 4, 6], vec![5, 2, 8, 1, 0, 4, 6, 3]),
+        ];
+        let mut losses = Vec::new();
+        for step in 0..6 {
+            let (input, target) = &windows[step % windows.len()];
+            let (eager_grads, eager_loss) =
+                cuda_model.compute_grads_for_window_bitnet(input, target);
+            let (graph_grads, graph_loss) = cuda_model.run_step_graph(&mut graph, input, target);
+            assert_eq!(eager_loss, graph_loss, "loss diverged at step {step}");
+            for (i, (e, g)) in eager_grads.iter().zip(&graph_grads).enumerate() {
+                assert_eq!(e.data, g.data, "grad {i} diverged at step {step}");
+            }
+            losses.push(eager_loss);
+            // Plain SGD step on the CPU masters, then in-place device sync.
+            let mut i = 0usize;
+            model.for_each_param_mut(|t| {
+                for (v, g) in t.data.iter_mut().zip(&eager_grads[i].data) {
+                    *v -= 0.05 * g;
+                }
+                i += 1;
+            });
+            cuda_model.sync_from_cpu(&model);
+        }
+        // Sanity: training actually trained (first window's loss fell).
+        assert!(
+            losses[4] < losses[0],
+            "loss did not decrease over the trajectory: {losses:?}"
+        );
+    }
+
+    /// Issue #3 wall-clock bench: eager per-kernel launches vs one
+    /// graph replay per window, at the v0.13 shakespeare shape. Not a
+    /// correctness gate (timing-dependent), so ignored by default:
+    /// `EXPECT_CUDA=1 cargo test --release --features cuda step_graph_bench -- --ignored --nocapture`
+    #[test]
+    #[ignore = "benchmark, run explicitly with --ignored --nocapture"]
+    fn cuda_step_graph_bench_vs_eager() {
+        if cuda_state().is_err() {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        }
+        use crate::model::{Model, ModelConfig};
+        // v0.13 shakespeare shape (vocab 65 exercises the lm_head f32
+        // fallback inside the capture, like the real run).
+        let config = ModelConfig {
+            vocab_size: 65,
+            hidden_dim: 192,
+            n_heads: 12,
+            head_dim: 16,
+            ffn_dim: 384,
+            max_seq_len: 64,
+            n_blocks: 6,
+        };
+        let model = Model::new(&config, 3);
+        let cuda_model = CudaModel::from_cpu(&model);
+        let input: Vec<usize> = (0..64).map(|i| (i * 7) % 65).collect();
+        let target: Vec<usize> = (0..64).map(|i| (i * 7 + 1) % 65).collect();
+        let iters = 50usize;
+
+        // Warm both paths before timing.
+        let _ = cuda_model.compute_grads_for_window_bitnet(&input, &target);
+        let mut graph = cuda_model
+            .build_step_graph(64)
+            .expect("graph capture failed");
+        let _ = cuda_model.run_step_graph(&mut graph, &input, &target);
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            let _ = cuda_model.compute_grads_for_window_bitnet(&input, &target);
+        }
+        let eager = t0.elapsed();
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            let _ = cuda_model.run_step_graph(&mut graph, &input, &target);
+        }
+        let replay = t0.elapsed();
+
+        println!(
+            "per-window forward+backward, v0.13 shape, {iters} iters:\n  eager:  {:>8.2} ms/window\n  graph:  {:>8.2} ms/window\n  speedup: x{:.2}",
+            eager.as_secs_f64() * 1e3 / iters as f64,
+            replay.as_secs_f64() * 1e3 / iters as f64,
+            eager.as_secs_f64() / replay.as_secs_f64(),
+        );
+    }
+
     /// Issue #1: `sync_from_cpu` must refresh the device weights in
     /// place - same device buffers (zero new allocations), new values.
     /// Bitwise agreement with a freshly built `from_cpu` model proves
@@ -3087,7 +3766,6 @@ mod tests {
             return;
         }
         use crate::device::{BitLinear, QuantiseActsSTE, QuantiseWeightsSTE};
-        use std::sync::atomic::Ordering;
         let m = 32usize;
         let k = 64usize;
         let n = 16usize;
@@ -3102,36 +3780,23 @@ mod tests {
         ))
         .unwrap();
 
-        // The counter is process-global and other tests launch quant
-        // kernels concurrently, so a single-call delta is racy. Run N
-        // iterations and assert the total stays under the two-stage
-        // count (4 per pair = 4N): fused lands at 2N + a little
-        // cross-test noise, two-stage at 4N - cleanly separable at
-        // the 3N midpoint.
-        const N: usize = 50;
-        let before = QUANT_KERNEL_LAUNCHES.load(Ordering::Relaxed);
-        for _ in 0..N {
-            let _ = w.quantise_weights_ste();
-            let _ = x.quantise_acts_ste();
-        }
-        let ste_delta = QUANT_KERNEL_LAUNCHES.load(Ordering::Relaxed) - before;
-        assert!(
-            ste_delta < 3 * N,
-            "f32 STE pair must be 1 fused launch per operand: {N} pairs cost {ste_delta} \
-             launches (two-stage would cost {})",
-            4 * N
+        // The counter is thread-local, so these deltas are exact even
+        // with the rest of the suite hammering the GPU in parallel.
+        let before = QUANT_KERNEL_LAUNCHES.with(std::cell::Cell::get);
+        let _ = w.quantise_weights_ste();
+        let _ = x.quantise_acts_ste();
+        let ste_delta = QUANT_KERNEL_LAUNCHES.with(std::cell::Cell::get) - before;
+        assert_eq!(
+            ste_delta, 2,
+            "f32 STE pair must be 1 fused launch per operand, saw {ste_delta}"
         );
 
-        let before = QUANT_KERNEL_LAUNCHES.load(Ordering::Relaxed);
-        for _ in 0..N {
-            let _ = x.bit_linear(&w); // k, n multiples of 4: int8 path
-        }
-        let int8_delta = QUANT_KERNEL_LAUNCHES.load(Ordering::Relaxed) - before;
-        assert!(
-            int8_delta < 3 * N,
-            "int8 bit_linear must quantise with 1 fused launch per operand: {N} calls cost \
-             {int8_delta} launches (two-stage would cost {})",
-            4 * N
+        let before = QUANT_KERNEL_LAUNCHES.with(std::cell::Cell::get);
+        let _ = x.bit_linear(&w); // k, n multiples of 4: int8 path
+        let int8_delta = QUANT_KERNEL_LAUNCHES.with(std::cell::Cell::get) - before;
+        assert_eq!(
+            int8_delta, 2,
+            "int8 bit_linear must quantise with 1 fused launch per operand, saw {int8_delta}"
         );
     }
 
