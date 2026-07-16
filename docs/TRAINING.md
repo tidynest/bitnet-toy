@@ -175,6 +175,7 @@ numbers are included for calibration.
 |---|---|---|
 | CPU (300% quota)        | 366-444 | 1138-1201 |
 | GPU, graph replay       | 145-178 | 492 |
+| GPU, graph + flat readback (#15) | 139 | 394 |
 | GPU, eager launches     | 164     | 499 |
 | CPU uncapped (v0.13-era historical) | ~180 | ~800 (est. 4-5x v0.13) |
 | GPU pre-#1/#2/#3 (historical)       | ~300 | - |
@@ -189,12 +190,14 @@ Conclusions:
   per-step fixed costs exactly as issue #4 predicted.
 - Graph replay vs eager launches is within run-to-run noise
   end-to-end at these scales (the controlled per-window bench in
-  `cuda_step_graph_bench_vs_eager` shows x1.17); the remaining GPU
-  step cost is dominated by the ~300 individual per-tensor gradient
-  D->H reads plus the CPU-side AdamW, not launch overhead.
-- Next levers, in expected-impact order: a flat gradient buffer
-  (one D->H read per step instead of ~300), moving AdamW onto the
-  device, then larger batches per graph replay.
+  `cuda_step_graph_bench_vs_eager` shows x1.17).
+- The flat gradient readback (#15) collapsed the ~300-540 per-tensor
+  D->H reads per window into ONE copy: within noise at the v0.13
+  scale (small tensors, cheap syncs) but **-20% ms/step at the large
+  scale**, where per-read stalls grew with tensor count and size.
+- Remaining levers, in expected-impact order: moving AdamW onto the
+  device (#16 - would also eliminate the full-model weight upload
+  each step), then larger batches per graph replay.
 
 ## Watching the run
 
