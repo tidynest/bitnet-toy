@@ -28,7 +28,7 @@ inference, binary export. No third-party ML dependencies.
 
 ## Status
 
-- **147** tests passing on `cargo test`; **181** with `cargo test --features cuda`.
+- **147** tests passing on `cargo test`; **183** with `cargo test --features cuda`.
 - **0** warnings on `cargo build --release` (or `--features cuda`).
 - `cargo audit` clean for the default build (stdlib-only); the optional
   `cuda` feature pulls `cudarc` and its small dynamic-loading deps.
@@ -45,10 +45,13 @@ inference, binary export. No third-party ML dependencies.
   with the int8 path active; cuda-shakespeare runs end-to-end at
   v0.13 scale (loss trajectory matches CPU). Empirically GPU is
   ~300 ms/step vs CPU ~180 ms/step at v0.13 scale: per-step
-  launch overhead dominates (~3000+ kernel launches per step).
-  Device-buffer reuse (#1) and quant-kernel fusion (#2, one
-  launch per operand) have landed; CUDA graphs + larger batches
-  are the follow-ups to actually realise tensor-core throughput.
+  launch overhead dominated (~3000+ kernel launches per step).
+  Device-buffer reuse (#1), quant-kernel fusion (#2, one launch
+  per operand) and CUDA-graph step capture (#3, the whole
+  forward+backward replays as ONE driver call, bit-identical
+  loss trajectory, `BITNET_CUDA_GRAPH=0` opts out) have landed;
+  larger batches and a flat-gradient-buffer readback are the
+  remaining follow-ups to fully realise tensor-core throughput.
 
 ## Quick start
 
@@ -266,9 +269,9 @@ Planned work is tracked on GitHub:
 Milestones, in priority order:
 
 1. **Phase 5.c - GPU perf** - realise the tensor-core speedup. Device buffers
-   are now reused across steps (`sync_from_cpu`, #1) and the quant kernels are
-   fused to one launch per operand (#2); remaining: capture the step as a CUDA
-   graph (#3), then benchmark at scale (#4).
+   are reused across steps (`sync_from_cpu`, #1), the quant kernels are fused
+   to one launch per operand (#2), and the training step is captured and
+   replayed as a CUDA graph (#3); remaining: benchmark at scale (#4).
 2. **CPU SIMD & threading** - the persistent matmul thread pool landed (#7)
    and Zen 4 AVX2 auto-select in v0.19; remaining: an ARM64 NEON path (#6,
    needs ARM hardware to validate).

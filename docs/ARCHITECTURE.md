@@ -448,11 +448,12 @@ of how much each matters (tracked as
 [GitHub issues](https://github.com/tidynest/bitnet-toy/issues)):
 
 1. **GPU is slower than CPU at this scale.** The ternary int8 GEMM is correct
-   and runs on Ada tensor cores, but per-launch driver overhead dominates the
-   microsecond GEMMs. Device-buffer reuse (`sync_from_cpu`, issue #1) and
-   quant-kernel fusion (one launch per operand, issue #2) have landed;
-   realising the full speedup still needs CUDA graphs and larger batches -
-   milestone **Phase 5.c - GPU perf** (issues #3-#4).
+   and runs on Ada tensor cores, but per-launch driver overhead dominated the
+   microsecond GEMMs. Device-buffer reuse (`sync_from_cpu`, issue #1),
+   quant-kernel fusion (one launch per operand, issue #2) and CUDA-graph step
+   capture/replay (issue #3) have landed; the remaining levers are larger
+   batches and a flat-gradient readback - milestone **Phase 5.c - GPU perf**
+   (issue #4 benchmarks the crossover).
 
 2. **f32 master weights.** Real BitNet keeps BF16 masters; the GEMM is now int8
    on tensor cores, but the master weights and the AdamW optimiser state remain
