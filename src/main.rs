@@ -282,11 +282,9 @@ pub struct TrainConfig {
     /// the training loop exits with a clear error.
     ///
     /// Default: `false` (CPU autograd path, the v0.1-v0.18 behaviour).
-    /// Performance is dominated by `CudaModel::from_cpu(&model)`
-    /// rebuild per training step (the CPU master weights mutate after
-    /// each AdamW update, so the device-resident copy must be
-    /// refreshed); a follow-up `CudaModel::sync_from_cpu` would skip
-    /// the alloc cost.
+    /// The device-resident model is built once at step 0 and then
+    /// refreshed in place per step via `CudaModel::sync_from_cpu`
+    /// (issue #1) - pure H->D copies, no per-step device allocations.
     pub use_cuda_backward: bool,
 }
 
@@ -578,11 +576,11 @@ fn compute_batched_grads(
 /// of the CPU `Var`-based autograd path.
 ///
 /// Implementation notes:
-/// - Rebuilds the device-resident `CudaModel` once per training step
-///   from the current CPU master weights. The CPU weights mutate after
-///   each AdamW update, so the device copy must be refreshed; the
-///   rebuild is one H->D copy per weight tensor (no allocations on the
-///   hot path beyond what `cudarc` does internally).
+/// - Takes the device-resident `CudaModel` from the caller. The
+///   training loop builds it once and refreshes it in place with
+///   `CudaModel::sync_from_cpu` after each AdamW update (issue #1),
+///   so the per-step cost is pure H->D copies with zero new device
+///   allocations.
 /// - Runs windows serially - the GPU is the parallelism layer here.
 ///   Spawning multiple CPU threads to dispatch CUDA kernels would just
 ///   serialise on the default stream anyway.
@@ -592,17 +590,12 @@ fn compute_batched_grads(
 ///   comparison at the same seed.
 #[cfg(feature = "cuda")]
 fn compute_batched_grads_cuda_bitnet(
-    model: &crate::model::Model,
+    cuda_model: &crate::cuda::CudaModel,
     windows: &[(Vec<usize>, Vec<usize>)],
     rng: &mut crate::data::Lcg,
     batch_size: usize,
 ) -> (Vec<crate::tensor::Tensor>, f32) {
-    use crate::cuda::CudaModel;
     assert!(batch_size >= 1, "batch_size must be >= 1");
-
-    // Rebuild CudaModel once per training step (master weights moved
-    // last step). H->D cost is amortised across the batch.
-    let cuda_model = CudaModel::from_cpu(model);
 
     // Sample all window indices up front so changing batch_size does
     // not change which windows the run sees at the same RNG state.
@@ -816,6 +809,12 @@ fn train_bitnet_lm(
     let batch_size = cfg.batch_size.max(1);
     let n_workers = cfg.n_workers.max(1);
 
+    // Issue #1: the device-resident model is built once, then refreshed
+    // in place each step via `sync_from_cpu` - zero per-step device
+    // allocations. Lazily initialised so CPU-only runs never touch CUDA.
+    #[cfg(feature = "cuda")]
+    let mut cuda_model: Option<crate::cuda::CudaModel> = None;
+
     for step in 0..cfg.n_steps {
         // Sample `batch_size` random windows every step. With batch_size = 1
         // (the default for the tiny demo) this is exactly the prior single-
@@ -840,7 +839,16 @@ fn train_bitnet_lm(
         let (mut grads, batch_loss) = if cfg.use_cuda_backward {
             #[cfg(feature = "cuda")]
             {
-                compute_batched_grads_cuda_bitnet(&model, &windows, &mut rng, batch_size)
+                let cm = match cuda_model.as_mut() {
+                    Some(cm) => {
+                        // Masters moved last step (AdamW); refresh the
+                        // existing device buffers in place.
+                        cm.sync_from_cpu(&model);
+                        cm
+                    }
+                    None => cuda_model.insert(crate::cuda::CudaModel::from_cpu(&model)),
+                };
+                compute_batched_grads_cuda_bitnet(cm, &windows, &mut rng, batch_size)
             }
             #[cfg(not(feature = "cuda"))]
             {
@@ -1722,18 +1730,15 @@ fn run_cuda_demo() {
 /// this as a Phase 4 wiring proof, not a production training path.
 ///
 /// Per-step cost analysis (v0.13-shape demo, 7940HS + RTX 4070 Laptop):
-///   - rebuild CudaModel from CPU weights: H->D copy of every weight
-///     tensor every step. At v0.13 scale (~5M params, ~20 MB f32) the
-///     PCIe Gen4 round-trip is ~1 ms per rebuild.
+///   - refresh device weights from CPU masters: `sync_from_cpu`
+///     overwrites the existing buffers in place via `memcpy_htod`
+///     (issue #1), so the step pays pure H->D copy cost - allocation
+///     happens once at startup. At v0.13 scale (~5M params, ~20 MB
+///     f32) the PCIe Gen4 copy is well under 1 ms.
 ///   - forward+backward through one block stack: tens of kernel
 ///     launches at ~10-30 us each (mostly launch overhead, not
 ///     kernel time). Several ms per window at v0.13 scale.
 ///   - optimiser update on CPU: linear in param count, ~few ms.
-///
-/// The rebuild cost is the obvious next perf target: a follow-up
-/// chunk should add `CudaModel::sync_from_cpu(&Model)` that overwrites
-/// existing device buffers in place via `memcpy_htod`, so allocation
-/// overhead is paid once at startup instead of every step.
 #[cfg(feature = "cuda")]
 fn run_cuda_train_demo() {
     use crate::cuda::{CudaModel, cuda_state};
@@ -1792,13 +1797,17 @@ fn run_cuda_train_demo() {
     let mut min_loss: f32 = f32::INFINITY;
     let mut initial_loss: f32 = f32::NAN;
     let t0 = Instant::now();
+    // Built once; refreshed in place each step (issue #1). The CPU
+    // weights mutate after every opt step, so the device copy is
+    // synced at the top of each iteration - zero per-step device
+    // allocations.
+    let mut cuda_model = CudaModel::from_cpu(&model);
     for step in 0..n_steps {
         let idx = rng.gen_range(windows.len());
         let (input, target) = &windows[idx];
-        // Rebuild CudaModel from current CPU weights every step (CPU
-        // weights mutated by previous opt step). Cost is bearable at
-        // demo scale; production wiring would mutate in place.
-        let cuda_model = CudaModel::from_cpu(&model);
+        if step > 0 {
+            cuda_model.sync_from_cpu(&model);
+        }
         let (mut grads, loss) = cuda_model.compute_grads_for_window(input, target);
         if step == 0 {
             initial_loss = loss;
