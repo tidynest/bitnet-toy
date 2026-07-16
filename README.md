@@ -49,9 +49,13 @@ inference, binary export. No third-party ML dependencies.
   Device-buffer reuse (#1), quant-kernel fusion (#2, one launch
   per operand) and CUDA-graph step capture (#3, the whole
   forward+backward replays as ONE driver call, bit-identical
-  loss trajectory, `BITNET_CUDA_GRAPH=0` opts out) have landed;
-  larger batches and a flat-gradient-buffer readback are the
-  remaining follow-ups to fully realise tensor-core throughput.
+  loss trajectory, `BITNET_CUDA_GRAPH=0` opts out) have landed.
+  **The GPU now beats the CPU at both training scales** (#4):
+  ~145-178 vs ~370-440 ms/step at v0.13, ~492 vs ~1170 at
+  shakespeare-large (batch 4, quota-capped CPU; see
+  docs/TRAINING.md for the full table and caveats). Remaining
+  levers: flat-gradient readback, device-side AdamW, larger
+  batches.
 
 ## Quick start
 
@@ -268,10 +272,10 @@ Planned work is tracked on GitHub:
 
 Milestones, in priority order:
 
-1. **Phase 5.c - GPU perf** - realise the tensor-core speedup. Device buffers
-   are reused across steps (`sync_from_cpu`, #1), the quant kernels are fused
-   to one launch per operand (#2), and the training step is captured and
-   replayed as a CUDA graph (#3); remaining: benchmark at scale (#4).
+1. **Phase 5.c - GPU perf** - done (#1-#4): buffer reuse, fused quant
+   kernels, CUDA-graph step replay, and the GPU-vs-CPU benchmark showing the
+   GPU ahead at both scales (see docs/TRAINING.md). Possible follow-ups:
+   flat-gradient readback, device-side AdamW, larger batches.
 2. **CPU SIMD & threading** - the persistent matmul thread pool landed (#7)
    and Zen 4 AVX2 auto-select in v0.19; remaining: an ARM64 NEON path (#6,
    needs ARM hardware to validate).
