@@ -10,6 +10,7 @@ How to train, what to expect, what to watch for, and what knobs to turn.
 - [Smoke test](#smoke-test-no-setup-required)
 - [Real training: TinyShakespeare](#real-training-tinyshakespeare)
 - [Training any corpus: the train subcommand](#training-any-corpus-the-train-subcommand)
+- [GPU vs CPU benchmark](#gpu-vs-cpu-benchmark-issue-4)
 - [Watching the run](#watching-the-run)
 - [Generation modes](#generation-modes)
 - [Tuning](#tuning)
@@ -154,6 +155,46 @@ the eager path (pinned by `cuda_step_graph_loss_trajectory_matches_eager`).
 Set `BITNET_CUDA_GRAPH=0` to force the eager per-kernel path (A/B
 timing, or as an escape hatch on a misbehaving driver). A failed
 capture falls back to eager with a warning instead of aborting.
+
+## GPU vs CPU benchmark (issue #4)
+
+Measured 2026-07-16 on a Ryzen 9 7940HS + RTX 4070 Laptop (CUDA 13.3),
+after issues #1 (buffer reuse), #2 (fused quant kernels) and #3 (CUDA
+graph capture). Method: `train data/tinyshakespeare.txt --steps 100
+--val-split 0 [shape flags] [--cuda]`, reading the trainer's ms/step
+line; two runs per CPU cell, single runs elsewhere. batch_size 4
+windows per step in every cell.
+
+**Caveat**: this machine caps ALL heavy CPU work at a 300% aggregate
+CPU quota (thermal policy), so the CPU rows are roughly 2-3x slower
+than an uncapped 7940HS would be; the GPU path uses a single dispatch
+thread and is essentially unaffected. Historical uncapped v0.13
+numbers are included for calibration.
+
+| ms/step (batch 4) | v0.13 (~5M, seq 64) | large (~8.5M, seq 128) |
+|---|---|---|
+| CPU (300% quota)        | 366-444 | 1138-1201 |
+| GPU, graph replay       | 145-178 | 492 |
+| GPU, eager launches     | 164     | 499 |
+| CPU uncapped (v0.13-era historical) | ~180 | ~800 (est. 4-5x v0.13) |
+| GPU pre-#1/#2/#3 (historical)       | ~300 | - |
+
+Conclusions:
+
+- **The GPU now beats the CPU at both scales**: ~x2.4 at v0.13 and
+  ~x2.4 at shakespeare-large under the quota. Against an *uncapped*
+  CPU the crossover point sits right at the v0.13 scale (~180 vs
+  ~145-178 ms/step, near parity) and the GPU pulls clearly ahead at
+  the large scale (~800 est. vs ~492) - bigger matmuls amortise the
+  per-step fixed costs exactly as issue #4 predicted.
+- Graph replay vs eager launches is within run-to-run noise
+  end-to-end at these scales (the controlled per-window bench in
+  `cuda_step_graph_bench_vs_eager` shows x1.17); the remaining GPU
+  step cost is dominated by the ~300 individual per-tensor gradient
+  D->H reads plus the CPU-side AdamW, not launch overhead.
+- Next levers, in expected-impact order: a flat gradient buffer
+  (one D->H read per step instead of ~300), moving AdamW onto the
+  device, then larger batches per graph replay.
 
 ## Watching the run
 

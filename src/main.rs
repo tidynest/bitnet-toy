@@ -853,6 +853,7 @@ fn train_bitnet_lm(
     #[cfg(feature = "cuda")]
     let mut cuda_step_graph: Option<crate::cuda::CudaStepGraph> = None;
 
+    let train_t0 = std::time::Instant::now();
     for step in 0..cfg.n_steps {
         // Sample `batch_size` random windows every step. With batch_size = 1
         // (the default for the tiny demo) this is exactly the prior single-
@@ -943,6 +944,18 @@ fn train_bitnet_lm(
             );
         }
     }
+
+    // Issue #4 benchmarking hook: wall-clock over the whole step loop.
+    // Includes any mid-run eval passes; run with val_split = 0 for a
+    // pure ms/step number.
+    let train_elapsed = train_t0.elapsed();
+    println!(
+        "\ntrained {} steps in {:.1}s  ({:.1} ms/step, batch_size {})",
+        cfg.n_steps,
+        train_elapsed.as_secs_f32(),
+        train_elapsed.as_secs_f64() * 1e3 / cfg.n_steps.max(1) as f64,
+        batch_size,
+    );
 
     // Final, more accurate validation pass at end of training. Use 5× the
     // running-eval sample count so the headline number reflects the model
