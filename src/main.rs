@@ -581,6 +581,13 @@ fn compute_batched_grads(
 ///   `CudaModel::sync_from_cpu` after each AdamW update (issue #1),
 ///   so the per-step cost is pure H->D copies with zero new device
 ///   allocations.
+/// - Each window replays a captured CUDA graph (issue #3): the whole
+///   forward+backward launch sequence collapses into one driver call.
+///   The graph is captured lazily on the first step and reused for
+///   the rest of the run; `BITNET_CUDA_GRAPH=0` forces the eager
+///   per-kernel path (A/B timing, driver-bug escape hatch), and a
+///   failed capture falls back to eager with a warning rather than
+///   aborting the run.
 /// - Runs windows serially - the GPU is the parallelism layer here.
 ///   Spawning multiple CPU threads to dispatch CUDA kernels would just
 ///   serialise on the default stream anyway.
@@ -591,11 +598,33 @@ fn compute_batched_grads(
 #[cfg(feature = "cuda")]
 fn compute_batched_grads_cuda_bitnet(
     cuda_model: &crate::cuda::CudaModel,
+    step_graph: &mut Option<crate::cuda::CudaStepGraph>,
     windows: &[(Vec<usize>, Vec<usize>)],
     rng: &mut crate::data::Lcg,
     batch_size: usize,
 ) -> (Vec<crate::tensor::Tensor>, f32) {
     assert!(batch_size >= 1, "batch_size must be >= 1");
+
+    // Lazy one-time capture. All training windows share one seq_len
+    // (make_windows produces fixed-size windows), so one graph serves
+    // the whole run. A `false` here after a failed capture keeps the
+    // run on the eager path without retrying every step.
+    static GRAPH_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+    let graph_wanted = std::env::var("BITNET_CUDA_GRAPH").map_or(true, |v| v.trim() != "0")
+        && GRAPH_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
+    if step_graph.is_none() && graph_wanted {
+        let seq = windows[0].0.len();
+        match cuda_model.build_step_graph(seq) {
+            Ok(g) => {
+                println!("captured CUDA step graph (seq_len {seq}); replaying it per window");
+                *step_graph = Some(g);
+            }
+            Err(e) => {
+                eprintln!("CUDA graph capture failed ({e}); falling back to eager launches");
+                GRAPH_ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
 
     // Sample all window indices up front so changing batch_size does
     // not change which windows the run sees at the same RNG state.
@@ -603,14 +632,19 @@ fn compute_batched_grads_cuda_bitnet(
         .map(|_| rng.gen_range(windows.len()))
         .collect();
 
+    let mut grads_for = |input: &[usize], target: &[usize]| match step_graph.as_mut() {
+        Some(g) => cuda_model.run_step_graph(g, input, target),
+        None => cuda_model.compute_grads_for_window_bitnet(input, target),
+    };
+
     // Average gradients across the batch. Start from the first
     // result's tensors (move out, no clone) and sum the rest into them.
     let first_idx = indices[0];
     let (input, target) = &windows[first_idx];
-    let (mut avg_grads, mut total_loss) = cuda_model.compute_grads_for_window_bitnet(input, target);
+    let (mut avg_grads, mut total_loss) = grads_for(input, target);
     for &idx in &indices[1..] {
         let (input, target) = &windows[idx];
-        let (other_grads, other_loss) = cuda_model.compute_grads_for_window_bitnet(input, target);
+        let (other_grads, other_loss) = grads_for(input, target);
         for (a, b) in avg_grads.iter_mut().zip(&other_grads) {
             for (av, bv) in a.data.iter_mut().zip(&b.data) {
                 *av += bv;
@@ -814,6 +848,10 @@ fn train_bitnet_lm(
     // allocations. Lazily initialised so CPU-only runs never touch CUDA.
     #[cfg(feature = "cuda")]
     let mut cuda_model: Option<crate::cuda::CudaModel> = None;
+    // Issue #3: the captured step graph, built lazily on the first GPU
+    // step and replayed for the rest of the run.
+    #[cfg(feature = "cuda")]
+    let mut cuda_step_graph: Option<crate::cuda::CudaStepGraph> = None;
 
     for step in 0..cfg.n_steps {
         // Sample `batch_size` random windows every step. With batch_size = 1
@@ -848,7 +886,13 @@ fn train_bitnet_lm(
                     }
                     None => cuda_model.insert(crate::cuda::CudaModel::from_cpu(&model)),
                 };
-                compute_batched_grads_cuda_bitnet(cm, &windows, &mut rng, batch_size)
+                compute_batched_grads_cuda_bitnet(
+                    cm,
+                    &mut cuda_step_graph,
+                    &windows,
+                    &mut rng,
+                    batch_size,
+                )
             }
             #[cfg(not(feature = "cuda"))]
             {
