@@ -2,7 +2,7 @@
 
 ![version](https://img.shields.io/badge/version-v0.19.0-3b6ea5)
 ![Rust](https://img.shields.io/badge/Rust-2024%20edition-ce412b?logo=rust&logoColor=white)
-![tests](https://img.shields.io/badge/tests-140%20passing-3f9142)
+![tests](https://img.shields.io/badge/tests-147%20passing-3f9142)
 ![CUDA](https://img.shields.io/badge/CUDA-optional%20(cudarc%200.19)-76b900?logo=nvidia&logoColor=white)
 ![ML dependencies](https://img.shields.io/badge/ML%20dependencies-none-3f9142)
 
@@ -28,7 +28,7 @@ inference, binary export. No third-party ML dependencies.
 
 ## Status
 
-- **140** tests passing on `cargo test`; **172** with `cargo test --features cuda`.
+- **147** tests passing on `cargo test`; **181** with `cargo test --features cuda`.
 - **0** warnings on `cargo build --release` (or `--features cuda`).
 - `cargo audit` clean for the default build (stdlib-only); the optional
   `cuda` feature pulls `cudarc` and its small dynamic-loading deps.
@@ -46,8 +46,9 @@ inference, binary export. No third-party ML dependencies.
   v0.13 scale (loss trajectory matches CPU). Empirically GPU is
   ~300 ms/step vs CPU ~180 ms/step at v0.13 scale: per-step
   launch overhead dominates (~3000+ kernel launches per step).
-  Kernel fusion + CUDA graphs + larger batches are the
-  follow-ups to actually realise tensor-core throughput.
+  Device-buffer reuse (#1) and quant-kernel fusion (#2, one
+  launch per operand) have landed; CUDA graphs + larger batches
+  are the follow-ups to actually realise tensor-core throughput.
 
 ## Quick start
 

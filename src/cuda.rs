@@ -1398,7 +1398,7 @@ impl crate::device::Rope for CudaTensor {
         let seq = self.shape[0];
         let head_dim = self.shape[1];
         assert!(
-            head_dim % 2 == 0,
+            head_dim.is_multiple_of(2),
             "rope: head_dim ({head_dim}) must be even"
         );
         let seq_i = i32::try_from(seq).expect("seq exceeds i32");
@@ -1440,7 +1440,7 @@ impl crate::device::RopeBackward for CudaTensor {
         let seq = self.shape[0];
         let head_dim = self.shape[1];
         assert!(
-            head_dim % 2 == 0,
+            head_dim.is_multiple_of(2),
             "rope_backward: head_dim ({head_dim}) must be even"
         );
         let seq_i = i32::try_from(seq).expect("seq exceeds i32");
@@ -1736,7 +1736,7 @@ impl crate::device::BitLinear for CudaTensor {
         // to the Phase 5.a f32 sgemm path (algebraically identical;
         // the only matmul in the project that hits this fallback is
         // the lm_head with n = vocab = 65).
-        if k % 4 != 0 || n % 4 != 0 {
+        if !k.is_multiple_of(4) || !n.is_multiple_of(4) {
             use crate::device::{MatMul, QuantiseActsSTE, QuantiseWeightsSTE};
             let x_eff = self.quantise_acts_ste();
             let w_eff = rhs.quantise_weights_ste();
@@ -2048,6 +2048,7 @@ impl CudaModel {
     ///      backward (transposed [vocab, hidden] grad slab)
     ///   2. for each block: per-head q/k/v/o, then ffn_gate, ffn_up,
     ///      ffn_down
+    ///
     /// (No trailing lm_head: tied to token_embed.)
     pub fn compute_grads_for_window(
         &self,
@@ -3249,6 +3250,7 @@ mod tests {
     /// - every gradient tensor is finite (no NaN / inf);
     /// - the gradient norm is non-zero (a fully-zero set would mean
     ///   the chain dropped a branch somewhere).
+    ///
     /// Together with chunks 4.5.a-d's correctness gates, this is
     /// enough sanity that the orchestration is right; tighter
     /// validation lives in chunk 4.5.f's "loss decreases when we
