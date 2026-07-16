@@ -842,6 +842,22 @@ fn count_quant_launch() {
     QUANT_KERNEL_LAUNCHES.with(|c| c.set(c.get() + 1));
 }
 
+thread_local! {
+    /// Count of device-to-host reads issued BY THIS THREAD through the
+    /// step/readback paths (`to_cpu` + the step-loss/grad reads).
+    /// Issue #15 observability: each read is a driver round-trip plus
+    /// a pageable-copy sync, so tests pin how many a training step may
+    /// issue. Thread-local for parallel-suite immunity, like
+    /// `QUANT_KERNEL_LAUNCHES`.
+    pub static DTOH_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Increment helper for `DTOH_READS` - one call per D->H copy, next to
+/// the copy itself.
+fn count_dtoh_read() {
+    DTOH_READS.with(|c| c.set(c.get() + 1));
+}
+
 /// Device-resident f32 tensor. Owns its `CudaSlice<f32>`; the slice is
 /// reference-counted by cudarc so cloning is cheap on the Rust side and
 /// safe across stream boundaries.
@@ -902,26 +918,10 @@ impl CudaTensor {
             .map_err(|e| format!("memcpy_htod failed: {e:?}"))
     }
 
-    /// Overwrite this tensor's device buffer in place from another
-    /// device tensor of identical shape (device-to-device memcpy, no
-    /// allocation). Used to land step outputs in persistent buffers
-    /// that outlive a captured graph (issue #3).
-    pub fn copy_from_device(&mut self, src: &CudaTensor) -> Result<(), String> {
-        if self.shape != src.shape {
-            return Err(format!(
-                "copy_from_device shape mismatch: dst {:?} vs src {:?}",
-                self.shape, src.shape
-            ));
-        }
-        let s = cuda_state()?;
-        s.active_stream()
-            .memcpy_dtod(&src.data, &mut self.data)
-            .map_err(|e| format!("memcpy_dtod failed: {e:?}"))
-    }
-
     /// Copy device memory back into a CPU `Tensor`. Synchronous.
     pub fn to_cpu(&self) -> Result<Tensor, String> {
         let s = cuda_state()?;
+        count_dtoh_read();
         let v = s
             .active_stream()
             .clone_dtoh(&self.data)
@@ -1681,6 +1681,7 @@ impl crate::device::CrossEntropy for CudaTensor {
         // Copy per-row losses back and average. seq is small (~64) so
         // this is far cheaper than fighting GPU atomic-add or a second
         // reduction kernel.
+        count_dtoh_read();
         let losses_host = s
             .active_stream()
             .clone_dtoh(&per_row_loss)
@@ -2479,52 +2480,81 @@ impl CudaModel {
         }
     }
 
-    /// Persistent output slots for one training step. Allocated once,
-    /// written by `step_core_into` via device-to-device copies, read
-    /// back by `assemble_grads`. Stable addresses are what let a
-    /// captured graph (issue #3) deliver its results across replays.
+    /// Persistent output slot for one training step: ONE contiguous
+    /// device buffer holding every output at a precomputed offset
+    /// (issue #15), so the whole readback is a single D->H copy.
+    /// Allocated once, written by `step_core_into` via device-to-device
+    /// copies, read back by `assemble_grads`. The stable address is
+    /// also what lets a captured graph (issue #3) deliver its results
+    /// across replays.
+    ///
+    /// Layout (element offsets, all f32):
+    ///   [0..seq)              per-row CE loss
+    ///   [seq..+vocab*h)       grad of the tied lm_head, pre-transposed
+    ///                         to [vocab, hidden]
+    ///   [..+seq*h)            grad wrt the post-embed activations
+    ///   then per block: per head w_q, w_k, w_v, w_o, then the FFN
+    ///   gate, up, down - the same walk `assemble_grads` flattens.
     fn alloc_step_buffers(&self, seq: usize) -> StepBuffers {
         let s = cuda_state().expect("cuda_state failed");
         let h = self.config.hidden_dim;
         let vocab = self.config.vocab_size;
-        let zeros = |shape: Vec<usize>| -> CudaTensor {
-            let len = shape.iter().product();
-            CudaTensor {
-                data: s
-                    .active_stream()
-                    .alloc_zeros::<f32>(len)
-                    .expect("alloc step buffer"),
-                shape,
-            }
+        let mut next = 0usize;
+        let mut claim = |len: usize| -> usize {
+            let at = next;
+            next += len;
+            at
         };
+        let loss = claim(seq);
+        let lm_head_w_t = claim(vocab * h);
+        let x_pre_blocks = claim(seq * h);
         let blocks = self
             .blocks
             .iter()
-            .map(|b| BlockGradBuffers {
+            .map(|b| BlockOffsets {
                 heads: b
                     .heads
                     .iter()
-                    .map(|hw| HeadGradBuffers {
-                        w_q: zeros(hw.w_q.shape.clone()),
-                        w_k: zeros(hw.w_k.shape.clone()),
-                        w_v: zeros(hw.w_v.shape.clone()),
-                        w_o: zeros(hw.w_o.shape.clone()),
+                    .map(|hw| {
+                        [
+                            claim(hw.w_q.data.len()),
+                            claim(hw.w_k.data.len()),
+                            claim(hw.w_v.data.len()),
+                            claim(hw.w_o.data.len()),
+                        ]
                     })
                     .collect(),
-                w_gate: zeros(b.ffn.w_gate.shape.clone()),
-                w_up: zeros(b.ffn.w_up.shape.clone()),
-                w_down: zeros(b.ffn.w_down.shape.clone()),
+                gate: claim(b.ffn.w_gate.data.len()),
+                up: claim(b.ffn.w_up.data.len()),
+                down: claim(b.ffn.w_down.data.len()),
             })
             .collect();
+        let total = next;
         StepBuffers {
-            per_row_loss: s
+            flat: s
                 .active_stream()
-                .alloc_zeros::<f32>(seq)
-                .expect("alloc per_row_loss"),
-            grad_lm_head_w_t: zeros(vec![vocab, h]),
-            grad_x_pre_blocks: zeros(vec![seq, h]),
-            blocks,
+                .alloc_zeros::<f32>(total)
+                .expect("alloc flat step buffer"),
+            layout: StepLayout {
+                loss,
+                lm_head_w_t,
+                x_pre_blocks,
+                blocks,
+                total,
+            },
         }
+    }
+
+    /// Device-to-device copy of one step output into its slot of the
+    /// flat buffer. Bounds are guaranteed by construction (`claim`
+    /// sized every slot from the same tensors that get written), so a
+    /// mismatch is a layout bug and panics.
+    fn write_flat(flat: &mut CudaSlice<f32>, offset: usize, src: &CudaSlice<f32>) {
+        let s = cuda_state().expect("cuda_state failed");
+        let mut dst = flat.slice_mut(offset..offset + src.len());
+        s.active_stream()
+            .memcpy_dtod(src, &mut dst)
+            .expect("D->D into flat step buffer");
     }
 
     /// The device-only step core: forward through every block, tied
@@ -2598,74 +2628,67 @@ impl CudaModel {
         let block_grads: Vec<crate::device::BlockGrads<CudaTensor>> =
             block_grads_rev.into_iter().rev().collect();
 
-        // ---- Land every output in the persistent buffers. ----
-        let s = cuda_state().expect("cuda_state failed");
-        s.active_stream()
-            .memcpy_dtod(&per_row_loss, &mut bufs.per_row_loss)
-            .expect("D->D per_row_loss");
+        // ---- Land every output in its flat-buffer slot (issue #15). ----
+        let StepBuffers { flat, layout } = bufs;
+        Self::write_flat(flat, layout.loss, &per_row_loss);
         // Tied-embedding contribution transposed to [vocab, hidden] so
         // the host side can sum it straight into the embed-gather grad.
-        bufs.grad_lm_head_w_t
-            .copy_from_device(&grad_lm_head_w.transpose_2d())
-            .expect("D->D grad_lm_head_w_t");
-        bufs.grad_x_pre_blocks
-            .copy_from_device(&grad_x)
-            .expect("D->D grad_x_pre_blocks");
-        for (bb, bg) in bufs.blocks.iter_mut().zip(&block_grads) {
-            for (hb, hg) in bb.heads.iter_mut().zip(&bg.head_grads) {
-                hb.w_q.copy_from_device(&hg.grad_w_q).expect("D->D w_q");
-                hb.w_k.copy_from_device(&hg.grad_w_k).expect("D->D w_k");
-                hb.w_v.copy_from_device(&hg.grad_w_v).expect("D->D w_v");
-                hb.w_o.copy_from_device(&hg.grad_w_o).expect("D->D w_o");
+        Self::write_flat(
+            flat,
+            layout.lm_head_w_t,
+            &grad_lm_head_w.transpose_2d().data,
+        );
+        Self::write_flat(flat, layout.x_pre_blocks, &grad_x.data);
+        for (bo, bg) in layout.blocks.iter().zip(&block_grads) {
+            for (ho, hg) in bo.heads.iter().zip(&bg.head_grads) {
+                Self::write_flat(flat, ho[0], &hg.grad_w_q.data);
+                Self::write_flat(flat, ho[1], &hg.grad_w_k.data);
+                Self::write_flat(flat, ho[2], &hg.grad_w_v.data);
+                Self::write_flat(flat, ho[3], &hg.grad_w_o.data);
             }
-            bb.w_gate
-                .copy_from_device(&bg.grad_w_gate)
-                .expect("D->D w_gate");
-            bb.w_up.copy_from_device(&bg.grad_w_up).expect("D->D w_up");
-            bb.w_down
-                .copy_from_device(&bg.grad_w_down)
-                .expect("D->D w_down");
+            Self::write_flat(flat, bo.gate, &bg.grad_w_gate.data);
+            Self::write_flat(flat, bo.up, &bg.grad_w_up.data);
+            Self::write_flat(flat, bo.down, &bg.grad_w_down.data);
         }
     }
 
-    /// Pull the step outputs off the device and build the CPU-side
-    /// result: mean loss, embed scatter-add + tied-lm_head sum, and
-    /// the flat gradient list in the **canonical visitor order**
-    /// matching `Model::for_each_grad`. Shared verbatim by the eager
-    /// and graph paths, so the two can only differ in what the device
-    /// computed - which is what the graph test pins bitwise.
+    /// Pull the step outputs off the device - ONE flat D->H read
+    /// (issue #15) - and build the CPU-side result: mean loss, embed
+    /// scatter-add + tied-lm_head sum, and the gradient list in the
+    /// **canonical visitor order** matching `Model::for_each_grad`.
+    /// Shared verbatim by the eager and graph paths, so the two can
+    /// only differ in what the device computed - which is what the
+    /// graph test pins bitwise.
     fn assemble_grads(&self, bufs: &StepBuffers, input_ids: &[usize]) -> (Vec<Tensor>, f32) {
         let s = cuda_state().expect("cuda_state failed");
         let seq = input_ids.len();
         let h = self.config.hidden_dim;
         let vocab = self.config.vocab_size;
+        let lay = &bufs.layout;
 
-        let losses_host = s
+        count_dtoh_read();
+        let host = s
             .active_stream()
-            .clone_dtoh(&bufs.per_row_loss)
-            .expect("D->H per_row_loss");
-        let loss = losses_host.iter().sum::<f32>() / seq as f32;
+            .clone_dtoh(&bufs.flat)
+            .expect("D->H flat step buffer");
+        debug_assert_eq!(host.len(), lay.total);
+        let at = |offset: usize, len: usize| -> &[f32] { &host[offset..offset + len] };
+
+        let loss = at(lay.loss, seq).iter().sum::<f32>() / seq as f32;
 
         // Embed scatter-add (CPU side), then sum in the LM-head's
         // tied-embedding contribution.
-        let grad_x_pre_blocks_cpu = bufs
-            .grad_x_pre_blocks
-            .to_cpu()
-            .expect("D->H grad_x_pre_blocks");
-        let grad_token_embed_from_lm = bufs.grad_lm_head_w_t.to_cpu().expect("D->H grad_lm");
+        let grad_x_pre_blocks = at(lay.x_pre_blocks, seq * h);
+        let grad_token_embed_from_lm = at(lay.lm_head_w_t, vocab * h);
         let mut grad_token_embed = vec![0.0_f32; vocab * h];
         for (pos, &id) in input_ids.iter().enumerate() {
             let dst_start = id * h;
             let src_start = pos * h;
             for c in 0..h {
-                grad_token_embed[dst_start + c] += grad_x_pre_blocks_cpu.data[src_start + c];
+                grad_token_embed[dst_start + c] += grad_x_pre_blocks[src_start + c];
             }
         }
-        debug_assert_eq!(grad_token_embed_from_lm.data.len(), grad_token_embed.len());
-        for (g, &lm) in grad_token_embed
-            .iter_mut()
-            .zip(&grad_token_embed_from_lm.data)
-        {
+        for (g, &lm) in grad_token_embed.iter_mut().zip(grad_token_embed_from_lm) {
             *g += lm;
         }
         let grad_token_embed_t = Tensor {
@@ -2673,20 +2696,30 @@ impl CudaModel {
             shape: vec![vocab, h],
         };
 
-        // Flatten in canonical visitor order. No trailing lm_head: tied
-        // to token_embed since v0.17 / BNT5.
+        // Flatten in canonical visitor order, slicing each parameter's
+        // gradient out of the flat host copy at its layout offset.
+        // Shapes come from the device weight tensors - the same source
+        // `alloc_step_buffers` sized the slots from. No trailing
+        // lm_head: tied to token_embed since v0.17 / BNT5.
+        let slice_to_tensor = |offset: usize, shape: &[usize]| -> Tensor {
+            let len = shape.iter().product();
+            Tensor {
+                data: at(offset, len).to_vec(),
+                shape: shape.to_vec(),
+            }
+        };
         let mut grads: Vec<Tensor> = Vec::new();
         grads.push(grad_token_embed_t);
-        for bb in &bufs.blocks {
-            for hb in &bb.heads {
-                grads.push(hb.w_q.to_cpu().expect("D->H w_q"));
-                grads.push(hb.w_k.to_cpu().expect("D->H w_k"));
-                grads.push(hb.w_v.to_cpu().expect("D->H w_v"));
-                grads.push(hb.w_o.to_cpu().expect("D->H w_o"));
+        for (bo, b) in lay.blocks.iter().zip(&self.blocks) {
+            for (ho, hw) in bo.heads.iter().zip(&b.heads) {
+                grads.push(slice_to_tensor(ho[0], &hw.w_q.shape));
+                grads.push(slice_to_tensor(ho[1], &hw.w_k.shape));
+                grads.push(slice_to_tensor(ho[2], &hw.w_v.shape));
+                grads.push(slice_to_tensor(ho[3], &hw.w_o.shape));
             }
-            grads.push(bb.w_gate.to_cpu().expect("D->H w_gate"));
-            grads.push(bb.w_up.to_cpu().expect("D->H w_up"));
-            grads.push(bb.w_down.to_cpu().expect("D->H w_down"));
+            grads.push(slice_to_tensor(bo.gate, &b.ffn.w_gate.shape));
+            grads.push(slice_to_tensor(bo.up, &b.ffn.w_up.shape));
+            grads.push(slice_to_tensor(bo.down, &b.ffn.w_down.shape));
         }
 
         (grads, loss)
@@ -2805,27 +2838,32 @@ impl CudaModel {
     }
 }
 
-/// Persistent per-step output slots (issue #3). See
-/// `CudaModel::alloc_step_buffers`.
-struct HeadGradBuffers {
-    w_q: CudaTensor,
-    w_k: CudaTensor,
-    w_v: CudaTensor,
-    w_o: CudaTensor,
-}
-
-struct BlockGradBuffers {
-    heads: Vec<HeadGradBuffers>,
-    w_gate: CudaTensor,
-    w_up: CudaTensor,
-    w_down: CudaTensor,
-}
-
+/// Persistent per-step output buffer (issues #3 + #15): one flat
+/// device allocation plus the element offsets of every slot in it.
+/// See `CudaModel::alloc_step_buffers` for the layout.
 struct StepBuffers {
-    per_row_loss: CudaSlice<f32>,
-    grad_lm_head_w_t: CudaTensor,
-    grad_x_pre_blocks: CudaTensor,
-    blocks: Vec<BlockGradBuffers>,
+    flat: CudaSlice<f32>,
+    layout: StepLayout,
+}
+
+/// Element offsets into `StepBuffers::flat`. Shapes are not stored:
+/// both the writer (`step_core_into`) and the reader
+/// (`assemble_grads`) take them from the model's device weight
+/// tensors, the same source `alloc_step_buffers` sized the slots from.
+struct StepLayout {
+    loss: usize,
+    lm_head_w_t: usize,
+    x_pre_blocks: usize,
+    blocks: Vec<BlockOffsets>,
+    total: usize,
+}
+
+/// Per-block slot offsets: `heads[i]` holds `[w_q, w_k, w_v, w_o]`.
+struct BlockOffsets {
+    heads: Vec<[usize; 4]>,
+    gate: usize,
+    up: usize,
+    down: usize,
 }
 
 /// A captured training step: the instantiated CUDA graph plus every
@@ -3401,6 +3439,49 @@ mod tests {
         for (i, (e, g)) in eager_b.iter().zip(&graph_b).enumerate() {
             assert_eq!(e.data, g.data, "grad {i} diverged after weight sync");
         }
+    }
+
+    /// Issue #15: the whole step readback must be ONE device-to-host
+    /// copy - a single flat gradient buffer read - on both the eager
+    /// and the graph path. ~300 per-tensor reads per window were the
+    /// dominant residual GPU step cost after #1-#3.
+    #[test]
+    fn step_readback_is_single_dtoh() {
+        if cuda_state().is_err() {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        }
+        use crate::model::{Model, ModelConfig};
+        let config = ModelConfig {
+            vocab_size: 12,
+            hidden_dim: 32,
+            n_heads: 4,
+            head_dim: 8,
+            ffn_dim: 64,
+            max_seq_len: 8,
+            n_blocks: 2,
+        };
+        let model = Model::new(&config, 11);
+        let cuda_model = CudaModel::from_cpu(&model);
+        let win: Vec<usize> = vec![0, 3, 7, 11, 5, 1, 9, 2];
+        let tgt: Vec<usize> = vec![3, 7, 11, 5, 1, 9, 2, 0];
+
+        let before = DTOH_READS.with(std::cell::Cell::get);
+        let _ = cuda_model.compute_grads_for_window_bitnet(&win, &tgt);
+        let eager_reads = DTOH_READS.with(std::cell::Cell::get) - before;
+        assert_eq!(
+            eager_reads, 1,
+            "eager step must read back one flat buffer, saw {eager_reads} D->H reads"
+        );
+
+        let mut graph = cuda_model.build_step_graph(8).expect("capture failed");
+        let before = DTOH_READS.with(std::cell::Cell::get);
+        let _ = cuda_model.run_step_graph(&mut graph, &win, &tgt);
+        let graph_reads = DTOH_READS.with(std::cell::Cell::get) - before;
+        assert_eq!(
+            graph_reads, 1,
+            "graph replay must read back one flat buffer, saw {graph_reads} D->H reads"
+        );
     }
 
     /// Issue #3 DoD: the loss trajectory of a short training run must
