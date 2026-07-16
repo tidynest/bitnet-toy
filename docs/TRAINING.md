@@ -15,7 +15,7 @@ How to train, what to expect, what to watch for, and what knobs to turn.
 - [Tuning](#tuning)
 - [Limitations to know about](#limitations-to-know-about)
 - [Batching and threading notes](#batching-and-threading-notes)
-- [CUDA back-end](#cuda-back-end) — Phases 1-3, 4.1-4.5.f, 5.a/5.b, preflight
+- [CUDA back-end](#cuda-back-end) - Phases 1-3, 4.1-4.5.f, 5.a/5.b, preflight
 
 ## Smoke test (no setup required)
 
@@ -320,7 +320,7 @@ picks the widest path the CPU exposes:
 
 | Path     | Lanes | Detection                     |
 |----------|-------|-------------------------------|
-| AVX-512  |    16 | `is_x86_feature_detected!("avx512f")` (Sapphire Rapids onwards; **not** Zen 4 by default — see below) |
+| AVX-512  |    16 | `is_x86_feature_detected!("avx512f")` (Sapphire Rapids onwards; **not** Zen 4 by default - see below) |
 | AVX2     |     8 | `is_x86_feature_detected!("avx2")` (everything since ~2013)            |
 | Scalar   |     1 | always                                                                 |
 

@@ -264,14 +264,15 @@ Planned work is tracked on GitHub:
 
 Milestones, in priority order:
 
-1. **Phase 5.c — GPU perf** — realise the tensor-core speedup. Per-step launch
-   overhead currently makes the GPU slower than the CPU despite correct ternary
-   int8 GEMM; reuse device buffers, fuse the quant kernels, capture the step as
-   a CUDA graph, then benchmark at scale.
-2. **CPU SIMD & threading** — an ARM64 NEON path and a persistent thread pool
-   (Zen 4 AVX2 auto-select landed in v0.19).
-3. **CLI ergonomics** — train arbitrary corpora with overridable hyperparameters
-   from the command line.
+1. **Phase 5.c - GPU perf** - realise the tensor-core speedup. Device buffers
+   are now reused across steps (`sync_from_cpu`, #1) and the quant kernels are
+   fused to one launch per operand (#2); remaining: capture the step as a CUDA
+   graph (#3), then benchmark at scale (#4).
+2. **CPU SIMD & threading** - the persistent matmul thread pool landed (#7)
+   and Zen 4 AVX2 auto-select in v0.19; remaining: an ARM64 NEON path (#6,
+   needs ARM hardware to validate).
+3. **CLI ergonomics** - done (#8): `train <corpus>` with overridable
+   hyperparameters, `--help`, and `sample --corpus` for custom checkpoints.
 
 ## Further reading
 
