@@ -51,11 +51,12 @@ inference, binary export. No third-party ML dependencies.
   forward+backward replays as ONE driver call, bit-identical
   loss trajectory, `BITNET_CUDA_GRAPH=0` opts out) have landed.
   **The GPU now beats the CPU at both training scales** (#4):
-  ~139 vs ~370-440 ms/step at v0.13, ~394 vs ~1170 at
-  shakespeare-large after the flat-gradient readback (#15: the
-  whole step reads back as ONE D->H copy; batch 4, quota-capped
-  CPU; see docs/TRAINING.md for the full table and caveats).
-  Remaining levers: device-side AdamW (#16), larger batches.
+  ~116 vs ~370-440 ms/step at v0.13 and ~276 vs ~1170 at
+  shakespeare-large (x4.2) after the flat-gradient readback
+  (#15) and device-side AdamW (#16: gradients never leave the
+  GPU, the update kernel rewrites the masters in place; batch 4,
+  quota-capped CPU; docs/TRAINING.md has the full table and
+  caveats). Remaining lever: larger batches per graph replay.
 
 ## Quick start
 
@@ -275,9 +276,10 @@ Milestones, in priority order:
 1. **Phase 5.c - GPU perf** - done (#1-#4): buffer reuse, fused quant
    kernels, CUDA-graph step replay, and the GPU-vs-CPU benchmark showing the
    GPU ahead at both scales (see docs/TRAINING.md).
-2. **Phase 5.d - GPU step residency** - flat-gradient readback done (#15,
-   one D->H copy per window, -20% ms/step at the large scale); next:
-   device-side AdamW (#16), then larger batches per graph replay.
+2. **Phase 5.d - GPU step residency** - done: flat-gradient readback (#15)
+   and device-side AdamW (#16) leave only each window's loss and the grad
+   norm crossing to the host per step (492 -> 276 ms/step at the large
+   scale). Possible follow-up: larger batches per graph replay.
 3. **CPU SIMD & threading** - the persistent matmul thread pool landed (#7)
    and Zen 4 AVX2 auto-select in v0.19; remaining: an ARM64 NEON path (#6,
    needs ARM hardware to validate).
