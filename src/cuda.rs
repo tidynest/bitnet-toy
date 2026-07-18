@@ -90,16 +90,20 @@ extern "C" __global__ void transpose_2d_f32(
     }
 }
 
+// window (issue #22): rows i and j belong to the same attention window
+// iff i / window == j / window. With window == m this is the plain
+// causal mask; a batched [B*seq, B*seq] score matrix gets the
+// block-diagonal-causal pattern that stops attention crossing windows.
 extern "C" __global__ void causal_mask_f32(
     const float* __restrict__ in_,
     float* __restrict__ out,
-    int m, int n)
+    int m, int n, int window)
 {
     int j = blockIdx.x * blockDim.x + threadIdx.x;
     int i = blockIdx.y * blockDim.y + threadIdx.y;
     if (i < m && j < n) {
         float v = in_[i * n + j];
-        out[i * n + j] = (j > i) ? -INFINITY : v;
+        out[i * n + j] = (j > i || j / window != i / window) ? -INFINITY : v;
     }
 }
 
@@ -132,10 +136,13 @@ extern "C" __global__ void softmax_row_f32(
     for (int j = 0; j < n; ++j) yr[j] *= inv;
 }
 
+// period (issue #22): the rotation position is pos % period, so a
+// batched [B*seq, head_dim] slab rotates every window by positions
+// 0..seq. period == seq (== row count for B = 1) is the classic RoPE.
 extern "C" __global__ void rope_f32(
     const float* __restrict__ x,
     float* __restrict__ out,
-    int seq, int head_dim)
+    int seq, int head_dim, int period)
 {
     // One thread per (pos, pair). pair indexes 0..head_dim/2.
     int pair = blockIdx.x * blockDim.x + threadIdx.x;
@@ -144,7 +151,7 @@ extern "C" __global__ void rope_f32(
     if (pair >= half || pos >= seq) return;
 
     float theta_i = powf(10000.0f, -(2.0f * (float)pair) / (float)head_dim);
-    float angle   = (float)pos * theta_i;
+    float angle   = (float)(pos % period) * theta_i;
     float c = cosf(angle);
     float s = sinf(angle);
     float a = x[pos * head_dim + 2 * pair];
@@ -228,12 +235,12 @@ extern "C" __global__ void softmax_backward_row_f32(
 extern "C" __global__ void causal_mask_backward_f32(
     const float* __restrict__ grad_y,
     float* __restrict__ out,
-    int m, int n)
+    int m, int n, int window)
 {
     int j = blockIdx.x * blockDim.x + threadIdx.x;
     int i = blockIdx.y * blockDim.y + threadIdx.y;
     if (i < m && j < n) {
-        out[i * n + j] = (j > i) ? 0.0f : grad_y[i * n + j];
+        out[i * n + j] = (j > i || j / window != i / window) ? 0.0f : grad_y[i * n + j];
     }
 }
 
@@ -536,14 +543,14 @@ extern "C" __global__ void cross_entropy_backward_f32(
 extern "C" __global__ void rope_backward_f32(
     const float* __restrict__ grad_y,
     float* __restrict__ out,
-    int seq, int head_dim)
+    int seq, int head_dim, int period)
 {
     int pair = blockIdx.x * blockDim.x + threadIdx.x;
     int pos = blockIdx.y * blockDim.y + threadIdx.y;
     int half = head_dim / 2;
     if (pair >= half || pos >= seq) return;
     float theta_i = powf(10000.0f, -(2.0f * (float)pair) / (float)head_dim);
-    float angle = (float)pos * theta_i;
+    float angle = (float)(pos % period) * theta_i;
     float c = cosf(angle);
     float s = sinf(angle);
     float ga = grad_y[pos * head_dim + 2 * pair];
@@ -607,28 +614,6 @@ extern "C" __global__ void embed_grad_fused_f32(
         if (ids[pos] == r) sum += x_pre[pos * h + c];
     }
     flat[out_off + r * h + c] = sum + lm_t[r * h + c];
-}
-
-// acc[i] += g[i]. Accumulates per-window gradients across the batch.
-extern "C" __global__ void grad_accumulate_f32(
-    const float* __restrict__ g,
-    float* __restrict__ acc,
-    int n)
-{
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
-         i += gridDim.x * blockDim.x) {
-        acc[i] += g[i];
-    }
-}
-
-// g[i] *= s. Batch averaging (s = 1 / batch_size) and zeroing (s = 0).
-extern "C" __global__ void grad_scale_f32(
-    float* __restrict__ g, float s, int n)
-{
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
-         i += gridDim.x * blockDim.x) {
-        g[i] *= s;
-    }
 }
 
 // Global L2 norm, stage 1: per-block partial sums of squares over the
@@ -796,8 +781,6 @@ pub struct CudaContextHolder {
     pub quantise_weights_int8_fused_fn: CudaFunction,
     pub quantise_acts_int8_fused_fn: CudaFunction,
     pub embed_grad_fused_fn: CudaFunction,
-    pub grad_accumulate_fn: CudaFunction,
-    pub grad_scale_fn: CudaFunction,
     pub l2_partial_sums_fn: CudaFunction,
     pub l2_finalise_scale_fn: CudaFunction,
     pub adamw_update_regions_fn: CudaFunction,
@@ -928,8 +911,6 @@ pub fn cuda_state() -> Result<&'static CudaContextHolder, String> {
         let quantise_weights_int8_fused_fn = load("quantise_weights_int8_fused")?;
         let quantise_acts_int8_fused_fn = load("quantise_acts_int8_fused")?;
         let embed_grad_fused_fn = load("embed_grad_fused_f32")?;
-        let grad_accumulate_fn = load("grad_accumulate_f32")?;
-        let grad_scale_fn = load("grad_scale_f32")?;
         let l2_partial_sums_fn = load("l2_partial_sums_f32")?;
         let l2_finalise_scale_fn = load("l2_finalise_scale_f32")?;
         let adamw_update_regions_fn = load("adamw_update_regions_f32")?;
@@ -971,8 +952,6 @@ pub fn cuda_state() -> Result<&'static CudaContextHolder, String> {
             quantise_weights_int8_fused_fn,
             quantise_acts_int8_fused_fn,
             embed_grad_fused_fn,
-            grad_accumulate_fn,
-            grad_scale_fn,
             l2_partial_sums_fn,
             l2_finalise_scale_fn,
             adamw_update_regions_fn,
@@ -1329,7 +1308,7 @@ impl crate::device::Transpose2D for CudaTensor {
 }
 
 impl crate::device::CausalMask for CudaTensor {
-    fn causal_mask(&self) -> Self {
+    fn causal_mask(&self, window: usize) -> Self {
         assert_eq!(
             self.shape.len(),
             2,
@@ -1341,6 +1320,7 @@ impl crate::device::CausalMask for CudaTensor {
         let n = self.shape[1];
         let m_i = i32::try_from(m).expect("m exceeds i32");
         let n_i = i32::try_from(n).expect("n exceeds i32");
+        let window_i = i32::try_from(window).expect("window exceeds i32");
         let mut out = s
             .active_stream()
             .alloc_zeros::<f32>(m * n)
@@ -1357,8 +1337,9 @@ impl crate::device::CausalMask for CudaTensor {
         l.arg(&mut out);
         l.arg(&m_i);
         l.arg(&n_i);
-        // Safety: signature (const float*, float*, int, int) matches
-        // the four args; both buffers sized m*n.
+        l.arg(&window_i);
+        // Safety: signature (const float*, float*, int, int, int)
+        // matches the five args; both buffers sized m*n.
         unsafe { l.launch(cfg) }.expect("causal_mask_f32 launch failed");
         Self {
             data: out,
@@ -1448,13 +1429,14 @@ impl crate::device::SoftmaxBackward for CudaTensor {
 }
 
 impl crate::device::CausalMaskBackward for CudaTensor {
-    fn causal_mask_backward(&self) -> Self {
+    fn causal_mask_backward(&self, window: usize) -> Self {
         assert_eq!(self.shape.len(), 2, "causal_mask_backward: rank-2 only");
         let st = cuda_state().expect("cuda_state failed");
         let m = self.shape[0];
         let n = self.shape[1];
         let m_i = i32::try_from(m).expect("m exceeds i32");
         let n_i = i32::try_from(n).expect("n exceeds i32");
+        let window_i = i32::try_from(window).expect("window exceeds i32");
         let mut out = st
             .active_stream()
             .alloc_zeros::<f32>(m * n)
@@ -1472,8 +1454,9 @@ impl crate::device::CausalMaskBackward for CudaTensor {
         l.arg(&mut out);
         l.arg(&m_i);
         l.arg(&n_i);
+        l.arg(&window_i);
         // Safety: signature (const float* grad_y, float* out, int m,
-        // int n) matches the four args; both buffers sized m*n.
+        // int n, int window) matches the five args; buffers sized m*n.
         unsafe { l.launch(cfg) }.expect("causal_mask_backward_f32 launch failed");
         Self {
             data: out,
@@ -1663,7 +1646,7 @@ impl crate::device::Mul for CudaTensor {
 }
 
 impl crate::device::Rope for CudaTensor {
-    fn rope(&self) -> Self {
+    fn rope(&self, period: usize) -> Self {
         assert_eq!(
             self.shape.len(),
             2,
@@ -1671,6 +1654,7 @@ impl crate::device::Rope for CudaTensor {
             self.shape
         );
         let s = cuda_state().expect("cuda_state failed");
+        let period_i = i32::try_from(period).expect("period exceeds i32");
         let seq = self.shape[0];
         let head_dim = self.shape[1];
         assert!(
@@ -1700,8 +1684,9 @@ impl crate::device::Rope for CudaTensor {
         l.arg(&mut out);
         l.arg(&seq_i);
         l.arg(&hd_i);
-        // Safety: signature (const float*, float*, int, int) matches
-        // the four args; both buffers sized seq*head_dim.
+        l.arg(&period_i);
+        // Safety: signature (const float*, float*, int, int, int)
+        // matches the five args; both buffers sized seq*head_dim.
         unsafe { l.launch(cfg) }.expect("rope_f32 launch failed");
         Self {
             data: out,
@@ -1711,9 +1696,10 @@ impl crate::device::Rope for CudaTensor {
 }
 
 impl crate::device::RopeBackward for CudaTensor {
-    fn rope_backward(&self) -> Self {
+    fn rope_backward(&self, period: usize) -> Self {
         assert_eq!(self.shape.len(), 2, "rope_backward: rank-2 only");
         let s = cuda_state().expect("cuda_state failed");
+        let period_i = i32::try_from(period).expect("period exceeds i32");
         let seq = self.shape[0];
         let head_dim = self.shape[1];
         assert!(
@@ -1745,9 +1731,10 @@ impl crate::device::RopeBackward for CudaTensor {
         l.arg(&mut out);
         l.arg(&seq_i);
         l.arg(&hd_i);
+        l.arg(&period_i);
         // Safety: signature (const float* grad_y, float* out, int seq,
-        // int head_dim) matches the four args; both buffers sized
-        // seq*head_dim; output freshly allocated above.
+        // int head_dim, int period) matches the five args; both
+        // buffers sized seq*head_dim; output freshly allocated above.
         unsafe { l.launch(cfg) }.expect("rope_backward_f32 launch failed");
         Self {
             data: out,
@@ -2362,7 +2349,8 @@ impl CudaModel {
         let mut x = CudaTensor::from_cpu(&x_cpu).expect("forward: H->D embed failed");
         // Step 3: blocks, fully device-resident.
         for block in &self.blocks {
-            x = block_inference(&x, &block.heads, &block.ffn, self.config.head_dim);
+            let rows = x.shape[0];
+            x = block_inference(&x, &block.heads, &block.ffn, self.config.head_dim, rows);
         }
         // Steps 4 + 5. Tied LM head: matmul against the transposed
         // device-resident token_embed.
@@ -2442,8 +2430,9 @@ impl CudaModel {
         let mut block_saveds: Vec<BlockSaved<CudaTensor>> = Vec::with_capacity(n_blocks);
         block_inputs.push(x_post_embed);
         for (i, block) in self.blocks.iter().enumerate() {
+            let rows = block_inputs[i].shape[0];
             let (out, saved) =
-                block_forward_save(&block_inputs[i], &block.heads, &block.ffn, head_dim);
+                block_forward_save(&block_inputs[i], &block.heads, &block.ffn, head_dim, rows);
             block_saveds.push(saved);
             block_inputs.push(out);
         }
@@ -2485,6 +2474,7 @@ impl CudaModel {
                 &self.blocks[i].heads,
                 &self.blocks[i].ffn,
                 head_dim,
+                grad_x.shape[0],
             );
             // grad_x for the previous-block iteration is this block's
             // grad_x. Clone is one D->D memcpy per block (cheap at
@@ -2556,16 +2546,38 @@ impl CudaModel {
     /// Internally this is `alloc_step_buffers` + `step_core_into` +
     /// `assemble_grads`: the same device-only core a captured CUDA
     /// graph replays (issue #3), so the eager path doubles as the
-    /// correctness witness for the graph path.
+    /// correctness witness for the graph path. Since #22 the training
+    /// loop calls the batched sibling; this single-window form remains
+    /// the reference surface for the cross-backend bitwise tests.
+    #[allow(dead_code)]
     pub fn compute_grads_for_window_bitnet(
         &self,
         input_ids: &[usize],
         target_ids: &[usize],
     ) -> (Vec<Tensor>, f32) {
-        let seq = input_ids.len();
-        let mut bufs = self.alloc_step_buffers(seq);
+        self.compute_grads_batched_bitnet(input_ids, target_ids, input_ids.len())
+    }
+
+    /// Batched eager sibling (issue #22): `input_ids`/`target_ids` are
+    /// `len / window` concatenated windows; the step core runs them as
+    /// one slab with block-diagonal-causal attention. Returns
+    /// batch-AVERAGED gradients and the batch-mean loss (the CE row
+    /// scale is `1/rows`).
+    pub fn compute_grads_batched_bitnet(
+        &self,
+        input_ids: &[usize],
+        target_ids: &[usize],
+        window: usize,
+    ) -> (Vec<Tensor>, f32) {
+        assert!(
+            window <= self.config.max_seq_len && input_ids.len().is_multiple_of(window),
+            "compute_grads_batched_bitnet: {} ids do not form whole windows of {window}",
+            input_ids.len(),
+        );
+        let rows = input_ids.len();
+        let mut bufs = self.alloc_step_buffers(rows);
         let (x_embed, targets_dev) = self.upload_step_inputs(input_ids, target_ids, None);
-        self.step_core_into(&x_embed, &targets_dev, &mut bufs);
+        self.step_core_into(&x_embed, &targets_dev, &mut bufs, window);
         self.assemble_grads(&bufs, input_ids)
     }
 
@@ -2584,12 +2596,9 @@ impl CudaModel {
             target_ids.len(),
             "compute_grads_bitnet: input/target length mismatch"
         );
-        assert!(
-            input_ids.len() <= self.config.max_seq_len,
-            "compute_grads_bitnet: seq_len {} exceeds max_seq_len {}",
-            input_ids.len(),
-            self.config.max_seq_len,
-        );
+        // Issue #22: the ids may be a concatenation of several windows
+        // (batch*seq rows); per-window length policing happens in the
+        // callers, which know the window size.
         let seq = input_ids.len();
         let h = self.config.hidden_dim;
         let vocab = self.config.vocab_size;
@@ -2736,6 +2745,7 @@ impl CudaModel {
         x_embed: &CudaTensor,
         targets_dev: &CudaSlice<i32>,
         bufs: &mut StepBuffers,
+        window: usize,
     ) {
         use crate::device::{
             BitLinear, BlockSaved, RmsNorm, RmsNormBackward, Transpose2D, bit_linear_backward,
@@ -2750,8 +2760,13 @@ impl CudaModel {
         let mut block_saveds: Vec<BlockSaved<CudaTensor>> = Vec::with_capacity(n_blocks);
         block_inputs.push(x_embed.clone());
         for (i, block) in self.blocks.iter().enumerate() {
-            let (out, saved) =
-                block_forward_save_bitnet(&block_inputs[i], &block.heads, &block.ffn, head_dim);
+            let (out, saved) = block_forward_save_bitnet(
+                &block_inputs[i],
+                &block.heads,
+                &block.ffn,
+                head_dim,
+                window,
+            );
             block_saveds.push(saved);
             block_inputs.push(out);
         }
@@ -2786,6 +2801,7 @@ impl CudaModel {
                 &self.blocks[i].heads,
                 &self.blocks[i].ffn,
                 head_dim,
+                window,
             );
             grad_x = bg.grad_x.clone();
             block_grads_rev.push(bg);
@@ -2903,7 +2919,15 @@ impl CudaModel {
     /// those buffers strictly in place - so a replay always reads the
     /// current weights. The persistent input/output buffers live in
     /// the returned `CudaStepGraph`.
-    pub fn build_step_graph(&self, seq: usize) -> Result<CudaStepGraph, String> {
+    /// `batch` (issue #22): the graph is captured over a `[batch*seq,
+    /// hidden]` activation slab - block-diagonal-causal masking and
+    /// periodic RoPE keep windows independent - so ONE replay computes
+    /// the whole training step. Weight gradients arrive batch-summed
+    /// by the matmul backward, and the CE `1/(batch*seq)` scale makes
+    /// them batch-AVERAGED, exactly what the optimiser consumes.
+    pub fn build_step_graph(&self, seq: usize, batch: usize) -> Result<CudaStepGraph, String> {
+        assert!(batch >= 1, "build_step_graph: batch must be >= 1");
+        let rows = seq * batch;
         use cudarc::driver::sys::{CUgraphInstantiate_flags, CUstreamCaptureMode};
         let s = cuda_state()?;
         // Cross-stream edge: weight buffers are written on the default
@@ -2925,17 +2949,17 @@ impl CudaModel {
         let h = self.config.hidden_dim;
         let x_embed = CudaTensor {
             data: capture_stream
-                .alloc_zeros::<f32>(seq * h)
+                .alloc_zeros::<f32>(rows * h)
                 .map_err(|e| format!("alloc x_embed failed: {e:?}"))?,
-            shape: vec![seq, h],
+            shape: vec![rows, h],
         };
         let targets_dev = capture_stream
-            .alloc_zeros::<i32>(seq)
+            .alloc_zeros::<i32>(rows)
             .map_err(|e| format!("alloc targets failed: {e:?}"))?;
-        let mut bufs = self.alloc_step_buffers(seq);
+        let mut bufs = self.alloc_step_buffers(rows);
 
         // Warm-up (eager, on the capture stream).
-        self.step_core_into(&x_embed, &targets_dev, &mut bufs);
+        self.step_core_into(&x_embed, &targets_dev, &mut bufs, seq);
         capture_stream
             .synchronize()
             .map_err(|e| format!("warm-up sync failed: {e:?}"))?;
@@ -2944,7 +2968,7 @@ impl CudaModel {
         capture_stream
             .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
             .map_err(|e| format!("begin_capture failed: {e:?}"))?;
-        self.step_core_into(&x_embed, &targets_dev, &mut bufs);
+        self.step_core_into(&x_embed, &targets_dev, &mut bufs, seq);
         let graph = capture_stream
             .end_capture(CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
             .map_err(|e| format!("end_capture failed: {e:?}"))?
@@ -2961,6 +2985,7 @@ impl CudaModel {
             targets_dev,
             bufs,
             seq,
+            batch,
         })
     }
 
@@ -2977,9 +3002,10 @@ impl CudaModel {
     ) -> (Vec<Tensor>, f32) {
         assert_eq!(
             input_ids.len(),
-            g.seq,
-            "run_step_graph: seq {} does not match captured seq {}",
+            g.seq * g.batch,
+            "run_step_graph: {} ids do not fill the captured {}x{} slab",
             input_ids.len(),
+            g.batch,
             g.seq,
         );
         // Cross-stream edge: `sync_from_cpu` uploads the fresh weights
@@ -3002,40 +3028,53 @@ impl CudaModel {
         self.assemble_grads(&g.bufs, input_ids)
     }
 
-    /// Device-optimiser path (issue #16): compute one window's
-    /// gradients (eagerly - the graph variant is
-    /// `run_step_graph_accumulate`), finish the token-embed gradient
-    /// on-device with the fused scatter kernel, and add the whole
-    /// parameter-gradient region into the optimiser's batch
-    /// accumulator. Returns the window's mean loss (one small D->H
+    /// Device-optimiser path (issues #16 + #22): compute the gradients
+    /// for a whole batch eagerly - `input_ids`/`target_ids` are the
+    /// concatenation of `len / window` windows - finish the token-embed
+    /// gradient on-device with the fused scatter kernel, and leave the
+    /// batch-AVERAGED parameter gradients in the flat buffer for
+    /// `CudaAdamW::step`. Returns the batch mean loss (one small D->H
     /// read of the per-row losses - the only host transfer).
-    pub fn accumulate_window_grads(
+    pub fn device_step_grads(
         &self,
         bufs: &mut StepBuffers,
-        opt: &mut CudaAdamW,
         input_ids: &[usize],
         target_ids: &[usize],
+        window: usize,
     ) -> f32 {
+        assert!(
+            window <= self.config.max_seq_len && input_ids.len().is_multiple_of(window),
+            "device_step_grads: {} ids do not form whole windows of {window}",
+            input_ids.len(),
+        );
+        // The loss slot's extent IS the buffer's row count; a mismatch
+        // would silently overrun into the next flat slot.
+        assert_eq!(
+            bufs.layout.lm_head_w_t - bufs.layout.loss,
+            input_ids.len(),
+            "device_step_grads: step buffers sized for a different row count"
+        );
         let (x_embed, targets_dev) = self.upload_step_inputs(input_ids, target_ids, None);
-        self.step_core_into(&x_embed, &targets_dev, bufs);
+        self.step_core_into(&x_embed, &targets_dev, bufs, window);
         let ids_dev = Self::ids_to_device(input_ids);
-        self.finish_and_accumulate(bufs, opt, &ids_dev)
+        self.finish_step(bufs, &ids_dev)
     }
 
-    /// Graph variant of `accumulate_window_grads`: replay the captured
-    /// step, then the same fused embed gradient + accumulate tail.
-    pub fn run_step_graph_accumulate(
+    /// Graph variant of `device_step_grads` (issue #22): ONE replay of
+    /// the captured batched step, then the fused embed gradient and
+    /// the loss read.
+    pub fn run_step_graph_grads(
         &self,
         g: &mut CudaStepGraph,
-        opt: &mut CudaAdamW,
         input_ids: &[usize],
         target_ids: &[usize],
     ) -> f32 {
         assert_eq!(
             input_ids.len(),
-            g.seq,
-            "run_step_graph_accumulate: seq {} does not match captured seq {}",
+            g.seq * g.batch,
+            "run_step_graph_grads: {} ids do not fill the captured {}x{} slab",
             input_ids.len(),
+            g.batch,
             g.seq,
         );
         cuda_state()
@@ -3051,18 +3090,14 @@ impl CudaModel {
         );
         g.graph.launch().expect("graph launch failed");
         let ids_dev = Self::ids_to_device(input_ids);
-        self.finish_and_accumulate(&mut g.bufs, opt, &ids_dev)
+        self.finish_step(&mut g.bufs, &ids_dev)
     }
 
-    /// Shared tail of both device-optimiser window paths: fused embed
-    /// gradient into the flat buffer's embed slot, accumulate the
-    /// parameter region, read the window loss.
-    fn finish_and_accumulate(
-        &self,
-        bufs: &mut StepBuffers,
-        opt: &mut CudaAdamW,
-        ids_dev: &CudaSlice<i32>,
-    ) -> f32 {
+    /// Shared tail of both device-optimiser step paths: fused embed
+    /// gradient into the flat buffer's embed slot (position-order scan
+    /// over the whole ids slab - window-major, matching the CPU
+    /// accumulation order), then the batch-mean loss read.
+    fn finish_step(&self, bufs: &mut StepBuffers, ids_dev: &CudaSlice<i32>) -> f32 {
         let s = cuda_state().expect("cuda_state failed");
         let h = self.config.hidden_dim;
         let vocab = self.config.vocab_size;
@@ -3100,9 +3135,8 @@ impl CudaModel {
             // sized as claimed by the layout.
             unsafe { l.launch(cfg) }.expect("embed_grad_fused launch");
         }
-        opt.accumulate(bufs);
 
-        // Window loss: the per-row slice is the only host read.
+        // Batch loss: the per-row slice is the only host read.
         count_dtoh_read();
         let losses = s
             .active_stream()
@@ -3238,8 +3272,6 @@ pub struct CudaAdamW {
     /// First/second moments, flat, aligned to the gradient region.
     m: CudaSlice<f32>,
     v: CudaSlice<f32>,
-    /// Batch gradient accumulator, same layout.
-    grad_sum: CudaSlice<f32>,
     /// Region table: 4 x u64 per parameter tensor
     /// (master_ptr, grad_offset, mv_offset, len).
     desc: CudaSlice<u64>,
@@ -3304,9 +3336,6 @@ impl CudaAdamW {
             step_count: 0,
             m: stream.alloc_zeros::<f32>(param_len).expect("alloc m"),
             v: stream.alloc_zeros::<f32>(param_len).expect("alloc v"),
-            grad_sum: stream
-                .alloc_zeros::<f32>(param_len)
-                .expect("alloc grad_sum"),
             desc: stream.clone_htod(&desc_host).expect("H->D region table"),
             n_regions,
             param_len,
@@ -3317,73 +3346,29 @@ impl CudaAdamW {
         }
     }
 
-    /// Zero the batch gradient accumulator. Call once per training
-    /// step before accumulating windows.
-    pub fn begin_batch(&mut self) {
-        let s = cuda_state().expect("cuda_state failed");
-        s.active_stream()
-            .memset_zeros(&mut self.grad_sum)
-            .expect("zero grad_sum");
-    }
-
-    /// Add one window's parameter gradients (the `[embed..total)`
-    /// region of the flat step buffer) into the batch accumulator.
-    fn accumulate(&mut self, bufs: &StepBuffers) {
+    /// One optimiser step over the gradients sitting in the flat step
+    /// buffer's `[embed_grad..total)` region (issue #22: the batched
+    /// step core lands them there already batch-AVERAGED - the CE
+    /// backward's `1/(batch*seq)` row scale times the matmul backward's
+    /// batch summation). Computes the global L2 norm and clip scale on
+    /// the device, then runs the region-descriptor update kernel.
+    /// Returns the pre-clip norm (the loop's `|g|` column) - the only
+    /// value that crosses back to the host.
+    pub fn step(&mut self, bufs: &StepBuffers, lr: f32, max_norm: f32) -> f32 {
         assert_eq!(
             bufs.layout.total - bufs.layout.embed_grad,
             self.param_len,
             "step buffers do not match this optimiser's model"
         );
         let s = cuda_state().expect("cuda_state failed");
-        let g = bufs.flat.slice(bufs.layout.embed_grad..bufs.layout.total);
-        let n_i = i32::try_from(self.param_len).expect("param_len exceeds i32");
-        let cfg = LaunchConfig {
-            grid_dim: ((n_i as u32).div_ceil(256).min(1024), 1, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let stream = s.active_stream();
-        let mut l = stream.launch_builder(&s.grad_accumulate_fn);
-        l.arg(&g);
-        l.arg(&mut self.grad_sum);
-        l.arg(&n_i);
-        // Safety: signature (const float* g, float* acc, int n); both
-        // buffers hold param_len elements.
-        unsafe { l.launch(cfg) }.expect("grad_accumulate launch");
-    }
-
-    /// One optimiser step over the accumulated batch: average by
-    /// `batch_n`, compute the global L2 norm and clip scale on the
-    /// device, then run the region-descriptor update kernel. Returns
-    /// the pre-clip norm (the loop's `|g|` column) - the only value
-    /// that crosses back to the host.
-    pub fn step(&mut self, batch_n: usize, lr: f32, max_norm: f32) -> f32 {
-        let s = cuda_state().expect("cuda_state failed");
         let stream = s.active_stream();
         let n_i = i32::try_from(self.param_len).expect("param_len exceeds i32");
+        let grads = bufs.flat.slice(bufs.layout.embed_grad..bufs.layout.total);
         self.lr = lr;
         self.step_count += 1;
         let t = self.step_count as i32;
         let bc1 = 1.0 - self.beta1.powi(t);
         let bc2 = 1.0 - self.beta2.powi(t);
-
-        // Average across the batch (skip the no-op multiply for n=1 so
-        // the single-window path stays bit-identical to the CPU one,
-        // which never scales).
-        if batch_n > 1 {
-            let inv = 1.0f32 / batch_n as f32;
-            let cfg = LaunchConfig {
-                grid_dim: ((n_i as u32).div_ceil(256).min(1024), 1, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            let mut l = stream.launch_builder(&s.grad_scale_fn);
-            l.arg(&mut self.grad_sum);
-            l.arg(&inv);
-            l.arg(&n_i);
-            // Safety: signature (float* g, float s, int n).
-            unsafe { l.launch(cfg) }.expect("grad_scale launch");
-        }
 
         // Global L2 norm -> {norm, clip scale} on the device.
         let l2_blocks_i = i32::try_from(L2_BLOCKS).expect("L2_BLOCKS");
@@ -3393,7 +3378,7 @@ impl CudaAdamW {
             shared_mem_bytes: 0,
         };
         let mut l = stream.launch_builder(&s.l2_partial_sums_fn);
-        l.arg(&self.grad_sum);
+        l.arg(&grads);
         l.arg(&mut self.partials);
         l.arg(&n_i);
         // Safety: signature (const float* g, float* partials, int n);
@@ -3421,7 +3406,7 @@ impl CudaAdamW {
         };
         let mut l = stream.launch_builder(&s.adamw_update_regions_fn);
         l.arg(&self.desc);
-        l.arg(&self.grad_sum);
+        l.arg(&grads);
         l.arg(&mut self.m);
         l.arg(&mut self.v);
         l.arg(&self.norm_scale);
@@ -3489,13 +3474,13 @@ impl CudaAdamW {
         }
     }
 
-    /// Test hook: the accumulated flat gradient, on the host.
+    /// Test hook: the flat parameter-gradient region, on the host.
     #[cfg(test)]
-    fn grad_sum_host(&self) -> Vec<f32> {
+    fn flat_grads_host(bufs: &StepBuffers) -> Vec<f32> {
         let s = cuda_state().expect("cuda_state failed");
         s.active_stream()
-            .clone_dtoh(&self.grad_sum)
-            .expect("D->H grad_sum")
+            .clone_dtoh(&bufs.flat.slice(bufs.layout.embed_grad..bufs.layout.total))
+            .expect("D->H flat grads")
     }
 
     /// Restore moments from a checkpoint's `OptimState` (resume).
@@ -3570,6 +3555,16 @@ pub struct CudaStepGraph {
     targets_dev: CudaSlice<i32>,
     bufs: StepBuffers,
     seq: usize,
+    /// Windows per replay (issue #22); the slab holds `batch * seq` rows.
+    batch: usize,
+}
+
+impl CudaStepGraph {
+    /// The persistent step buffers a replay writes into - the
+    /// optimiser consumes their flat gradient region (issue #22).
+    pub fn step_bufs(&self) -> &StepBuffers {
+        &self.bufs
+    }
 }
 
 /// Convenience: copy two CPU tensors to device, multiply, copy back.
@@ -3841,10 +3836,10 @@ mod tests {
         // Square seq x seq is the only shape causal_mask is meaningful
         // on; primes (17) push every edge through the bounds checks.
         let a = random_tensor(17, 17, 0.4);
-        let cpu = <Tensor as CausalMask>::causal_mask(&a);
+        let cpu = <Tensor as CausalMask>::causal_mask(&a, 17);
         let gpu = CudaTensor::from_cpu(&a)
             .unwrap()
-            .causal_mask()
+            .causal_mask(17)
             .to_cpu()
             .unwrap();
         // -inf cells must match exactly. Comparing -inf with assert_close's
@@ -3895,8 +3890,8 @@ mod tests {
         }
         // head_dim must be even. Use realistic v0.13 attention shape.
         let a = random_tensor(64, 16, 0.6);
-        let cpu = <Tensor as Rope>::rope(&a);
-        let gpu = CudaTensor::from_cpu(&a).unwrap().rope().to_cpu().unwrap();
+        let cpu = <Tensor as Rope>::rope(&a, 64);
+        let gpu = CudaTensor::from_cpu(&a).unwrap().rope(64).to_cpu().unwrap();
         // RoPE uses transcendentals (cos/sin/pow); GPU + CPU may use
         // slightly different math implementations. Slightly looser
         // tolerance than the elementwise-arithmetic ops.
@@ -3999,7 +3994,8 @@ mod tests {
                 w_up: b.ffn_up_w.clone(),
                 w_down: b.ffn_down_w.clone(),
             };
-            x = block_inference(&x, &heads, &ffn, model.config.head_dim);
+            let rows = x.shape[0];
+            x = block_inference(&x, &heads, &ffn, model.config.head_dim, rows);
         }
         x.rmsnorm().matmul(&model.token_embed.transpose_2d())
     }
@@ -4103,7 +4099,7 @@ mod tests {
         let (eager_grads, eager_loss) = cuda_model.compute_grads_for_window_bitnet(&win_a, &tgt_a);
 
         let mut graph = cuda_model
-            .build_step_graph(win_a.len())
+            .build_step_graph(win_a.len(), 1)
             .expect("graph capture failed");
         let (graph_grads, graph_loss) = cuda_model.run_step_graph(&mut graph, &win_a, &tgt_a);
         assert_eq!(eager_loss, graph_loss, "loss diverged on first replay");
@@ -4126,6 +4122,79 @@ mod tests {
         assert_eq!(loss_b, graph_loss_b, "loss diverged after weight sync");
         for (i, (e, g)) in eager_b.iter().zip(&graph_b).enumerate() {
             assert_eq!(e.data, g.data, "grad {i} diverged after weight sync");
+        }
+    }
+
+    /// Issue #22 headline: the batched step (one [B*seq, hidden] slab,
+    /// block-diagonal-causal attention, periodic RoPE, 1/(B*seq) CE
+    /// scale) must equal the average of the per-window steps. Not
+    /// bitwise vs the per-window path - the division sits on the other
+    /// side of the summation - so tight FP tolerance; the graph-replay
+    /// variant of the SAME batched math is then pinned bitwise.
+    #[test]
+    fn batched_step_matches_per_window_average() {
+        if cuda_state().is_err() {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        }
+        use crate::model::{Model, ModelConfig};
+        let config = ModelConfig {
+            vocab_size: 12,
+            hidden_dim: 32,
+            n_heads: 4,
+            head_dim: 8,
+            ffn_dim: 64,
+            max_seq_len: 8,
+            n_blocks: 2,
+        };
+        let model = Model::new(&config, 21);
+        let cuda_model = CudaModel::from_cpu(&model);
+        let windows: [(Vec<usize>, Vec<usize>); 2] = [
+            (vec![0, 3, 7, 11, 5, 1, 9, 2], vec![3, 7, 11, 5, 1, 9, 2, 0]),
+            (vec![5, 5, 2, 8, 1, 0, 4, 6], vec![5, 2, 8, 1, 0, 4, 6, 3]),
+        ];
+
+        // Reference: per-window grads, averaged on the host.
+        let (mut want, l0) =
+            cuda_model.compute_grads_for_window_bitnet(&windows[0].0, &windows[0].1);
+        let (g1, l1) = cuda_model.compute_grads_for_window_bitnet(&windows[1].0, &windows[1].1);
+        for (a, b) in want.iter_mut().zip(&g1) {
+            for (av, bv) in a.data.iter_mut().zip(&b.data) {
+                *av = (*av + bv) / 2.0;
+            }
+        }
+        let want_loss = (l0 + l1) / 2.0;
+
+        // Batched eager: one slab.
+        let ids: Vec<usize> = windows.iter().flat_map(|w| w.0.clone()).collect();
+        let targets: Vec<usize> = windows.iter().flat_map(|w| w.1.clone()).collect();
+        let (got, got_loss) = cuda_model.compute_grads_batched_bitnet(&ids, &targets, 8);
+
+        let rel = |a: f32, b: f32| (a - b).abs() / b.abs().max(1e-4);
+        assert!(
+            rel(got_loss, want_loss) < 1e-5,
+            "batched loss {got_loss} vs averaged {want_loss}"
+        );
+        assert_eq!(got.len(), want.len());
+        for (ti, (g, w)) in got.iter().zip(&want).enumerate() {
+            for (j, (a, b)) in g.data.iter().zip(&w.data).enumerate() {
+                assert!(
+                    rel(*a, *b) < 1e-3,
+                    "grad tensor {ti} cell {j}: batched {a} vs averaged {b}"
+                );
+            }
+        }
+
+        // Graph replay of the batched step: bitwise vs batched eager.
+        let mut graph = cuda_model.build_step_graph(8, 2).expect("capture failed");
+        let (graph_grads, graph_loss) = cuda_model.run_step_graph(&mut graph, &ids, &targets);
+        assert_eq!(
+            graph_loss.to_bits(),
+            got_loss.to_bits(),
+            "graph loss diverged"
+        );
+        for (ti, (g, e)) in graph_grads.iter().zip(&got).enumerate() {
+            assert_eq!(g.data, e.data, "graph grad tensor {ti} diverged from eager");
         }
     }
 
@@ -4167,13 +4236,12 @@ mod tests {
             let (grads, _) = cuda_model.compute_grads_for_window_bitnet(&win, &tgt);
             cpu_opt.step_with_grads(&mut cpu_model, &grads);
 
-            // Device step over the same window.
+            // Device step over the same window (batch of 1).
             let mut bufs = cuda_model.alloc_step_buffers(win.len());
-            dev_opt.begin_batch();
-            cuda_model.accumulate_window_grads(&mut bufs, &mut dev_opt, &win, &tgt);
-            // Grad parity first: the accumulated flat gradient must be
+            cuda_model.device_step_grads(&mut bufs, &win, &tgt, win.len());
+            // Grad parity first: the flat gradient region must be
             // bitwise the CPU-visitor-order concatenation.
-            let dev_grads = dev_opt.grad_sum_host();
+            let dev_grads = CudaAdamW::flat_grads_host(&bufs);
             let mut off = 0usize;
             for (gi, g) in grads.iter().enumerate() {
                 assert_eq!(
@@ -4183,7 +4251,7 @@ mod tests {
                 );
                 off += g.data.len();
             }
-            let _norm = dev_opt.step(1, 3e-3, f32::INFINITY);
+            let _norm = dev_opt.step(&bufs, 3e-3, f32::INFINITY);
 
             // Masters bitwise.
             let mut synced = Model::new(&config, 0);
@@ -4267,7 +4335,7 @@ mod tests {
             (vec![0, 3, 7, 11, 5, 1, 9, 2], vec![3, 7, 11, 5, 1, 9, 2, 0]),
             (vec![5, 5, 2, 8, 1, 0, 4, 6], vec![5, 2, 8, 1, 0, 4, 6, 3]),
         ];
-        let mut bufs = dev_side.alloc_step_buffers(8);
+        let mut bufs = dev_side.alloc_step_buffers(16); // 2 windows x seq 8
         let mut cpu_losses: Vec<f32> = Vec::new();
         let mut dev_losses: Vec<f32> = Vec::new();
         for step in 0..8 {
@@ -4298,15 +4366,15 @@ mod tests {
             cpu_side.sync_from_cpu(&cpu_model);
             let cpu_loss = cpu_loss / 2.0;
 
-            // Device path: same windows, everything on the GPU.
-            dev_opt.begin_batch();
-            let mut dev_loss = 0.0f32;
+            // Device path: same windows, ONE batched slab (issue #22).
+            let mut ids: Vec<usize> = Vec::new();
+            let mut targets: Vec<usize> = Vec::new();
             for (input, target) in &windows {
-                dev_loss +=
-                    dev_side.accumulate_window_grads(&mut bufs, &mut dev_opt, input, target);
+                ids.extend_from_slice(input);
+                targets.extend_from_slice(target);
             }
-            let dev_norm = dev_opt.step(2, 3e-3, 1.0);
-            let dev_loss = dev_loss / 2.0;
+            let dev_loss = dev_side.device_step_grads(&mut bufs, &ids, &targets, 8);
+            let dev_norm = dev_opt.step(&bufs, 3e-3, 1.0);
 
             assert!(
                 dev_loss.is_finite(),
@@ -4374,9 +4442,8 @@ mod tests {
         let tgt: Vec<usize> = vec![3, 7, 11, 5, 1, 9, 2, 0];
         let mut bufs = cuda_model.alloc_step_buffers(8);
         for _ in 0..3 {
-            opt.begin_batch();
-            let _ = cuda_model.accumulate_window_grads(&mut bufs, &mut opt, &win, &tgt);
-            let _ = opt.step(1, 3e-3, 1.0);
+            let _ = cuda_model.device_step_grads(&mut bufs, &win, &tgt, win.len());
+            let _ = opt.step(&bufs, 3e-3, 1.0);
         }
         let snap = opt.snapshot(&cuda_model);
         assert_eq!(snap.step_count, 3);
@@ -4457,7 +4524,7 @@ mod tests {
             "eager step must read back one flat buffer, saw {eager_reads} D->H reads"
         );
 
-        let mut graph = cuda_model.build_step_graph(8).expect("capture failed");
+        let mut graph = cuda_model.build_step_graph(8, 1).expect("capture failed");
         let before = DTOH_READS.with(std::cell::Cell::get);
         let _ = cuda_model.run_step_graph(&mut graph, &win, &tgt);
         let graph_reads = DTOH_READS.with(std::cell::Cell::get) - before;
@@ -4492,7 +4559,7 @@ mod tests {
         let mut model = Model::new(&config, 21);
         let mut cuda_model = CudaModel::from_cpu(&model);
         let mut graph = cuda_model
-            .build_step_graph(8)
+            .build_step_graph(8, 1)
             .expect("graph capture failed");
         let windows: [(Vec<usize>, Vec<usize>); 2] = [
             (vec![0, 3, 7, 11, 5, 1, 9, 2], vec![3, 7, 11, 5, 1, 9, 2, 0]),
@@ -4558,7 +4625,7 @@ mod tests {
         // Warm both paths before timing.
         let _ = cuda_model.compute_grads_for_window_bitnet(&input, &target);
         let mut graph = cuda_model
-            .build_step_graph(64)
+            .build_step_graph(64, 1)
             .expect("graph capture failed");
         let _ = cuda_model.run_step_graph(&mut graph, &input, &target);
 
@@ -4691,7 +4758,8 @@ mod tests {
             w_up: random_tensor(hidden, ffn, 3.6),
             w_down: random_tensor(ffn, hidden, 3.7),
         };
-        let cpu_out = block_inference::<Tensor>(&x_cpu, &cpu_heads, &cpu_ffn, head_dim);
+        let seq = x_cpu.shape[0];
+        let cpu_out = block_inference::<Tensor>(&x_cpu, &cpu_heads, &cpu_ffn, head_dim, seq);
 
         // Same source, on the GPU. Take ownership of CPU tensors when
         // copying since the helper signature is `block_inference<T>(&T,
@@ -4711,7 +4779,7 @@ mod tests {
             w_up: CudaTensor::from_cpu(&cpu_ffn.w_up).unwrap(),
             w_down: CudaTensor::from_cpu(&cpu_ffn.w_down).unwrap(),
         };
-        let gpu_out = block_inference::<CudaTensor>(&x_gpu, &gpu_heads, &gpu_ffn, head_dim)
+        let gpu_out = block_inference::<CudaTensor>(&x_gpu, &gpu_heads, &gpu_ffn, head_dim, seq)
             .to_cpu()
             .unwrap();
 
@@ -4792,7 +4860,8 @@ mod tests {
         let w_v = random_tensor(hidden, head_dim, 1.3);
         let w_o = random_tensor(head_dim, hidden, 1.4);
 
-        let cpu_out = attention_head_inference::<Tensor>(&x, &w_q, &w_k, &w_v, &w_o, head_dim);
+        let seq = x.shape[0];
+        let cpu_out = attention_head_inference::<Tensor>(&x, &w_q, &w_k, &w_v, &w_o, head_dim, seq);
 
         let x_g = CudaTensor::from_cpu(&x).unwrap();
         let q_g = CudaTensor::from_cpu(&w_q).unwrap();
@@ -4800,7 +4869,7 @@ mod tests {
         let v_g = CudaTensor::from_cpu(&w_v).unwrap();
         let o_g = CudaTensor::from_cpu(&w_o).unwrap();
         let gpu_out =
-            attention_head_inference::<CudaTensor>(&x_g, &q_g, &k_g, &v_g, &o_g, head_dim)
+            attention_head_inference::<CudaTensor>(&x_g, &q_g, &k_g, &v_g, &o_g, head_dim, seq)
                 .to_cpu()
                 .unwrap();
 
