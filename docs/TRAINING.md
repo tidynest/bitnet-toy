@@ -139,6 +139,13 @@ worth knowing:
 - `--cuda` runs forward+backward on the GPU (build with
   `--features cuda`); it forces `n_workers = 1` since the GPU is the
   parallelism layer.
+- `--checkpoint-every N` (issue #19) writes a crash-recovery
+  checkpoint to `models/<out>.f32.bin` every N steps (default 500,
+  `0` = only at run end). Writes are atomic (temp file + rename), so
+  a crash mid-write never corrupts the previous checkpoint, and every
+  checkpoint feeds straight into `--resume`. In device-optimiser mode
+  the masters and AdamW moments are pulled from the GPU for the
+  write, amortised at checkpoint frequency.
 - The post-training generation tail only uses the stock prompts the
   corpus vocab can encode, and says so when none fit.
 
