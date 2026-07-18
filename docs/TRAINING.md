@@ -176,6 +176,7 @@ numbers are included for calibration.
 | CPU (300% quota)        | 366-444 | 1138-1201 |
 | GPU, graph replay       | 145-178 | 492 |
 | GPU, graph + flat readback (#15) | 139 | 394 |
+| GPU + device AdamW (#16)         | 116 | **276** |
 | GPU, eager launches     | 164     | 499 |
 | CPU uncapped (v0.13-era historical) | ~180 | ~800 (est. 4-5x v0.13) |
 | GPU pre-#1/#2/#3 (historical)       | ~300 | - |
@@ -195,9 +196,21 @@ Conclusions:
   D->H reads per window into ONE copy: within noise at the v0.13
   scale (small tensors, cheap syncs) but **-20% ms/step at the large
   scale**, where per-read stalls grew with tensor count and size.
-- Remaining levers, in expected-impact order: moving AdamW onto the
-  device (#16 - would also eliminate the full-model weight upload
-  each step), then larger batches per graph replay.
+- Device-side AdamW (#16) moved the optimiser onto the GPU: gradients
+  never reach the host, the update kernel rewrites the master weights
+  in place, and the per-step weight upload disappears - another -30%
+  at the large scale (394 -> 276 ms/step; x4.2 vs the capped CPU).
+  Per step, only each window's mean loss and the gradient norm cross
+  back to the host; the CPU copy of the model refreshes at
+  log/eval/checkpoint boundaries. `BITNET_CUDA_ADAMW=0` reverts to
+  the CPU optimiser.
+- Numerics: without clipping the device update is bit-identical to
+  the CPU AdamW (the kernel forbids FMA contraction and reproduces
+  Rust's evaluation order). Once the clip fires, the device norm
+  reduction reorders a sum and BitNet's ternary rounding amplifies
+  the last-ULP difference, so GPU and CPU runs at the same seed stay
+  statistically equivalent but no longer print identical loss lines.
+- Remaining lever: larger batches per graph replay.
 
 ## Watching the run
 
