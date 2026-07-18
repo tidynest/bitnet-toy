@@ -455,10 +455,13 @@ of how much each matters (tracked as
    batches and a flat-gradient readback - milestone **Phase 5.c - GPU perf**
    (issue #4 benchmarks the crossover).
 
-2. **f32 master weights.** Real BitNet keeps BF16 masters; the GEMM is now int8
-   on tensor cores, but the master weights and the AdamW optimiser state remain
-   f32. Lowering the masters to BF16 is a possible future step, not yet
-   scheduled.
+2. **BF16 master weights (issue #23).** Matching the paper's recipe, master
+   weights are STORED at bf16 precision: every optimiser write narrows the
+   updated master onto the bf16 grid (RNE, identical bit-for-bit on the CPU
+   and CUDA paths), checkpoints carry u16 halves (2 bytes per weight), and
+   all arithmetic stays f32 (load-widen, compute, store-narrow). The AdamW
+   moments remain full f32. `BITNET_BF16_MASTERS=0` reverts to f32 masters
+   for A/B runs; pre-#23 f32 checkpoints still load (widening is a no-op).
 
 3. **AVX-512 underperforms AVX2 on Zen 4.** The 16-wide AVX-512 loads cause more
    L2/L3 contention across 4 worker threads than the 8-wide AVX2 loads on this

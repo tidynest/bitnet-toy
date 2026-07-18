@@ -229,7 +229,9 @@ cargo audit                 # security audit; trivially clean (no deps)
 This is a learning project, not a production library:
 
 - Pure Rust, no third-party ML dependencies (only `std`).
-- f32 throughout; no BF16 or FP16.
+- f32 arithmetic everywhere; master weights are stored at BF16
+  precision (#23, the b1.58 paper recipe - narrow-on-optimiser-write,
+  u16 checkpoint halves, moments stay f32).
 - SIMD inside `Tensor::matmul` on x86_64, runtime-detected, widest path
   that actually wins: AVX-512 foundation (16 f32 per inner-loop step) on
   Sapphire Rapids and later, falling back to AVX2 (8 f32) and then to a
