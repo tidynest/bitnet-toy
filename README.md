@@ -283,10 +283,15 @@ Milestones, in priority order:
    device-side AdamW (#16) and batched graph replay (#22) collapse a
    training step to ONE graph launch plus the loss/norm reads
    (492 -> 176 ms/step at the large scale).
-3. **CPU SIMD & threading** - done: the persistent matmul thread pool (#7),
+3. **Phase 6 - model fidelity & scale** - BF16 masters landed (#23); a
+   hand-rolled byte-level BPE tokeniser landed (#24: `bpe <corpus>
+   --vocab-size N`, checkpoint-embedded merges, bits/char metric for
+   cross-tokeniser comparisons). Open question: BPE vs char at a real
+   step budget (first 2k-step A/B: char 3.11 bits/char, BPE-1024 3.90).
+4. **CPU SIMD & threading** - done: the persistent matmul thread pool (#7),
    Zen 4 AVX2 auto-select (v0.19), and the ARM64 NEON path (#6, bit-identity
    validated under qemu-aarch64; native perf numbers await real ARM hardware).
-4. **CLI ergonomics** - done (#8): `train <corpus>` with overridable
+5. **CLI ergonomics** - done (#8): `train <corpus>` with overridable
    hyperparameters, `--help`, and `sample --corpus` for custom checkpoints.
 
 ## Further reading
