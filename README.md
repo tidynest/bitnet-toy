@@ -280,9 +280,9 @@ Milestones, in priority order:
    and device-side AdamW (#16) leave only each window's loss and the grad
    norm crossing to the host per step (492 -> 276 ms/step at the large
    scale). Possible follow-up: larger batches per graph replay.
-3. **CPU SIMD & threading** - the persistent matmul thread pool landed (#7)
-   and Zen 4 AVX2 auto-select in v0.19; remaining: an ARM64 NEON path (#6,
-   needs ARM hardware to validate).
+3. **CPU SIMD & threading** - done: the persistent matmul thread pool (#7),
+   Zen 4 AVX2 auto-select (v0.19), and the ARM64 NEON path (#6, bit-identity
+   validated under qemu-aarch64; native perf numbers await real ARM hardware).
 4. **CLI ergonomics** - done (#8): `train <corpus>` with overridable
    hyperparameters, `--help`, and `sample --corpus` for custom checkpoints.
 
