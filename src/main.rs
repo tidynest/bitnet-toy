@@ -569,51 +569,30 @@ fn compute_batched_grads(
     (avg_grads, total_loss / n)
 }
 
-/// Phase 5.a: CUDA-backed batched gradient computation. Mirrors
-/// `compute_batched_grads`'s signature (averaged grads + mean loss
-/// over `batch_size` windows) but each per-window forward+backward
-/// runs through `CudaModel::compute_grads_for_window_bitnet` instead
-/// of the CPU `Var`-based autograd path.
-///
-/// Implementation notes:
-/// - Takes the device-resident `CudaModel` from the caller. The
-///   training loop builds it once and refreshes it in place with
-///   `CudaModel::sync_from_cpu` after each AdamW update (issue #1),
-///   so the per-step cost is pure H->D copies with zero new device
-///   allocations.
-/// - Each window replays a captured CUDA graph (issue #3): the whole
-///   forward+backward launch sequence collapses into one driver call.
-///   The graph is captured lazily on the first step and reused for
-///   the rest of the run; `BITNET_CUDA_GRAPH=0` forces the eager
-///   per-kernel path (A/B timing, driver-bug escape hatch), and a
-///   failed capture falls back to eager with a warning rather than
-///   aborting the run.
-/// - Runs windows serially - the GPU is the parallelism layer here.
-///   Spawning multiple CPU threads to dispatch CUDA kernels would just
-///   serialise on the default stream anyway.
-/// - The same window-index sampler (`Lcg::gen_range`) is used as the
-///   CPU path, so swapping `use_cuda_backward` between two runs
-///   preserves training-data ordering for an apples-to-apples
-///   comparison at the same seed.
+/// Issue #16 escape hatch: `BITNET_CUDA_ADAMW=0` keeps the optimiser
+/// on the CPU (per-step gradient download + weight upload) while the
+/// forward/backward still runs on the GPU. Read once.
 #[cfg(feature = "cuda")]
-fn compute_batched_grads_cuda_bitnet(
+fn cuda_adamw_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("BITNET_CUDA_ADAMW").map_or(true, |v| v.trim() != "0"))
+}
+
+/// Lazy one-time CUDA-graph capture (issue #3), shared by both GPU
+/// step paths. All training windows share one seq_len (make_windows
+/// produces fixed-size windows), so one graph serves the whole run. A
+/// sticky `false` after a failed capture keeps the run on the eager
+/// path without retrying every step.
+#[cfg(feature = "cuda")]
+fn ensure_cuda_step_graph(
     cuda_model: &crate::cuda::CudaModel,
     step_graph: &mut Option<crate::cuda::CudaStepGraph>,
-    windows: &[(Vec<usize>, Vec<usize>)],
-    rng: &mut crate::data::Lcg,
-    batch_size: usize,
-) -> (Vec<crate::tensor::Tensor>, f32) {
-    assert!(batch_size >= 1, "batch_size must be >= 1");
-
-    // Lazy one-time capture. All training windows share one seq_len
-    // (make_windows produces fixed-size windows), so one graph serves
-    // the whole run. A `false` here after a failed capture keeps the
-    // run on the eager path without retrying every step.
+    seq: usize,
+) {
     static GRAPH_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
     let graph_wanted = std::env::var("BITNET_CUDA_GRAPH").map_or(true, |v| v.trim() != "0")
         && GRAPH_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
     if step_graph.is_none() && graph_wanted {
-        let seq = windows[0].0.len();
         match cuda_model.build_step_graph(seq) {
             Ok(g) => {
                 println!("captured CUDA step graph (seq_len {seq}); replaying it per window");
@@ -625,6 +604,78 @@ fn compute_batched_grads_cuda_bitnet(
             }
         }
     }
+}
+
+/// Issue #16: one fully device-resident training step. Gradients are
+/// computed (graph replay when available), the token-embed gradient is
+/// fused on-device, the batch is accumulated and averaged on-device,
+/// and the AdamW kernel updates the master weights in place - nothing
+/// crosses back to the host except each window's mean loss and the
+/// pre-clip gradient norm. Returns `(batch_loss, pre_clip_norm)`.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn cuda_device_train_step(
+    cuda_model: &crate::cuda::CudaModel,
+    step_graph: &mut Option<crate::cuda::CudaStepGraph>,
+    dev_opt: &mut crate::cuda::CudaAdamW,
+    bufs: &mut crate::cuda::StepBuffers,
+    windows: &[(Vec<usize>, Vec<usize>)],
+    rng: &mut crate::data::Lcg,
+    batch_size: usize,
+    lr: f32,
+    grad_clip: f32,
+) -> (f32, f32) {
+    assert!(batch_size >= 1, "batch_size must be >= 1");
+    ensure_cuda_step_graph(cuda_model, step_graph, windows[0].0.len());
+    // Same up-front index sampling as the other paths: RNG consumption
+    // per step is identical, so data order matches at the same seed.
+    let indices: Vec<usize> = (0..batch_size)
+        .map(|_| rng.gen_range(windows.len()))
+        .collect();
+    dev_opt.begin_batch();
+    let mut loss_sum = 0.0f32;
+    for &idx in &indices {
+        let (input, target) = &windows[idx];
+        loss_sum += match step_graph.as_mut() {
+            Some(g) => cuda_model.run_step_graph_accumulate(g, dev_opt, input, target),
+            None => cuda_model.accumulate_window_grads(bufs, dev_opt, input, target),
+        };
+    }
+    let norm = dev_opt.step(batch_size, lr, grad_clip);
+    (loss_sum / batch_size as f32, norm)
+}
+
+/// Phase 5.a: CUDA-backed batched gradient computation (CPU-optimiser
+/// mode). Mirrors `compute_batched_grads`'s signature (averaged grads
+/// plus mean loss over `batch_size` windows) but each per-window
+/// forward+backward runs through the device step core instead of the
+/// CPU `Var`-based autograd path.
+///
+/// Implementation notes:
+/// - Takes the device-resident `CudaModel` from the caller. The
+///   training loop builds it once and refreshes it in place with
+///   `CudaModel::sync_from_cpu` after each CPU AdamW update (issue
+///   #1), so the per-step cost is pure H->D copies with zero new
+///   device allocations. (In device-optimiser mode - issue #16 -
+///   `cuda_device_train_step` replaces this function entirely.)
+/// - Each window replays a captured CUDA graph (issue #3): the whole
+///   forward+backward launch sequence collapses into one driver call.
+///   `BITNET_CUDA_GRAPH=0` forces the eager per-kernel path, and a
+///   failed capture falls back to eager rather than aborting.
+/// - Runs windows serially - the GPU is the parallelism layer here.
+/// - The same window-index sampler (`Lcg::gen_range`) is used as the
+///   CPU path, so swapping `use_cuda_backward` between two runs
+///   preserves training-data ordering at the same seed.
+#[cfg(feature = "cuda")]
+fn compute_batched_grads_cuda_bitnet(
+    cuda_model: &crate::cuda::CudaModel,
+    step_graph: &mut Option<crate::cuda::CudaStepGraph>,
+    windows: &[(Vec<usize>, Vec<usize>)],
+    rng: &mut crate::data::Lcg,
+    batch_size: usize,
+) -> (Vec<crate::tensor::Tensor>, f32) {
+    assert!(batch_size >= 1, "batch_size must be >= 1");
+    ensure_cuda_step_graph(cuda_model, step_graph, windows[0].0.len());
 
     // Sample all window indices up front so changing batch_size does
     // not change which windows the run sees at the same RNG state.
@@ -784,6 +835,10 @@ fn train_bitnet_lm(
     opt.beta1 = cfg.adamw_beta1;
     opt.beta2 = cfg.adamw_beta2;
     opt.weight_decay = cfg.weight_decay;
+    // The device optimiser (issue #16) restores from the same state;
+    // stash a copy before the CPU optimiser consumes the original.
+    #[cfg(feature = "cuda")]
+    let mut device_optim_resume = cfg.start_from_optim.clone();
     if let Some(state) = cfg.start_from_optim {
         println!(
             "restoring AdamW state from checkpoint (step_count = {})",
@@ -852,6 +907,16 @@ fn train_bitnet_lm(
     // step and replayed for the rest of the run.
     #[cfg(feature = "cuda")]
     let mut cuda_step_graph: Option<crate::cuda::CudaStepGraph> = None;
+    // Issue #16: device-resident AdamW + the step buffers its eager
+    // fallback writes into. When active, the DEVICE owns the master
+    // weights between steps; the CPU copy is refreshed only at
+    // log/eval/checkpoint boundaries via `sync_to_cpu`.
+    #[cfg(feature = "cuda")]
+    let device_opt_mode = cfg.use_cuda_backward && cuda_adamw_enabled();
+    #[cfg(feature = "cuda")]
+    let mut cuda_adamw: Option<crate::cuda::CudaAdamW> = None;
+    #[cfg(feature = "cuda")]
+    let mut cuda_step_bufs: Option<crate::cuda::StepBuffers> = None;
 
     let train_t0 = std::time::Instant::now();
     for step in 0..cfg.n_steps {
@@ -875,25 +940,74 @@ fn train_bitnet_lm(
         );
         opt.lr = lr;
 
+        // `dev_norm = Some(n)` means the device optimiser already
+        // applied this step's update (issue #16): skip the CPU clip +
+        // AdamW below.
+        #[cfg(feature = "cuda")]
+        let mut dev_norm: Option<f32> = None;
         let (mut grads, batch_loss) = if cfg.use_cuda_backward {
             #[cfg(feature = "cuda")]
             {
-                let cm = match cuda_model.as_mut() {
-                    Some(cm) => {
-                        // Masters moved last step (AdamW); refresh the
-                        // existing device buffers in place.
-                        cm.sync_from_cpu(&model);
-                        cm
-                    }
-                    None => cuda_model.insert(crate::cuda::CudaModel::from_cpu(&model)),
-                };
-                compute_batched_grads_cuda_bitnet(
-                    cm,
-                    &mut cuda_step_graph,
-                    &windows,
-                    &mut rng,
-                    batch_size,
-                )
+                if device_opt_mode {
+                    let cm = match cuda_model.as_mut() {
+                        // No per-step sync_from_cpu: the device owns
+                        // the masters, the AdamW kernel updates them
+                        // in place.
+                        Some(cm) => cm,
+                        None => cuda_model.insert(crate::cuda::CudaModel::from_cpu(&model)),
+                    };
+                    let dev_opt = match cuda_adamw.as_mut() {
+                        Some(o) => o,
+                        None => {
+                            let mut o = crate::cuda::CudaAdamW::new_for(cm, cfg.peak_lr);
+                            o.beta1 = cfg.adamw_beta1;
+                            o.beta2 = cfg.adamw_beta2;
+                            o.weight_decay = cfg.weight_decay;
+                            if let Some(state) = device_optim_resume.take() {
+                                println!(
+                                    "restoring device AdamW state (step_count = {})",
+                                    state.step_count
+                                );
+                                o.restore(&state);
+                            }
+                            cuda_adamw.insert(o)
+                        }
+                    };
+                    let bufs = match cuda_step_bufs.as_mut() {
+                        Some(b) => b,
+                        None => cuda_step_bufs.insert(cm.alloc_step_buffers(windows[0].0.len())),
+                    };
+                    let (loss, norm) = cuda_device_train_step(
+                        cm,
+                        &mut cuda_step_graph,
+                        dev_opt,
+                        bufs,
+                        &windows,
+                        &mut rng,
+                        batch_size,
+                        lr,
+                        cfg.grad_clip,
+                    );
+                    dev_norm = Some(norm);
+                    (Vec::new(), loss)
+                } else {
+                    let cm = match cuda_model.as_mut() {
+                        Some(cm) => {
+                            // Masters moved last step (CPU AdamW);
+                            // refresh the device buffers in place.
+                            cm.sync_from_cpu(&model);
+                            cm
+                        }
+                        None => cuda_model.insert(crate::cuda::CudaModel::from_cpu(&model)),
+                    };
+                    compute_batched_grads_cuda_bitnet(
+                        cm,
+                        &mut cuda_step_graph,
+                        &windows,
+                        &mut rng,
+                        batch_size,
+                    )
+                }
             }
             #[cfg(not(feature = "cuda"))]
             {
@@ -909,11 +1023,34 @@ fn train_bitnet_lm(
         if batch_loss < min_loss {
             min_loss = batch_loss;
         }
-        let pre_clip = clip_grad_norm_tensors(&mut grads, cfg.grad_clip);
-        opt.step_with_grads(&mut model, &grads);
+        #[cfg(feature = "cuda")]
+        let pre_clip = match dev_norm {
+            Some(n) => n, // device optimiser already stepped
+            None => {
+                let p = clip_grad_norm_tensors(&mut grads, cfg.grad_clip);
+                opt.step_with_grads(&mut model, &grads);
+                p
+            }
+        };
+        #[cfg(not(feature = "cuda"))]
+        let pre_clip = {
+            let p = clip_grad_norm_tensors(&mut grads, cfg.grad_clip);
+            opt.step_with_grads(&mut model, &grads);
+            p
+        };
 
         let on_log_step = step % cfg.log_every == 0 || step == cfg.n_steps - 1;
         let on_eval_step = val_enabled && (step % cfg.eval_every == 0 || step == cfg.n_steps - 1);
+
+        // Device-optimiser mode: the CPU model is stale between steps;
+        // the host-side anchor/val evals below need fresh masters.
+        #[cfg(feature = "cuda")]
+        if dev_norm.is_some() && (on_log_step || on_eval_step) {
+            cuda_model
+                .as_ref()
+                .expect("device mode always builds cuda_model")
+                .sync_to_cpu(&mut model);
+        }
 
         if on_log_step {
             let anchor_loss = eval_loss(&model, &input0, &target0);
@@ -945,6 +1082,13 @@ fn train_bitnet_lm(
         }
     }
 
+    // Device-optimiser mode: pull the final masters to the CPU for
+    // the final validation, the generation tail, and the checkpoint.
+    #[cfg(feature = "cuda")]
+    if let (true, Some(cm)) = (cuda_adamw.is_some(), cuda_model.as_ref()) {
+        cm.sync_to_cpu(&mut model);
+    }
+
     // Issue #4 benchmarking hook: wall-clock over the whole step loop.
     // Includes any mid-run eval passes; run with val_split = 0 for a
     // pure ms/step number.
@@ -974,6 +1118,12 @@ fn train_bitnet_lm(
         );
     }
 
+    #[cfg(feature = "cuda")]
+    let optim_snapshot = match (&cuda_model, &cuda_adamw) {
+        (Some(cm), Some(dev_opt)) => dev_opt.snapshot(cm),
+        _ => opt.snapshot(),
+    };
+    #[cfg(not(feature = "cuda"))]
     let optim_snapshot = opt.snapshot();
     (initial_loss, min_loss, model, vocab, optim_snapshot)
 }
