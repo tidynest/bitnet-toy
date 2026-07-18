@@ -271,6 +271,13 @@ pub struct TrainConfig {
     /// giving a smooth tail from previous-run-LR down to floor at the end
     /// of the new run.
     pub cosine_total_steps: Option<usize>,
+    /// Issue #19: write a crash-recovery checkpoint every N steps
+    /// (`0` disables). Only fires when `checkpoint_stem` is set.
+    pub checkpoint_every: usize,
+    /// Artefact stem for periodic checkpoints (`models/<stem>.f32.bin`,
+    /// the file `--resume` consumes). `None` - the default for tests
+    /// and library callers - disables periodic checkpointing.
+    pub checkpoint_stem: Option<String>,
     /// Phase 5.a: route gradient computation through the GPU
     /// `CudaModel::compute_grads_for_window_bitnet` instead of the CPU
     /// autograd `compute_grads_for_window`. Both paths produce
@@ -329,6 +336,8 @@ impl TrainConfig {
             start_from: None,
             start_from_optim: None,
             start_step_offset: 0,
+            checkpoint_every: 500,
+            checkpoint_stem: None,
             cosine_total_steps: None,
             use_cuda_backward: false,
         }
@@ -399,6 +408,8 @@ impl TrainConfig {
             start_from: None,
             start_from_optim: None,
             start_step_offset: 0,
+            checkpoint_every: 500,
+            checkpoint_stem: None,
             cosine_total_steps: None,
             use_cuda_backward: false,
         }
@@ -1080,6 +1091,35 @@ fn train_bitnet_lm(
                 step, val_loss, val_ppl
             );
         }
+
+        // Issue #19: periodic crash-recovery checkpoint. The final step
+        // is excluded - the end-of-run save covers it. Atomic rename
+        // inside `write_f32_checkpoint` protects the previous file.
+        let on_ckpt_step = cfg.checkpoint_every > 0
+            && step + 1 != cfg.n_steps
+            && (step + 1) % cfg.checkpoint_every == 0;
+        if let (true, Some(stem)) = (on_ckpt_step, &cfg.checkpoint_stem) {
+            {
+                #[cfg(feature = "cuda")]
+                let snap = match (&cuda_model, &cuda_adamw) {
+                    (Some(cm), Some(dev_opt)) => {
+                        // Device-optimiser mode: masters + moments live
+                        // on the GPU; pull both for the write.
+                        cm.sync_to_cpu(&mut model);
+                        dev_opt.snapshot(cm)
+                    }
+                    _ => opt.snapshot(),
+                };
+                #[cfg(not(feature = "cuda"))]
+                let snap = opt.snapshot();
+                match write_f32_checkpoint(&model, &snap, stem) {
+                    Ok((path, _)) => {
+                        println!("step {:>5}   checkpoint -> {}", step, path.display())
+                    }
+                    Err(e) => eprintln!("step {:>5}   checkpoint write failed: {e}", step),
+                }
+            }
+        }
     }
 
     // Device-optimiser mode: pull the final masters to the CPU for
@@ -1175,6 +1215,7 @@ fn run_shakespeare_training(resume_path: Option<std::path::PathBuf>, large: bool
         apply_resume_checkpoint(&mut cfg, &p);
     }
 
+    cfg.checkpoint_stem = Some("shakespeare".to_string());
     let (initial, min_seen, model, vocab, optim_state) = train_bitnet_lm(cfg);
     println!(
         "\nShakespeare training done.  initial = {:.4}   min seen = {:.4}   ratio = {:.2}",
@@ -1234,6 +1275,25 @@ fn apply_resume_checkpoint(cfg: &mut TrainConfig, p: &std::path::Path) {
     }
 }
 
+/// Write the resumable f32 checkpoint (masters + optimiser state)
+/// atomically: the bytes land in a temp file first and are renamed
+/// over the target, so a crash mid-write can never corrupt the
+/// previous good checkpoint (issue #19). Returns the written size.
+fn write_f32_checkpoint(
+    model: &crate::model::Model,
+    optim_state: &crate::optim::OptimState,
+    stem: &str,
+) -> std::io::Result<(std::path::PathBuf, usize)> {
+    let mut f32_buf = Vec::new();
+    export::export_f32(model, &mut f32_buf, Some(optim_state))
+        .expect("f32 export to Vec cannot fail");
+    let path = models_path(&format!("{stem}.f32.bin"));
+    let tmp = models_path(&format!(".{stem}.f32.bin.tmp"));
+    std::fs::write(&tmp, &f32_buf)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok((path, f32_buf.len()))
+}
+
 /// Write the two post-training artefacts under `models/<stem>.*`, each
 /// carrying only what its role needs:
 ///
@@ -1253,16 +1313,14 @@ fn save_train_artefacts(
     optim_state: &crate::optim::OptimState,
     stem: &str,
 ) {
-    let mut f32_buf = Vec::new();
-    export::export_f32(model, &mut f32_buf, Some(optim_state))
-        .expect("f32 export to Vec cannot fail");
-    let f32_path = models_path(&format!("{stem}.f32.bin"));
-    let _ = std::fs::write(&f32_path, &f32_buf);
-    println!(
-        "\nwrote {} ({:.2} KB)  resume from this for byte-identical continuation",
-        f32_path.display(),
-        f32_buf.len() as f32 / 1024.0
-    );
+    match write_f32_checkpoint(model, optim_state, stem) {
+        Ok((path, bytes)) => println!(
+            "\nwrote {} ({:.2} KB)  resume from this for byte-identical continuation",
+            path.display(),
+            bytes as f32 / 1024.0
+        ),
+        Err(e) => eprintln!("could not write f32 checkpoint: {e}"),
+    }
 
     let mut packed = Vec::new();
     export::export_ternary_packed(model, &mut packed, None)
@@ -1309,6 +1367,9 @@ options:
   --out STEM       artefact name: models/<STEM>.f32.bin and
                    models/<STEM>.ternary_packed.bin  (default custom)
   --resume PATH    continue from a checkpoint (.f32.bin for identity)
+  --checkpoint-every N
+                   write a crash-recovery checkpoint (models/<out>.f32.bin)
+                   every N steps (default 500, 0 = only at run end)
   --cuda           run forward+backward on the GPU (needs a build with
                    --features cuda); forces n_workers = 1
 
@@ -1367,6 +1428,12 @@ fn parse_train_args(args: &[String]) -> Result<TrainArgs, String> {
                 cfg.val_split = num(value(args, &mut i, "--val-split")?, "--val-split")?;
             }
             "--out" => out_stem = value(args, &mut i, "--out")?.to_string(),
+            "--checkpoint-every" => {
+                cfg.checkpoint_every = num(
+                    value(args, &mut i, "--checkpoint-every")?,
+                    "--checkpoint-every",
+                )?;
+            }
             "--resume" => {
                 resume = Some(std::path::PathBuf::from(value(args, &mut i, "--resume")?));
             }
@@ -1466,6 +1533,7 @@ fn run_train_cli(raw: &[String]) {
         apply_resume_checkpoint(&mut cfg, &p);
     }
 
+    cfg.checkpoint_stem = Some(out_stem.clone());
     let (initial, min_seen, model, vocab, optim_state) = train_bitnet_lm(cfg);
     println!(
         "\nTraining done.  initial = {:.4}   min seen = {:.4}   ratio = {:.2}",
