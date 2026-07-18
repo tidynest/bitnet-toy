@@ -86,6 +86,45 @@ impl Vocab {
     }
 }
 
+/// Unified tokeniser surface (issue #24): the char vocab or a BPE
+/// tokeniser behind one API, so training, generation and the CLI
+/// never branch on which one is active.
+pub enum Tokeniser {
+    Char(Vocab),
+    Bpe(crate::bpe::Bpe),
+}
+
+impl Tokeniser {
+    pub fn size(&self) -> usize {
+        match self {
+            Tokeniser::Char(v) => v.size(),
+            Tokeniser::Bpe(b) => b.size(),
+        }
+    }
+
+    pub fn encode(&self, text: &str) -> Vec<usize> {
+        match self {
+            Tokeniser::Char(v) => v.encode(text),
+            Tokeniser::Bpe(b) => b.encode(text),
+        }
+    }
+
+    pub fn decode(&self, ids: &[usize]) -> String {
+        match self {
+            Tokeniser::Char(v) => v.decode(ids),
+            Tokeniser::Bpe(b) => b.decode(ids),
+        }
+    }
+
+    /// Byte-level BPE encodes anything; the char vocab only its charset.
+    pub fn can_encode(&self, text: &str) -> bool {
+        match self {
+            Tokeniser::Char(v) => v.can_encode(text),
+            Tokeniser::Bpe(_) => true,
+        }
+    }
+}
+
 /// All `(input, target)` sliding windows of length `seq_len` over `ids`.
 ///
 /// Window `i` is  `(ids[i .. i+seq_len],  ids[i+1 .. i+seq_len+1])`.
