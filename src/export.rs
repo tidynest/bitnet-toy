@@ -88,6 +88,12 @@ pub enum Format {
     /// fit in a single byte (3^5 = 243 < 256). Closest to the "1.58 bits per
     /// weight" theoretical optimum with a fixed-byte container.
     TernaryPacked,
+    /// Issue #23: every weight as a bf16 half (2 bytes per value) - the
+    /// top 16 bits of the f32 pattern. Masters are stored at exactly the
+    /// precision the optimiser maintains them at, so a save+load cycle
+    /// is still a true identity. The OPTM payload (AdamW moments) stays
+    /// f32. The resume-checkpoint format since #23.
+    MastersBf16,
 }
 
 impl Format {
@@ -96,6 +102,7 @@ impl Format {
             Format::Float32 => 0,
             Format::Ternary => 1,
             Format::TernaryPacked => 2,
+            Format::MastersBf16 => 3,
         }
     }
     fn from_byte(b: u8) -> io::Result<Format> {
@@ -103,6 +110,7 @@ impl Format {
             0 => Ok(Format::Float32),
             1 => Ok(Format::Ternary),
             2 => Ok(Format::TernaryPacked),
+            3 => Ok(Format::MastersBf16),
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unknown format byte: {}", other),
@@ -182,6 +190,30 @@ fn write_f32_tensor<W: Write>(w: &mut W, t: &Tensor) -> io::Result<usize> {
         bytes += 4;
     }
     Ok(bytes)
+}
+
+/// Issue #23: bf16 halves, 2 bytes per value. The writer narrows with
+/// RNE - a no-op for masters the optimiser already keeps on the bf16
+/// grid, and the correct projection for anything else (e.g. a model
+/// trained pre-#23 being re-saved).
+fn write_bf16_tensor<W: Write>(w: &mut W, t: &Tensor) -> io::Result<usize> {
+    let mut bytes = 0;
+    for &v in &t.data {
+        w.write_all(&crate::tensor::f32_to_bf16_bits(v).to_le_bytes())?;
+        bytes += 2;
+    }
+    Ok(bytes)
+}
+
+fn read_bf16_tensor<R: Read>(r: &mut R, shape: Vec<usize>) -> io::Result<Tensor> {
+    let len: usize = shape.iter().product();
+    let mut data = Vec::with_capacity(len);
+    let mut buf = [0u8; 2];
+    for _ in 0..len {
+        r.read_exact(&mut buf)?;
+        data.push(crate::tensor::bf16_bits_to_f32(u16::from_le_bytes(buf)));
+    }
+    Ok(Tensor { data, shape })
 }
 
 fn write_ternary_tensor<W: Write>(w: &mut W, t: &Tensor) -> io::Result<usize> {
@@ -378,6 +410,34 @@ pub fn export_f32<W: Write>(
     Ok(total)
 }
 
+/// Issue #23: the resume-checkpoint export - bf16 masters (2 bytes per
+/// weight, exactly the precision the optimiser maintains), f32 OPTM
+/// payload. Identity round-trip for post-#23 models.
+pub fn export_bf16<W: Write>(
+    model: &Model,
+    w: &mut W,
+    optim: Option<&OptimState>,
+) -> io::Result<usize> {
+    let mut total = write_header(w, &model.config, Format::MastersBf16)?;
+    total += write_bf16_tensor(w, &model.token_embed)?;
+    for b in &model.blocks {
+        for h in &b.heads {
+            total += write_bf16_tensor(w, &h.w_q)?;
+            total += write_bf16_tensor(w, &h.w_k)?;
+            total += write_bf16_tensor(w, &h.w_v)?;
+            total += write_bf16_tensor(w, &h.w_o)?;
+        }
+        total += write_bf16_tensor(w, &b.ffn_gate_w)?;
+        total += write_bf16_tensor(w, &b.ffn_up_w)?;
+        total += write_bf16_tensor(w, &b.ffn_down_w)?;
+    }
+    // No trailing lm_head: tied to token_embed since BNT5 / v0.17.
+    if let Some(state) = optim {
+        total += write_optim_state(w, state)?;
+    }
+    Ok(total)
+}
+
 pub fn export_ternary<W: Write>(
     model: &Model,
     w: &mut W,
@@ -443,7 +503,12 @@ pub fn import<R: Read>(r: &mut R) -> io::Result<(Model, Format, Option<OptimStat
     let d = cfg.head_dim;
     let f = cfg.ffn_dim;
 
-    let token_embed = read_f32_tensor(r, vec![cfg.vocab_size, h])?;
+    // Ternary formats keep the embedding at f32 (it is not a BitLinear
+    // weight); the bf16 format (#23) narrows it like every other master.
+    let token_embed = match fmt {
+        Format::MastersBf16 => read_bf16_tensor(r, vec![cfg.vocab_size, h])?,
+        _ => read_f32_tensor(r, vec![cfg.vocab_size, h])?,
+    };
 
     let mut blocks = Vec::with_capacity(cfg.n_blocks);
     for _ in 0..cfg.n_blocks {
@@ -451,6 +516,7 @@ pub fn import<R: Read>(r: &mut R) -> io::Result<(Model, Format, Option<OptimStat
             Format::Float32 => read_f32_tensor(r, shape),
             Format::Ternary => read_ternary_tensor(r, shape),
             Format::TernaryPacked => read_ternary_packed_tensor(r, shape),
+            Format::MastersBf16 => read_bf16_tensor(r, shape),
         };
         let mut heads = Vec::with_capacity(cfg.n_heads);
         for _ in 0..cfg.n_heads {
@@ -835,6 +901,65 @@ mod tests {
             assert_eq!(lt.shape, st.shape);
             assert_eq!(lt.data, st.data);
         }
+    }
+
+    /// Issue #23: bf16 export -> import is an identity for models whose
+    /// masters sit on the bf16 grid (i.e. anything the post-#23
+    /// optimiser produced), and the OPTM payload survives at f32.
+    #[test]
+    fn bf16_export_import_round_trips_grid_masters() {
+        let mut model = tiny_model();
+        // Force every master onto the bf16 grid, as the optimiser does.
+        model.for_each_param_mut(|t| {
+            for v in t.data.iter_mut() {
+                *v = crate::tensor::narrow_to_bf16(*v);
+            }
+        });
+        let optim = OptimState {
+            step_count: 42,
+            m: model_shaped_tensors(&model, 0.31),
+            v: model_shaped_tensors(&model, 0.77),
+        };
+        let mut buf = Vec::new();
+        export_bf16(&model, &mut buf, Some(&optim)).unwrap();
+
+        let (back, fmt, optim_back) = import(&mut buf.as_slice()).unwrap();
+        assert_eq!(fmt, Format::MastersBf16);
+        let mut expect: Vec<Tensor> = Vec::new();
+        model.for_each_param_mut(|t| expect.push(t.clone()));
+        let mut i = 0;
+        let mut back_m = back;
+        back_m.for_each_param_mut(|t| {
+            assert_eq!(t.data, expect[i].data, "master {i} did not round-trip");
+            i += 1;
+        });
+        let ob = optim_back.expect("OPTM payload lost");
+        assert_eq!(ob.step_count, 42);
+        for (a, b) in ob.m.iter().zip(&optim.m) {
+            assert_eq!(a.data, b.data, "moment m did not round-trip at f32");
+        }
+        // Size: masters at 2 bytes each. Compare against the f32 export.
+        let mut f32_buf = Vec::new();
+        export_f32(&model, &mut f32_buf, None).unwrap();
+        let mut bf16_buf = Vec::new();
+        export_bf16(&model, &mut bf16_buf, None).unwrap();
+        let header = 33;
+        assert_eq!(bf16_buf.len() - header, (f32_buf.len() - header) / 2);
+    }
+
+    /// Helper: tensors shaped like the model's params, deterministic fill.
+    fn model_shaped_tensors(model: &Model, salt: f32) -> Vec<Tensor> {
+        model
+            .param_shapes()
+            .into_iter()
+            .map(|shape| {
+                let len: usize = shape.iter().product();
+                Tensor {
+                    data: (0..len).map(|i| (i as f32 * salt).sin()).collect(),
+                    shape,
+                }
+            })
+            .collect()
     }
 
     #[test]
