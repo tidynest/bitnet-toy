@@ -140,6 +140,15 @@ worth knowing:
 - `--cuda` runs forward+backward on the GPU (build with
   `--features cuda`); it forces `n_workers = 1` since the GPU is the
   parallelism layer.
+- Best-validation checkpoint (issue #28): whenever a mid-run
+  validation improves on the run's best, `models/<out>.best.f32.bin`
+  is (atomically) rewritten - same self-contained artefact as the
+  periodic checkpoint, so `--resume` accepts it directly. The
+  end-of-run summary reports where the best landed. Motivation: long
+  runs overfit past their optimum (the 50k full-corpus char run
+  bottomed ~0.75 bits/char below its own final state); the periodic
+  checkpoint keeps only LATEST. Best tracking is per-run (a resumed
+  run starts a fresh best).
 - `--checkpoint-every N` (issue #19) writes a crash-recovery
   checkpoint to `models/<out>.f32.bin` every N steps (default 500,
   `0` = only at run end). Writes are atomic (temp file + rename), so
