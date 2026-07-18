@@ -925,6 +925,14 @@ impl Tensor {
     /// Applied to attention scores before softmax so a query at row `i`
     /// cannot attend to keys at columns `> i`.
     pub fn causal_mask(&self) -> Tensor {
+        self.causal_mask_window(self.shape[0])
+    }
+
+    /// Block-diagonal-causal mask (issue #22): cell `(i, j)` survives
+    /// iff `j <= i` AND `i / window == j / window`, so a batched
+    /// `[B*seq, B*seq]` score matrix cannot attend across windows.
+    /// `window == rows` reduces to the classic causal mask.
+    pub fn causal_mask_window(&self, window: usize) -> Tensor {
         assert_eq!(
             self.ndim(),
             2,
@@ -935,7 +943,7 @@ impl Tensor {
         let mut data = self.data.clone();
         for i in 0..m {
             for j in 0..n {
-                if j > i {
+                if j > i || j / window != i / window {
                     data[i * n + j] = f32::NEG_INFINITY;
                 }
             }
@@ -986,6 +994,12 @@ impl Tensor {
     /// tensor is needed - the mask pattern is shape-determined.
     /// Matches `Var::causal_mask` (autograd.rs:805-811).
     pub fn causal_mask_backward(&self) -> Tensor {
+        self.causal_mask_backward_window(self.shape[0])
+    }
+
+    /// Backward of `causal_mask_window` (issue #22): upstream gradient
+    /// passes only where the forward kept the cell.
+    pub fn causal_mask_backward_window(&self, window: usize) -> Tensor {
         assert_eq!(
             self.ndim(),
             2,
@@ -996,7 +1010,9 @@ impl Tensor {
         let mut grad_in = vec![0.0_f32; m * n];
         for i in 0..m {
             for j in 0..(i + 1).min(n) {
-                grad_in[i * n + j] = self.data[i * n + j];
+                if j / window == i / window {
+                    grad_in[i * n + j] = self.data[i * n + j];
+                }
             }
         }
         Tensor {
@@ -1083,6 +1099,13 @@ impl Tensor {
     /// Parameter-free; trig table is recomputed per call (cheap, and
     /// avoids cache state for the inference path).
     pub fn rope(&self) -> Tensor {
+        self.rope_period(self.shape[0])
+    }
+
+    /// RoPE with an explicit rotation period (issue #22): position is
+    /// `row % period`, so a `[B*seq, head_dim]` slab rotates each
+    /// window by 0..seq. `period == rows` is classic RoPE.
+    pub fn rope_period(&self, period: usize) -> Tensor {
         assert_eq!(
             self.ndim(),
             2,
@@ -1100,7 +1123,7 @@ impl Tensor {
         for pos in 0..seq {
             for i in 0..half {
                 let theta_i = 10000_f32.powf(-(2.0 * i as f32) / head_dim as f32);
-                let angle = pos as f32 * theta_i;
+                let angle = (pos % period) as f32 * theta_i;
                 let c = angle.cos();
                 let s = angle.sin();
                 let a = self.data[pos * head_dim + 2 * i];
@@ -1270,6 +1293,12 @@ impl Tensor {
     /// the angles depend only on shape. Matches `Var::rope`
     /// (autograd.rs:902-925).
     pub fn rope_backward(&self) -> Tensor {
+        self.rope_backward_period(self.shape[0])
+    }
+
+    /// Backward of `rope_period` (issue #22): inverse rotation at
+    /// `row % period`.
+    pub fn rope_backward_period(&self, period: usize) -> Tensor {
         assert_eq!(self.ndim(), 2, "rope_backward: expected rank-2");
         let (seq, head_dim) = (self.shape[0], self.shape[1]);
         assert!(
@@ -1282,7 +1311,7 @@ impl Tensor {
         for pos in 0..seq {
             for i in 0..half {
                 let theta_i = 10000_f32.powf(-(2.0 * i as f32) / head_dim as f32);
-                let angle = pos as f32 * theta_i;
+                let angle = (pos % period) as f32 * theta_i;
                 let c = angle.cos();
                 let s = angle.sin();
                 let ga = self.data[pos * head_dim + 2 * i];
@@ -1333,14 +1362,14 @@ impl crate::device::Softmax for Tensor {
 }
 
 impl crate::device::CausalMask for Tensor {
-    fn causal_mask(&self) -> Self {
-        Tensor::causal_mask(self)
+    fn causal_mask(&self, window: usize) -> Self {
+        Tensor::causal_mask_window(self, window)
     }
 }
 
 impl crate::device::Rope for Tensor {
-    fn rope(&self) -> Self {
-        Tensor::rope(self)
+    fn rope(&self, period: usize) -> Self {
+        Tensor::rope_period(self, period)
     }
 }
 
@@ -1363,8 +1392,8 @@ impl crate::device::SoftmaxBackward for Tensor {
 }
 
 impl crate::device::CausalMaskBackward for Tensor {
-    fn causal_mask_backward(&self) -> Self {
-        Tensor::causal_mask_backward(self)
+    fn causal_mask_backward(&self, window: usize) -> Self {
+        Tensor::causal_mask_backward_window(self, window)
     }
 }
 
@@ -1375,8 +1404,8 @@ impl crate::device::RmsNormBackward for Tensor {
 }
 
 impl crate::device::RopeBackward for Tensor {
-    fn rope_backward(&self) -> Self {
-        Tensor::rope_backward(self)
+    fn rope_backward(&self, period: usize) -> Self {
+        Tensor::rope_backward_period(self, period)
     }
 }
 

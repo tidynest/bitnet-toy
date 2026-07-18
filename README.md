@@ -51,12 +51,13 @@ inference, binary export. No third-party ML dependencies.
   forward+backward replays as ONE driver call, bit-identical
   loss trajectory, `BITNET_CUDA_GRAPH=0` opts out) have landed.
   **The GPU now beats the CPU at both training scales** (#4):
-  ~116 vs ~370-440 ms/step at v0.13 and ~276 vs ~1170 at
-  shakespeare-large (x4.2) after the flat-gradient readback
-  (#15) and device-side AdamW (#16: gradients never leave the
-  GPU, the update kernel rewrites the masters in place; batch 4,
-  quota-capped CPU; docs/TRAINING.md has the full table and
-  caveats). Remaining lever: larger batches per graph replay.
+  ~61 vs ~370-440 ms/step at v0.13 and ~176 vs ~1170 at
+  shakespeare-large (**x6.6**) after the flat-gradient readback
+  (#15), device-side AdamW (#16) and batched graph replay (#22:
+  the whole batch is ONE [batch*seq, hidden] slab - block-
+  diagonal-causal attention, periodic RoPE - so a training step
+  is ONE graph replay; batch 4, quota-capped CPU;
+  docs/TRAINING.md has the full table and caveats).
 
 ## Quick start
 
@@ -276,10 +277,10 @@ Milestones, in priority order:
 1. **Phase 5.c - GPU perf** - done (#1-#4): buffer reuse, fused quant
    kernels, CUDA-graph step replay, and the GPU-vs-CPU benchmark showing the
    GPU ahead at both scales (see docs/TRAINING.md).
-2. **Phase 5.d - GPU step residency** - done: flat-gradient readback (#15)
-   and device-side AdamW (#16) leave only each window's loss and the grad
-   norm crossing to the host per step (492 -> 276 ms/step at the large
-   scale). Possible follow-up: larger batches per graph replay.
+2. **Phase 5.d - GPU step residency** - done: flat-gradient readback (#15),
+   device-side AdamW (#16) and batched graph replay (#22) collapse a
+   training step to ONE graph launch plus the loss/norm reads
+   (492 -> 176 ms/step at the large scale).
 3. **CPU SIMD & threading** - done: the persistent matmul thread pool (#7),
    Zen 4 AVX2 auto-select (v0.19), and the ARM64 NEON path (#6, bit-identity
    validated under qemu-aarch64; native perf numbers await real ARM hardware).
