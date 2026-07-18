@@ -40,7 +40,9 @@
 //! slower on this bandwidth-bound matmul, so the dispatcher auto-selects AVX2
 //! there. Export `BITNET_MATMUL_SIMD=avx512` to force AVX-512 back on (A/B
 //! timing), `=avx2` to force AVX2 anywhere, or `=off` (also `0 | none |
-//! scalar`) to force the scalar path. All paths are byte-identical per cell.
+//! scalar`) to force the scalar path. On aarch64 (issue #6) the dispatcher
+//! picks the 4-lane NEON kernel unconditionally (NEON is baseline there);
+//! only `=off` opts out. All paths are byte-identical per cell.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -205,6 +207,12 @@ enum MatmulSimd {
     /// 8-lane AVX2 (`_mm256_mul_ps` + `_mm256_add_ps`). Available on every
     /// modern x86_64 CPU shipped since ~2013.
     Avx2,
+    /// 4-lane ARM NEON (`vmulq_f32` + `vaddq_f32`). Baseline on every
+    /// ARMv8/aarch64 CPU (Apple Silicon, Graviton, Raspberry Pi 4+), so
+    /// no runtime detection is needed. Never constructed on x86_64,
+    /// where the dispatcher only returns the AVX/scalar variants.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    Neon,
     /// Portable scalar AXPY. LLVM may still auto-vectorise this on `--release`.
     Scalar,
 }
@@ -247,8 +255,16 @@ fn matmul_simd_mode() -> MatmulSimd {
                 return MatmulSimd::Avx2;
             }
         }
-        // Avoid unused-variable warnings when target_arch != x86_64.
+        // The forcing flags are x86-only; consume them on other arches.
         let _ = (force_avx2, force_avx512);
+        #[cfg(target_arch = "aarch64")]
+        {
+            // NEON is architecturally mandatory on aarch64: no runtime
+            // detection, no forcing flag needed - only `off`/`scalar`
+            // (handled above) opts out.
+            return MatmulSimd::Neon;
+        }
+        #[allow(unreachable_code)]
         MatmulSimd::Scalar
     })
 }
@@ -309,10 +325,80 @@ fn matmul_kernel(lhs: &[f32], rhs: &[f32], out: &mut [f32], m: usize, k: usize, 
         MatmulSimd::Avx2 => unsafe {
             matmul_kernel_avx2(lhs, rhs, out, m, k, n);
         },
-        MatmulSimd::Scalar => matmul_kernel_scalar(lhs, rhs, out, m, k, n),
+        // Neon is never selected on x86_64; the arm exists because the
+        // enum is shared across arches.
+        MatmulSimd::Scalar | MatmulSimd::Neon => matmul_kernel_scalar(lhs, rhs, out, m, k, n),
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
+    match matmul_simd_mode() {
+        // Safety: NEON is baseline on aarch64; the kernel only uses
+        // unaligned load/store intrinsics whose pointer offsets stay
+        // strictly within the per-row slices.
+        MatmulSimd::Neon => unsafe {
+            matmul_kernel_neon(lhs, rhs, out, m, k, n);
+        },
+        _ => matmul_kernel_scalar(lhs, rhs, out, m, k, n),
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     matmul_kernel_scalar(lhs, rhs, out, m, k, n);
+}
+
+/// NEON kernel (issue #6): 4 f32 per inner-loop iteration. Bit-identical
+/// to the scalar kernel because each output lane accumulates the same
+/// `kk = 0..k` sequence of `mul` then `add` operations, and
+/// `vmulq_f32` / `vaddq_f32` are IEEE-754 per-lane equivalents of scalar
+/// `f32 * +`. We deliberately do *not* use `vfmaq_f32`: FMA collapses
+/// the two roundings into one, breaking bit-equality with the scalar
+/// and x86 paths.
+///
+/// # Safety
+/// Caller must pass `lhs.len() >= m*k`, `rhs.len() >= k*n`,
+/// `out.len() >= m*n`. Inside, every pointer offset is bounded by the
+/// row's length and `j + 4 <= n` where applicable. (NEON itself needs
+/// no detection: it is baseline on aarch64.)
+#[cfg(target_arch = "aarch64")]
+unsafe fn matmul_kernel_neon(
+    lhs: &[f32],
+    rhs: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) {
+    use std::arch::aarch64::{vaddq_f32, vdupq_n_f32, vld1q_f32, vmulq_f32, vst1q_f32};
+
+    let n_simd = (n / 4) * 4; // largest multiple of 4 <= n
+
+    for i in 0..m {
+        let row_lhs_off = i * k;
+        let row_out_off = i * n;
+        for kk in 0..k {
+            let a = lhs[row_lhs_off + kk];
+            // Safety: every intrinsic and pointer offset below is bounded
+            // by the row's length; the function's preconditions guarantee
+            // lhs / rhs / out are large enough.
+            unsafe {
+                let a_vec = vdupq_n_f32(a);
+                let rhs_base = rhs.as_ptr().add(kk * n);
+                let out_base = out.as_mut_ptr().add(row_out_off);
+
+                let mut j = 0;
+                while j < n_simd {
+                    let out_vec = vld1q_f32(out_base.add(j));
+                    let rhs_vec = vld1q_f32(rhs_base.add(j));
+                    let prod = vmulq_f32(a_vec, rhs_vec);
+                    let sum = vaddq_f32(out_vec, prod);
+                    vst1q_f32(out_base.add(j), sum);
+                    j += 4;
+                }
+                // Tail: n - n_simd remaining columns, scalar.
+                while j < n {
+                    *out_base.add(j) += a * *rhs_base.add(j);
+                    j += 1;
+                }
+            }
+        }
+    }
 }
 
 /// Portable scalar AXPY-ordered kernel. The inner `j` loop is the per-row
@@ -1622,7 +1708,7 @@ mod tests {
 
     /// Hand-rolled textbook (i, j, kk) inner-product matmul. Re-used by the
     /// per-kernel direct-call tests below. Returns the row-major output.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     fn classic_triple_loop_reference(
         lhs: &[f32],
         rhs: &[f32],
@@ -1669,6 +1755,27 @@ mod tests {
         // m*n preconditions by construction.
         unsafe { matmul_kernel_avx2(&lhs, &rhs, &mut got, m, k, n) };
         assert_eq!(got, want, "AVX2 kernel diverged from textbook triple loop");
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn axpy_kernel_neon_direct_matches_classic_triple_loop_bit_identical() {
+        // Mirror of the AVX2/AVX-512 direct tests for the issue #6 NEON
+        // kernel. Primes (m=17, k=23, n=31) exercise both the 4-wide
+        // SIMD body and the n % 4 = 3 tail. NEON is baseline on
+        // aarch64, so no runtime detection guard is needed.
+        let m = 17usize;
+        let k = 23usize;
+        let n = 31usize;
+        let lhs: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.137).sin()).collect();
+        let rhs: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.219).cos()).collect();
+        let want = classic_triple_loop_reference(&lhs, &rhs, m, k, n);
+
+        let mut got = vec![0.0f32; m * n];
+        // Safety: slice lengths satisfy the m*k, k*n, m*n preconditions
+        // by construction.
+        unsafe { matmul_kernel_neon(&lhs, &rhs, &mut got, m, k, n) };
+        assert_eq!(got, want, "NEON kernel diverged from textbook triple loop");
     }
 
     #[test]
