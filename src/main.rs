@@ -937,6 +937,9 @@ fn train_bitnet_lm(
     let (input0, target0) = (windows[0].0.clone(), windows[0].1.clone());
     let initial_loss = eval_loss(&model, &input0, &target0);
     let mut min_loss = initial_loss;
+    // Issue #28: best mid-run validation seen, and where it happened.
+    let mut best_val = f32::INFINITY;
+    let mut best_val_step: usize = 0;
 
     let val_enabled = !val_windows.is_empty() && cfg.eval_every > 0 && cfg.val_eval_samples > 0;
 
@@ -1088,6 +1091,8 @@ fn train_bitnet_lm(
 
         let on_log_step = step % cfg.log_every == 0 || step == cfg.n_steps - 1;
         let on_eval_step = val_enabled && (step % cfg.eval_every == 0 || step == cfg.n_steps - 1);
+        // Issue #28: the val_loss this step computed, if any.
+        let mut stepped_val: Option<f32> = None;
 
         // Device-optimiser mode: the CPU model is stale between steps;
         // the host-side anchor/val evals below need fresh masters.
@@ -1104,6 +1109,7 @@ fn train_bitnet_lm(
             if on_eval_step {
                 let (val_loss, val_ppl) =
                     eval_val_perplexity(&model, &val_windows, cfg.val_eval_samples);
+                stepped_val = Some(val_loss);
                 println!(
                     "step {:>5}   train_loss = {:.4}   anchor_loss = {:.4}   \
                      min_seen = {:.4}   val_loss = {:.4}   val_ppl = {:.2}   \
@@ -1122,10 +1128,50 @@ fn train_bitnet_lm(
             // val_ppl line so the cadence stays visible.
             let (val_loss, val_ppl) =
                 eval_val_perplexity(&model, &val_windows, cfg.val_eval_samples);
+            stepped_val = Some(val_loss);
             println!(
                 "step {:>5}   val_loss = {:.4}   val_ppl = {:.2}",
                 step, val_loss, val_ppl
             );
+        }
+
+        // Issue #28: whenever a mid-run validation improves on the best
+        // seen, keep that model - long runs overfit past their optimum
+        // (the 50k full-corpus char run bottomed at step ~17k and
+        // finished 0.75 bits/char worse), and the periodic checkpoint
+        // below only keeps LATEST. Same self-contained artefact, so
+        // `--resume models/<out>.best.f32.bin` just works.
+        if let (Some(v), Some(stem)) = (stepped_val, &cfg.checkpoint_stem)
+            && v < best_val
+        {
+            {
+                best_val = v;
+                best_val_step = step;
+                #[cfg(feature = "cuda")]
+                let snap = match (&cuda_model, &cuda_adamw) {
+                    (Some(cm), Some(dev_opt)) => {
+                        // Masters already synced for the eval that
+                        // produced this val_loss; moments still need
+                        // the device snapshot.
+                        dev_opt.snapshot(cm)
+                    }
+                    _ => opt.snapshot(),
+                };
+                #[cfg(not(feature = "cuda"))]
+                let snap = opt.snapshot();
+                match write_named_checkpoint(&model, &snap, &format!("{stem}.best.f32.bin"), &vocab)
+                {
+                    Ok((path, _)) => {
+                        println!(
+                            "step {:>5}   best val_loss {:.4} -> {}",
+                            step,
+                            v,
+                            path.display()
+                        )
+                    }
+                    Err(e) => eprintln!("step {:>5}   best-val checkpoint failed: {e}", step),
+                }
+            }
         }
 
         // Issue #19: periodic crash-recovery checkpoint. The final step
@@ -1155,6 +1201,19 @@ fn train_bitnet_lm(
                     Err(e) => eprintln!("step {:>5}   checkpoint write failed: {e}", step),
                 }
             }
+        }
+    }
+
+    // Issue #28: where the best mid-run validation landed - every long
+    // run doubles as an early-stopping sweep.
+    if best_val.is_finite()
+        && let Some(stem) = &cfg.checkpoint_stem
+    {
+        {
+            println!(
+                "\nbest validation: val_loss = {:.4} at step {} (kept in models/{}.best.f32.bin)",
+                best_val, best_val_step, stem
+            );
         }
     }
 
@@ -1332,6 +1391,17 @@ fn write_f32_checkpoint(
     stem: &str,
     tokeniser: &crate::data::Tokeniser,
 ) -> std::io::Result<(std::path::PathBuf, usize)> {
+    write_named_checkpoint(model, optim_state, &format!("{stem}.f32.bin"), tokeniser)
+}
+
+/// Inner writer (issues #19 + #28): atomic, self-contained (bf16
+/// masters + OPTM + BPEM), any filename under `models/`.
+fn write_named_checkpoint(
+    model: &crate::model::Model,
+    optim_state: &crate::optim::OptimState,
+    filename: &str,
+    tokeniser: &crate::data::Tokeniser,
+) -> std::io::Result<(std::path::PathBuf, usize)> {
     let mut f32_buf = Vec::new();
     // Issue #23: masters travel as bf16 halves (exactly the precision
     // the optimiser maintains - identity round-trip); the AdamW
@@ -1345,8 +1415,8 @@ fn write_f32_checkpoint(
     if let crate::data::Tokeniser::Bpe(b) = tokeniser {
         export::append_bpe_section(&mut f32_buf, b).expect("BPE section to Vec cannot fail");
     }
-    let path = models_path(&format!("{stem}.f32.bin"));
-    let tmp = models_path(&format!(".{stem}.f32.bin.tmp"));
+    let path = models_path(filename);
+    let tmp = models_path(&format!(".{filename}.tmp"));
     std::fs::write(&tmp, &f32_buf)?;
     std::fs::rename(&tmp, &path)?;
     Ok((path, f32_buf.len()))
