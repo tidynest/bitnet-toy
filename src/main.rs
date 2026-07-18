@@ -1286,8 +1286,13 @@ fn write_f32_checkpoint(
     stem: &str,
 ) -> std::io::Result<(std::path::PathBuf, usize)> {
     let mut f32_buf = Vec::new();
-    export::export_f32(model, &mut f32_buf, Some(optim_state))
-        .expect("f32 export to Vec cannot fail");
+    // Issue #23: masters travel as bf16 halves (exactly the precision
+    // the optimiser maintains - identity round-trip); the AdamW
+    // moments in the OPTM payload stay f32. The `.f32.bin` name is
+    // kept so every resume path and doc stays valid; the format byte
+    // in the header is what imports dispatch on.
+    export::export_bf16(model, &mut f32_buf, Some(optim_state))
+        .expect("bf16 export to Vec cannot fail");
     let path = models_path(&format!("{stem}.f32.bin"));
     let tmp = models_path(&format!(".{stem}.f32.bin.tmp"));
     std::fs::write(&tmp, &f32_buf)?;

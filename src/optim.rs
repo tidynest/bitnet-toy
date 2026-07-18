@@ -142,6 +142,7 @@ impl AdamW {
 
         let m_slices = self.m.as_mut_slice();
         let v_slices = self.v.as_mut_slice();
+        let bf16 = crate::tensor::bf16_masters_enabled();
         let mut idx = 0;
 
         model.for_each_param_mut(|p| {
@@ -158,6 +159,12 @@ impl AdamW {
                 let m_hat = m_i.data[j] / bc1;
                 let v_hat = v_i.data[j] / bc2;
                 p.data[j] -= lr * (m_hat / (v_hat.sqrt() + eps) + wd * p.data[j]);
+                // Issue #23: masters are STORED at bf16 precision - the
+                // update computes in f32, the store narrows (RNE). The
+                // moments above stay full f32.
+                if bf16 {
+                    p.data[j] = crate::tensor::narrow_to_bf16(p.data[j]);
+                }
             }
         });
     }
@@ -216,6 +223,52 @@ mod tests {
     use super::*;
     use crate::autograd::Tape;
     use crate::model::ModelConfig;
+
+    /// Issue #23: after any optimiser step every master sits exactly on
+    /// the bf16 grid (low 16 bits zero) while the moments stay full f32.
+    #[test]
+    fn adamw_step_leaves_masters_on_bf16_grid() {
+        if !crate::tensor::bf16_masters_enabled() {
+            eprintln!("skipping: BITNET_BF16_MASTERS=0");
+            return;
+        }
+        let cfg = tiny_config();
+        let mut model = Model::new(&cfg, 3);
+        let mut opt = AdamW::new_for(&model, 1e-2);
+        let grads: Vec<Tensor> = model
+            .param_shapes()
+            .into_iter()
+            .map(|shape| {
+                let len: usize = shape.iter().product();
+                Tensor {
+                    data: (0..len).map(|i| (i as f32 * 0.37).sin()).collect(),
+                    shape,
+                }
+            })
+            .collect();
+        opt.step_with_grads(&mut model, &grads);
+        model.for_each_param_mut(|t| {
+            for (j, v) in t.data.iter().enumerate() {
+                assert_eq!(
+                    v.to_bits() & 0xFFFF,
+                    0,
+                    "master cell {j} off the bf16 grid: {v}"
+                );
+            }
+        });
+        // Moments untouched by narrowing: at least one has live low bits.
+        let snap = opt.snapshot();
+        let any_full_precision = snap
+            .m
+            .iter()
+            .chain(&snap.v)
+            .flat_map(|t| &t.data)
+            .any(|v| v.to_bits() & 0xFFFF != 0);
+        assert!(
+            any_full_precision,
+            "moments appear narrowed - they must stay f32"
+        );
+    }
 
     fn tiny_config() -> ModelConfig {
         ModelConfig {

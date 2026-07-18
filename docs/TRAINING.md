@@ -227,6 +227,12 @@ Conclusions:
   all disappear. One replay per training STEP: another -36-47%
   (v0.13 116 -> 61 ms/step, large 276 -> 176; x6.6 vs the capped
   CPU at the large scale).
+- BF16 masters (#23): the optimiser stores every master at bf16
+  precision (RNE narrow on write, bit-identical CPU vs CUDA); compute
+  stays f32 and the AdamW moments stay f32. Checkpoints write u16
+  halves - the masters section halves, and the `.f32.bin` name now
+  refers to the OPTM payload's precision. Old f32 checkpoints load
+  unchanged. `BITNET_BF16_MASTERS=0` reverts for A/B runs.
 - Numerics after #22: batched and per-window paths agree to FP
   tolerance (the batch division moves across a summation), graph and
   eager batched paths stay bitwise-identical, and the same-seed
