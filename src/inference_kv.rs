@@ -40,7 +40,7 @@
 //! a tight loop.
 
 use crate::bitlinear::{absmax_int8, absmean_ternary};
-use crate::data::{Lcg, Vocab};
+use crate::data::{Lcg, Tokeniser};
 use crate::inference::SamplingMode;
 use crate::model::Model;
 use crate::tensor::Tensor;
@@ -457,7 +457,7 @@ fn sample_from_logits(logits: &[f32], mode: &SamplingMode, rng: &mut Lcg) -> usi
 /// few logits and only matters when two tokens share a near-tied score).
 pub fn generate_with_cache(
     model: &Model,
-    vocab: &Vocab,
+    vocab: &Tokeniser,
     prompt: &str,
     max_new_tokens: usize,
     mode: SamplingMode,

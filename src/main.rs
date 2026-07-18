@@ -35,6 +35,7 @@ mod attention;
 mod autograd;
 mod bitlinear;
 mod block;
+mod bpe;
 #[cfg(feature = "cuda")]
 mod cuda;
 mod data;
@@ -271,6 +272,13 @@ pub struct TrainConfig {
     /// giving a smooth tail from previous-run-LR down to floor at the end
     /// of the new run.
     pub cosine_total_steps: Option<usize>,
+    /// Issue #24: path to a `.bpe` tokeniser artefact. `None` (default)
+    /// keeps the char vocab built from the corpus.
+    pub tokenizer_path: Option<std::path::PathBuf>,
+    /// Issue #24: tokeniser recovered from a resume checkpoint's BPEM
+    /// section. Wins over `tokenizer_path` - the checkpoint knows what
+    /// it was trained with.
+    pub resume_tokenizer: Option<crate::bpe::Bpe>,
     /// Issue #19: write a crash-recovery checkpoint every N steps
     /// (`0` disables). Only fires when `checkpoint_stem` is set.
     pub checkpoint_every: usize,
@@ -336,6 +344,8 @@ impl TrainConfig {
             start_from: None,
             start_from_optim: None,
             start_step_offset: 0,
+            tokenizer_path: None,
+            resume_tokenizer: None,
             checkpoint_every: 500,
             checkpoint_stem: None,
             cosine_total_steps: None,
@@ -408,6 +418,8 @@ impl TrainConfig {
             start_from: None,
             start_from_optim: None,
             start_step_offset: 0,
+            tokenizer_path: None,
+            resume_tokenizer: None,
             checkpoint_every: 500,
             checkpoint_stem: None,
             cosine_total_steps: None,
@@ -772,7 +784,7 @@ fn train_bitnet_lm(
     f32,
     f32,
     crate::model::Model,
-    crate::data::Vocab,
+    crate::data::Tokeniser,
     crate::optim::OptimState,
 ) {
     use crate::data::{Lcg, TINY_CORPUS, Vocab, make_windows, read_corpus};
@@ -793,7 +805,30 @@ fn train_bitnet_lm(
         None => TINY_CORPUS.to_string(),
     };
 
-    let vocab = Vocab::from_text(&corpus_owned);
+    // Issue #24: checkpoint-embedded tokeniser wins, then a --tokenizer
+    // artefact, else the char vocab from the corpus.
+    let vocab = if let Some(b) = cfg.resume_tokenizer.clone() {
+        println!(
+            "using the checkpoint's embedded BPE tokeniser (vocab {})",
+            b.size()
+        );
+        crate::data::Tokeniser::Bpe(b)
+    } else {
+        match &cfg.tokenizer_path {
+            Some(p) => match std::fs::File::open(p).and_then(|mut f| crate::bpe::Bpe::load(&mut f))
+            {
+                Ok(b) => {
+                    println!("loaded BPE tokeniser {:?} (vocab {})", p, b.size());
+                    crate::data::Tokeniser::Bpe(b)
+                }
+                Err(e) => {
+                    eprintln!("could not load tokeniser {:?}: {e}", p);
+                    std::process::exit(1);
+                }
+            },
+            None => crate::data::Tokeniser::Char(Vocab::from_text(&corpus_owned)),
+        }
+    };
     let ids = vocab.encode(&corpus_owned);
 
     // If we're resuming, the loaded model's config wins (vocab + dimensions
@@ -1113,7 +1148,7 @@ fn train_bitnet_lm(
                 };
                 #[cfg(not(feature = "cuda"))]
                 let snap = opt.snapshot();
-                match write_f32_checkpoint(&model, &snap, stem) {
+                match write_f32_checkpoint(&model, &snap, stem, &vocab) {
                     Ok((path, _)) => {
                         println!("step {:>5}   checkpoint -> {}", step, path.display())
                     }
@@ -1149,11 +1184,18 @@ fn train_bitnet_lm(
         let n = (cfg.val_eval_samples * 5).min(val_windows.len());
         let (val_loss, val_ppl) = eval_val_perplexity(&model, &val_windows, n);
         let baseline_ppl = vocab.size() as f32;
+        // Issue #24: bits per CHARACTER - the only loss unit comparable
+        // across tokenisers (per-token perplexities are not: a BPE
+        // token spans several chars). nats/token * tokens/char / ln 2.
+        let val_chars = vocab.decode(val_ids).chars().count().max(1);
+        let bits_per_char =
+            val_loss * (val_ids.len() as f32 / val_chars as f32) / std::f32::consts::LN_2;
         println!(
             "\nfinal validation:  val_loss = {:.4}   val_ppl = {:.3}   \
-             (uniform-vocab baseline = {:.1}, ratio = {:.3})",
+             bits/char = {:.3}   (uniform-vocab baseline = {:.1}, ratio = {:.3})",
             val_loss,
             val_ppl,
+            bits_per_char,
             baseline_ppl,
             val_ppl / baseline_ppl
         );
@@ -1226,7 +1268,7 @@ fn run_shakespeare_training(resume_path: Option<std::path::PathBuf>, large: bool
     );
 
     print_generation_samples(&model, &vocab, DEFAULT_PROMPTS);
-    save_train_artefacts(&model, &optim_state, "shakespeare");
+    save_train_artefacts(&model, &optim_state, "shakespeare", &vocab);
 }
 
 /// Load a checkpoint into `cfg` for a resumed run: masters into
@@ -1245,7 +1287,11 @@ fn apply_resume_checkpoint(cfg: &mut TrainConfig, p: &std::path::Path) {
         }
     };
     match export::import(&mut f) {
-        Ok((m, fmt, optim)) => {
+        Ok((m, fmt, optim, bpe)) => {
+            if let Some(b) = bpe {
+                println!("checkpoint carries a BPE tokeniser (vocab {})", b.size());
+                cfg.resume_tokenizer = Some(b);
+            }
             let optim_msg = if optim.is_some() {
                 "with optim state"
             } else {
@@ -1284,6 +1330,7 @@ fn write_f32_checkpoint(
     model: &crate::model::Model,
     optim_state: &crate::optim::OptimState,
     stem: &str,
+    tokeniser: &crate::data::Tokeniser,
 ) -> std::io::Result<(std::path::PathBuf, usize)> {
     let mut f32_buf = Vec::new();
     // Issue #23: masters travel as bf16 halves (exactly the precision
@@ -1293,6 +1340,11 @@ fn write_f32_checkpoint(
     // in the header is what imports dispatch on.
     export::export_bf16(model, &mut f32_buf, Some(optim_state))
         .expect("bf16 export to Vec cannot fail");
+    // Issue #24: a BPE-trained model is unusable without its merges -
+    // embed them so the checkpoint is self-contained.
+    if let crate::data::Tokeniser::Bpe(b) = tokeniser {
+        export::append_bpe_section(&mut f32_buf, b).expect("BPE section to Vec cannot fail");
+    }
     let path = models_path(&format!("{stem}.f32.bin"));
     let tmp = models_path(&format!(".{stem}.f32.bin.tmp"));
     std::fs::write(&tmp, &f32_buf)?;
@@ -1318,8 +1370,9 @@ fn save_train_artefacts(
     model: &crate::model::Model,
     optim_state: &crate::optim::OptimState,
     stem: &str,
+    tokeniser: &crate::data::Tokeniser,
 ) {
-    match write_f32_checkpoint(model, optim_state, stem) {
+    match write_f32_checkpoint(model, optim_state, stem, tokeniser) {
         Ok((path, bytes)) => println!(
             "\nwrote {} ({:.2} KB)  resume from this for byte-identical continuation",
             path.display(),
@@ -1331,6 +1384,9 @@ fn save_train_artefacts(
     let mut packed = Vec::new();
     export::export_ternary_packed(model, &mut packed, None)
         .expect("packed export to Vec cannot fail");
+    if let crate::data::Tokeniser::Bpe(b) = tokeniser {
+        export::append_bpe_section(&mut packed, b).expect("BPE section to Vec cannot fail");
+    }
     let path = models_path(&format!("{stem}.ternary_packed.bin"));
     let _ = std::fs::write(&path, &packed);
     println!(
@@ -1373,6 +1429,8 @@ options:
   --out STEM       artefact name: models/<STEM>.f32.bin and
                    models/<STEM>.ternary_packed.bin  (default custom)
   --resume PATH    continue from a checkpoint (.f32.bin for identity)
+  --tokenizer PATH .bpe artefact from `bpe <corpus> --vocab-size N`;
+                   default is the char vocab built from the corpus
   --checkpoint-every N
                    write a crash-recovery checkpoint (models/<out>.f32.bin)
                    every N steps (default 500, 0 = only at run end)
@@ -1434,6 +1492,13 @@ fn parse_train_args(args: &[String]) -> Result<TrainArgs, String> {
                 cfg.val_split = num(value(args, &mut i, "--val-split")?, "--val-split")?;
             }
             "--out" => out_stem = value(args, &mut i, "--out")?.to_string(),
+            "--tokenizer" => {
+                cfg.tokenizer_path = Some(std::path::PathBuf::from(value(
+                    args,
+                    &mut i,
+                    "--tokenizer",
+                )?));
+            }
             "--checkpoint-every" => {
                 cfg.checkpoint_every = num(
                     value(args, &mut i, "--checkpoint-every")?,
@@ -1507,6 +1572,94 @@ fn parse_train_args(args: &[String]) -> Result<TrainArgs, String> {
 /// `train` subcommand runner (issue #8): parse, validate IO, train,
 /// sample, save. IO and process-exit live here so the parser stays a
 /// pure function.
+/// `bpe <corpus.txt> --vocab-size N [--out PATH]` (issue #24): learn a
+/// byte-pair tokeniser from the corpus and write the deterministic
+/// `.bpe` artefact (default `models/<corpus stem>.bpe`).
+fn run_bpe_cli(args: &[String]) {
+    let usage = "usage: bitnet-toy bpe <corpus.txt> --vocab-size N [--out PATH]";
+    let mut corpus: Option<std::path::PathBuf> = None;
+    let mut vocab_size: Option<usize> = None;
+    let mut out: Option<std::path::PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--vocab-size" => {
+                i += 1;
+                vocab_size = args.get(i).and_then(|v| v.parse().ok());
+                if vocab_size.is_none() {
+                    eprintln!("--vocab-size needs a number\n{usage}");
+                    std::process::exit(2);
+                }
+            }
+            "--out" => {
+                i += 1;
+                match args.get(i) {
+                    Some(p) => out = Some(std::path::PathBuf::from(p)),
+                    None => {
+                        eprintln!("--out needs a path\n{usage}");
+                        std::process::exit(2);
+                    }
+                }
+            }
+            flag if flag.starts_with("--") => {
+                eprintln!("unknown flag {flag}\n{usage}");
+                std::process::exit(2);
+            }
+            positional => corpus = Some(std::path::PathBuf::from(positional)),
+        }
+        i += 1;
+    }
+    let (Some(corpus), Some(vocab_size)) = (corpus, vocab_size) else {
+        eprintln!("{usage}");
+        std::process::exit(2);
+    };
+    let bytes = match std::fs::read(&corpus) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("could not read {}: {e}", corpus.display());
+            std::process::exit(1);
+        }
+    };
+    println!(
+        "training BPE on {} ({} bytes, target vocab {})...",
+        corpus.display(),
+        bytes.len(),
+        vocab_size
+    );
+    let t0 = std::time::Instant::now();
+    let bpe = crate::bpe::Bpe::train(&bytes, vocab_size);
+    let out = out.unwrap_or_else(|| {
+        let stem = corpus
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "corpus".to_string());
+        models_path(&format!("{stem}.bpe"))
+    });
+    let mut buf = Vec::new();
+    bpe.save(&mut buf).expect("BPE save to Vec cannot fail");
+    if let Err(e) = std::fs::write(&out, &buf) {
+        eprintln!("could not write {}: {e}", out.display());
+        std::process::exit(1);
+    }
+    // Tokens-per-char preview: encode a corpus slice and report.
+    let sample_len = bytes.len().min(65536);
+    let sample = String::from_utf8_lossy(&bytes[..sample_len]);
+    let toks = bpe.encode(&sample).len();
+    println!(
+        "wrote {} (vocab {}, {} merges) in {:.1}s  ~{:.2} chars/token on the corpus",
+        out.display(),
+        bpe.size(),
+        bpe.merges.len(),
+        t0.elapsed().as_secs_f32(),
+        sample.chars().count() as f32 / toks.max(1) as f32,
+    );
+    println!(
+        "train with:  bitnet-toy train {} --tokenizer {}",
+        corpus.display(),
+        out.display()
+    );
+}
+
 fn run_train_cli(raw: &[String]) {
     let TrainArgs {
         mut cfg,
@@ -1565,7 +1718,7 @@ fn run_train_cli(raw: &[String]) {
     } else {
         print_generation_samples(&model, &vocab, &usable);
     }
-    save_train_artefacts(&model, &optim_state, &out_stem);
+    save_train_artefacts(&model, &optim_state, &out_stem, &vocab);
 }
 
 /// Top-level `--help` text: every subcommand on one screen. The `train`
@@ -1577,6 +1730,7 @@ fn print_help() {
          subcommands:\n  \
          (none)                        run the M4-M10 curriculum demo\n  \
          train <corpus> [options]      train on any UTF-8 corpus (see below)\n  \
+         bpe <corpus> --vocab-size N   learn a BPE tokeniser -> models/<stem>.bpe\n  \
          shakespeare [resume]          ~5M-param TinyShakespeare training\n  \
          shakespeare-large [resume]    ~8.5M-param variant, seq_len 128\n  \
          sample <checkpoint> [--corpus <path>] [prompt]\n                                generate from a checkpoint, no training; --corpus\n                                rebuilds the vocab for `train`-made checkpoints\n  \
@@ -1596,7 +1750,11 @@ fn print_help() {
 /// `run_shakespeare_training` (post-train tail, three default prompts)
 /// and the standalone `sample` subcommand below (caller-supplied prompt
 /// when given, otherwise the same defaults).
-fn print_generation_samples(model: &crate::model::Model, vocab: &data::Vocab, prompts: &[&str]) {
+fn print_generation_samples(
+    model: &crate::model::Model,
+    vocab: &data::Tokeniser,
+    prompts: &[&str],
+) {
     use SampleMode::*;
     let modes = enabled_sample_modes();
     if modes.is_empty() {
@@ -1911,8 +2069,8 @@ fn run_sample_cli(
             std::process::exit(1);
         }
     };
-    let (model, fmt, _optim) = match export::import(&mut f) {
-        Ok(triple) => triple,
+    let (model, fmt, _optim, embedded_bpe) = match export::import(&mut f) {
+        Ok(parts) => parts,
         Err(e) => {
             eprintln!("could not parse checkpoint {}: {}", path.display(), e);
             std::process::exit(1);
@@ -1936,6 +2094,20 @@ fn run_sample_cli(
             std::process::exit(1);
         }
     };
+    // Issue #24: a checkpoint carrying its BPE tokeniser is
+    // self-contained - the corpus is only needed for char vocabs.
+    if let Some(b) = embedded_bpe {
+        assert_eq!(
+            b.size(),
+            model.config.vocab_size,
+            "embedded tokeniser vocab does not match the model config"
+        );
+        println!(
+            "using the checkpoint's embedded BPE tokeniser (vocab {})",
+            b.size()
+        );
+        return sample_with_tokeniser(model, crate::data::Tokeniser::Bpe(b), raw_prompt);
+    }
     let vocab = Vocab::from_text(&corpus);
     if vocab.size() != model.config.vocab_size {
         eprintln!(
@@ -1947,12 +2119,24 @@ fn run_sample_cli(
         );
         std::process::exit(1);
     }
+    sample_with_tokeniser(model, crate::data::Tokeniser::Char(vocab), raw_prompt);
+}
 
+/// Shared tail of the `sample` subcommand: prompt filtering +
+/// generation, tokeniser-agnostic (issue #24).
+fn sample_with_tokeniser(
+    model: crate::model::Model,
+    vocab: crate::data::Tokeniser,
+    raw_prompt: Option<String>,
+) {
     match raw_prompt {
         Some(raw) => {
             // Filter the prompt to chars in the trained vocab; report
             // what got dropped so the user knows what the model saw.
-            let filtered: String = raw.chars().filter(|c| vocab.can_encode_char(*c)).collect();
+            let filtered: String = raw
+                .chars()
+                .filter(|c| vocab.can_encode(&c.to_string()))
+                .collect();
             let dropped_count = raw.chars().count() - filtered.chars().count();
             if dropped_count > 0 {
                 eprintln!("warning: dropped {dropped_count} out-of-vocab char(s) from prompt");
@@ -1976,10 +2160,8 @@ fn run_sample_cli(
                 .collect();
             if usable.is_empty() {
                 eprintln!(
-                    "none of the default prompts fit this corpus's vocab; pass a prompt:\n  \
-                     sample {} --corpus {} <your prompt>",
-                    path.display(),
-                    corpus_path.display()
+                    "none of the default prompts fit this model's vocab; pass a prompt:\n  \
+                     sample <checkpoint> --corpus <corpus> <your prompt>"
                 );
                 std::process::exit(1);
             }
@@ -2406,6 +2588,10 @@ fn main() {
         run_train_cli(&args[2..]);
         return;
     }
+    if args.len() > 1 && args[1] == "bpe" {
+        run_bpe_cli(&args[2..]);
+        return;
+    }
     if args.len() > 1 && (args[1] == "shakespeare" || args[1] == "shakespeare-large") {
         let large = args[1] == "shakespeare-large";
         let resume_path = args
@@ -2566,7 +2752,7 @@ fn main() {
     );
     let mut cursor = std::io::Cursor::new(packed_buf);
     match export::import(&mut cursor) {
-        Ok((loaded_model, fmt, _opt)) => {
+        Ok((loaded_model, fmt, _opt, _bpe)) => {
             println!(
                 "loaded {:?}-format model with vocab={}",
                 fmt, loaded_model.config.vocab_size

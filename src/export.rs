@@ -331,26 +331,12 @@ fn write_optim_state<W: Write>(w: &mut W, state: &OptimState) -> io::Result<usiz
 /// `param_shapes` must match the model whose state is being loaded - the
 /// importer reads exactly `2 * sum(shape.product())` floats and uses the
 /// shapes to reconstruct each `m` and `v` tensor.
-fn read_optim_state_or_none<R: Read>(
+/// Body of the OPTM section (marker already consumed by the trailer
+/// dispatch in `import`).
+fn read_optim_state_body<R: Read>(
     r: &mut R,
     param_shapes: &[Vec<usize>],
-) -> io::Result<Option<OptimState>> {
-    let mut marker = [0u8; 4];
-    match r.read_exact(&mut marker) {
-        Ok(()) => {}
-        Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e),
-    }
-    if &marker != OPTM_MARKER {
-        return Err(io::Error::new(
-            ErrorKind::InvalidData,
-            format!(
-                "expected OPTM marker after lm_head, got {:?}",
-                String::from_utf8_lossy(&marker)
-            ),
-        ));
-    }
-
+) -> io::Result<OptimState> {
     let mut buf = [0u8; 4];
     r.read_exact(&mut buf)?;
     let step_count = u32::from_le_bytes(buf);
@@ -363,7 +349,7 @@ fn read_optim_state_or_none<R: Read>(
     for shape in param_shapes {
         v.push(read_f32_tensor(r, shape.clone())?);
     }
-    Ok(Some(OptimState { step_count, m, v }))
+    Ok(OptimState { step_count, m, v })
 }
 
 fn read_ternary_tensor<R: Read>(r: &mut R, shape: Vec<usize>) -> io::Result<Tensor> {
@@ -491,13 +477,31 @@ pub fn export_ternary_packed<W: Write>(
     Ok(total)
 }
 
+// ---- BPE tokeniser section (issue #24) ----
+//
+// Optional trailing section AFTER the OPTM payload: marker "BPEM" then
+// the `Bpe::save` bytes. A BPE-trained model is unusable without its
+// merges, so the tokeniser travels inside the checkpoint - `sample`
+// needs no corpus and no side-channel file. Char-vocab checkpoints
+// simply omit the section (fully backward compatible).
+
+const BPE_MARKER: &[u8; 4] = b"BPEM";
+
+pub fn append_bpe_section<W: Write>(w: &mut W, bpe: &crate::bpe::Bpe) -> io::Result<()> {
+    w.write_all(BPE_MARKER)?;
+    bpe.save(w)
+}
+
 // ---- public import ----
 
 /// Read a model file (any format) and reconstruct the `Model`, the `Format`
 /// it was stored in, and an optional `OptimState` if the file carries one.
 /// Older BNT3 files written before optim-state persistence terminate after
 /// `lm_head`; this function returns `Ok((model, fmt, None))` for those.
-pub fn import<R: Read>(r: &mut R) -> io::Result<(Model, Format, Option<OptimState>)> {
+#[allow(clippy::type_complexity)]
+pub fn import<R: Read>(
+    r: &mut R,
+) -> io::Result<(Model, Format, Option<OptimState>, Option<crate::bpe::Bpe>)> {
     let (fmt, cfg) = read_header(r)?;
     let h = cfg.hidden_dim;
     let d = cfg.head_dim;
@@ -544,10 +548,34 @@ pub fn import<R: Read>(r: &mut R) -> io::Result<(Model, Format, Option<OptimStat
 
     // Try to read optim state. EOF here means the file pre-dates optim
     // persistence; that's fine, returns Ok(None).
+    // Trailing sections, each announced by a 4-byte marker: OPTM
+    // (AdamW state) and/or BPEM (issue #24 tokeniser), any order, both
+    // optional. EOF ends the trailer; an unknown marker is corruption.
     let param_shapes = model.param_shapes();
-    let optim = read_optim_state_or_none(r, &param_shapes)?;
+    let mut optim = None;
+    let mut bpe = None;
+    let mut marker = [0u8; 4];
+    loop {
+        match r.read_exact(&mut marker) {
+            Err(e) if e.kind() == ErrorKind::UnexpectedEof => break,
+            other => other?,
+        }
+        match &marker {
+            m if m == OPTM_MARKER => optim = Some(read_optim_state_body(r, &param_shapes)?),
+            m if m == BPE_MARKER => bpe = Some(crate::bpe::Bpe::load(r)?),
+            other => {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    format!(
+                        "unknown trailer marker {:?}",
+                        String::from_utf8_lossy(other)
+                    ),
+                ));
+            }
+        }
+    }
 
-    Ok((model, fmt, optim))
+    Ok((model, fmt, optim, bpe))
 }
 
 #[cfg(test)]
@@ -627,7 +655,7 @@ mod tests {
         let mut buf = Vec::new();
         export_f32(&model, &mut buf, None).unwrap();
 
-        let (loaded, fmt, _opt) = import(&mut Cursor::new(&buf)).unwrap();
+        let (loaded, fmt, _opt, _) = import(&mut Cursor::new(&buf)).unwrap();
         assert_eq!(fmt, Format::Float32);
         assert_eq!(loaded.config.vocab_size, model.config.vocab_size);
         assert_eq!(loaded.token_embed.data, model.token_embed.data);
@@ -652,7 +680,7 @@ mod tests {
         let mut buf = Vec::new();
         export_ternary(&model, &mut buf, None).unwrap();
 
-        let (loaded, fmt, _opt) = import(&mut Cursor::new(&buf)).unwrap();
+        let (loaded, fmt, _opt, _) = import(&mut Cursor::new(&buf)).unwrap();
         assert_eq!(fmt, Format::Ternary);
 
         // Embeddings are f32, exact match.
@@ -685,7 +713,7 @@ mod tests {
         let mut buf = Vec::new();
         export_ternary_packed(&model, &mut buf, None).unwrap();
 
-        let (loaded, fmt, _opt) = import(&mut Cursor::new(&buf)).unwrap();
+        let (loaded, fmt, _opt, _) = import(&mut Cursor::new(&buf)).unwrap();
         assert_eq!(fmt, Format::TernaryPacked);
 
         // Embeddings stay f32, exact match.
@@ -752,7 +780,7 @@ mod tests {
         let model = tiny_model();
         let mut buf = Vec::new();
         export_ternary_packed(&model, &mut buf, None).unwrap();
-        let (_loaded, _fmt, optim) = import(&mut Cursor::new(&buf)).unwrap();
+        let (_loaded, _fmt, optim, _) = import(&mut Cursor::new(&buf)).unwrap();
         assert!(
             optim.is_none(),
             "expected no optim state in payload-less export"
@@ -802,7 +830,7 @@ mod tests {
 
         let mut buf = Vec::new();
         export_ternary_packed(&model, &mut buf, Some(&saved)).unwrap();
-        let (_loaded_model, _fmt, loaded_optim) = import(&mut Cursor::new(&buf)).unwrap();
+        let (_loaded_model, _fmt, loaded_optim, _) = import(&mut Cursor::new(&buf)).unwrap();
         let loaded = loaded_optim.expect("optim state must round-trip when written");
 
         assert_eq!(loaded.step_count, 1234);
@@ -863,7 +891,7 @@ mod tests {
 
         let mut buf = Vec::new();
         export_f32(&model, &mut buf, Some(&saved)).unwrap();
-        let (loaded_model, fmt, loaded_optim) = import(&mut Cursor::new(&buf)).unwrap();
+        let (loaded_model, fmt, loaded_optim, _) = import(&mut Cursor::new(&buf)).unwrap();
         assert_eq!(fmt, Format::Float32);
         let loaded_state = loaded_optim.expect("optim state must round-trip");
 
@@ -923,7 +951,7 @@ mod tests {
         let mut buf = Vec::new();
         export_bf16(&model, &mut buf, Some(&optim)).unwrap();
 
-        let (back, fmt, optim_back) = import(&mut buf.as_slice()).unwrap();
+        let (back, fmt, optim_back, _) = import(&mut buf.as_slice()).unwrap();
         assert_eq!(fmt, Format::MastersBf16);
         let mut expect: Vec<Tensor> = Vec::new();
         model.for_each_param_mut(|t| expect.push(t.clone()));
@@ -960,6 +988,24 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    /// Issue #24: the BPEM trailing section round-trips the tokeniser
+    /// through a checkpoint, and files without one read back None.
+    #[test]
+    fn bpe_section_round_trips_through_checkpoint() {
+        let model = tiny_model();
+        let bpe = crate::bpe::Bpe::train(b"the theme thereof there ", 270);
+        let mut buf = Vec::new();
+        export_bf16(&model, &mut buf, None).unwrap();
+        append_bpe_section(&mut buf, &bpe).unwrap();
+        let (_m, _fmt, _opt, loaded) = import(&mut Cursor::new(&buf)).unwrap();
+        assert_eq!(loaded.expect("BPEM section lost"), bpe);
+
+        let mut plain = Vec::new();
+        export_bf16(&model, &mut plain, None).unwrap();
+        let (_m, _fmt, _opt, none) = import(&mut Cursor::new(&plain)).unwrap();
+        assert!(none.is_none(), "phantom tokeniser from a plain checkpoint");
     }
 
     #[test]
