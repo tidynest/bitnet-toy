@@ -31,7 +31,7 @@
 //! biggest inference optimisation deferred for a future milestone.
 
 use crate::autograd::Tape;
-use crate::data::{Lcg, Vocab};
+use crate::data::{Lcg, Tokeniser};
 use crate::model::Model;
 
 /// How to pick the next token from the model's logit distribution.
@@ -55,7 +55,7 @@ pub enum SamplingMode {
 /// deterministic and ignores `rng`; the other modes consume `rng`.
 pub fn generate_with_mode(
     model: &Model,
-    vocab: &Vocab,
+    vocab: &Tokeniser,
     prompt: &str,
     max_new_tokens: usize,
     mode: SamplingMode,
@@ -70,7 +70,7 @@ pub fn generate_with_mode(
 }
 
 /// Backwards-compatible greedy entry point.
-pub fn generate(model: &Model, vocab: &Vocab, prompt: &str, max_new_tokens: usize) -> String {
+pub fn generate(model: &Model, vocab: &Tokeniser, prompt: &str, max_new_tokens: usize) -> String {
     let mut throwaway = Lcg::new(0);
     generate_with_mode(
         model,
@@ -86,7 +86,7 @@ pub fn generate(model: &Model, vocab: &Vocab, prompt: &str, max_new_tokens: usiz
 #[allow(dead_code)] // used only by tests; main routes through generate_with_mode
 pub fn generate_with_temperature(
     model: &Model,
-    vocab: &Vocab,
+    vocab: &Tokeniser,
     prompt: &str,
     max_new_tokens: usize,
     temperature: f32,
@@ -280,8 +280,8 @@ mod tests {
     use crate::data::TINY_CORPUS;
     use crate::model::ModelConfig;
 
-    fn small_model() -> (Model, Vocab) {
-        let vocab = Vocab::from_text(TINY_CORPUS);
+    fn small_model() -> (Model, Tokeniser) {
+        let vocab = Tokeniser::Char(crate::data::Vocab::from_text(TINY_CORPUS));
         let cfg = ModelConfig {
             vocab_size: vocab.size(),
             hidden_dim: 8,

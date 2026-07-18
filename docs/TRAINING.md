@@ -11,6 +11,7 @@ How to train, what to expect, what to watch for, and what knobs to turn.
 - [Real training: TinyShakespeare](#real-training-tinyshakespeare)
 - [Training any corpus: the train subcommand](#training-any-corpus-the-train-subcommand)
 - [GPU vs CPU benchmark](#gpu-vs-cpu-benchmark-issue-4)
+- [BPE tokenisation](#bpe-tokenisation-issue-24)
 - [Watching the run](#watching-the-run)
 - [Generation modes](#generation-modes)
 - [Tuning](#tuning)
@@ -237,6 +238,44 @@ Conclusions:
   tolerance (the batch division moves across a summation), graph and
   eager batched paths stay bitwise-identical, and the same-seed
   GPU-vs-CPU statistical-equivalence story from #16 is unchanged.
+
+## BPE tokenisation (issue #24)
+
+The char vocab is the default; a hand-rolled byte-level BPE tokeniser
+is available for subword training:
+
+```
+bitnet-toy bpe data/tinyshakespeare.txt --vocab-size 1024
+bitnet-toy train data/tinyshakespeare.txt --tokenizer models/tinyshakespeare.bpe --cuda ...
+```
+
+- Byte-level: the base vocabulary is the 256 raw bytes, so ANY input
+  encodes and `decode(encode(x)) == x` for arbitrary UTF-8.
+- Deterministic: frequency ties break towards the smallest pair -
+  the same corpus and vocab size always produce a byte-identical
+  `.bpe` artefact.
+- **The tokeniser travels inside the checkpoint** (a `BPEM` trailing
+  section next to the AdamW `OPTM` payload): `sample` needs no
+  `--corpus` for BPE checkpoints, and `--resume` picks the embedded
+  tokeniser up automatically (it wins over `--tokenizer`).
+- Cross-tokeniser comparisons must use **bits per character** - the
+  final-validation line prints it. Per-token perplexity is NOT
+  comparable across vocabs: a BPE token spans ~2+ chars, so its
+  per-token loss is legitimately higher.
+  `bits/char = val_loss * (tokens/chars) / ln 2`.
+
+First A/B (v0.13 shape, 2000 steps, batch 4, val split 0.1):
+
+| tokeniser | vocab | val_ppl (per token) | bits/char |
+|---|---|---|---|
+| char | 65 | 8.65 | **3.11** |
+| BPE | 1024 | 786.8 | 3.90 |
+
+The char vocab wins at this budget: a 1024-way softmax and a ~2x
+harder per-token task need far more than 2k steps to amortise. The
+BPE payoff thesis stays what issue #24 stated - seq_len 128 spanning
+~4-5x more TEXT should help the larger model generalise - but it must
+be demonstrated at a real step budget, not asserted from a smoke run.
 
 ## Watching the run
 
