@@ -676,7 +676,7 @@ extern "C" __global__ void adamw_update_regions_f32(
     float* __restrict__ v,
     const float* __restrict__ norm_scale, // [2] = {norm, clip scale}
     float lr, float beta1, float beta2, float eps, float wd,
-    float bc1, float bc2)
+    float bc1, float bc2, int bf16)
 {
     const unsigned long long* d = desc + (size_t)blockIdx.x * 4;
     float* p = (float*)d[0];
@@ -699,7 +699,16 @@ extern "C" __global__ void adamw_update_regions_f32(
         float v_hat = vj / bc2;
         float denom = __fadd_rn(sqrtf(v_hat), eps);
         float step = __fadd_rn(m_hat / denom, __fmul_rn(wd, p[j]));
-        p[j] = __fsub_rn(p[j], __fmul_rn(lr, step));
+        float pj = __fsub_rn(p[j], __fmul_rn(lr, step));
+        // Issue #23: masters are STORED at bf16 precision. Manual RNE
+        // on the bit pattern - the exact rounding the CPU
+        // `narrow_to_bf16` performs - so CPU/GPU stay bit-identical.
+        if (bf16 != 0) {
+            unsigned int b = __float_as_uint(pj);
+            unsigned int round = ((b >> 16) & 1u) + 0x7FFFu;
+            pj = __uint_as_float(((b + round) >> 16) << 16);
+        }
+        p[j] = pj;
     }
 }
 "#;
@@ -3417,7 +3426,13 @@ impl CudaAdamW {
         l.arg(&self.weight_decay);
         l.arg(&bc1);
         l.arg(&bc2);
-        // Safety: signature matches the 12 args; desc holds n_regions
+        let bf16_i: i32 = if crate::tensor::bf16_masters_enabled() {
+            1
+        } else {
+            0
+        };
+        l.arg(&bf16_i);
+        // Safety: signature matches the 13 args; desc holds n_regions
         // * 4 u64s; grads/m/v hold param_len elements; the master
         // pointers in desc outlive self (weight buffers are never
         // reallocated).

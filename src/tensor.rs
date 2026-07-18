@@ -45,6 +45,50 @@
 //! only `=off` opts out. All paths are byte-identical per cell.
 
 use std::sync::OnceLock;
+
+// ---- BF16 master-weight storage (issue #23) ----
+//
+// BF16 is the top 16 bits of an IEEE-754 f32 (same exponent range,
+// 7-bit mantissa). Masters are STORED at bf16 precision - checkpoints
+// carry u16 halves, and the optimiser narrows every master it writes -
+// while all arithmetic stays f32 (load-widen, compute, store-narrow),
+// matching the BitNet b1.58 training recipe.
+
+/// Round an f32 to the nearest bf16 (round-to-nearest-even) and return
+/// the 16-bit pattern. NaNs are quieted so the narrowed pattern is
+/// still a NaN after widening.
+pub fn f32_to_bf16_bits(x: f32) -> u16 {
+    let b = x.to_bits();
+    if x.is_nan() {
+        // Preserve NaN-ness: keep the sign + exponent, force a quiet
+        // mantissa bit so truncation cannot produce an infinity.
+        return ((b >> 16) as u16) | 0x0040;
+    }
+    // RNE: add 0x7FFF plus the lowest kept bit, then truncate.
+    let round = ((b >> 16) & 1) + 0x7FFF;
+    ((b.wrapping_add(round)) >> 16) as u16
+}
+
+/// Widen a bf16 bit pattern back to f32 (exact - bf16 is a strict
+/// subset of f32).
+pub fn bf16_bits_to_f32(h: u16) -> f32 {
+    f32::from_bits((h as u32) << 16)
+}
+
+/// Narrow an f32 onto the bf16 grid (RNE) and widen it back. The
+/// result is an ordinary f32 whose low 16 mantissa bits are zero, so
+/// every downstream f32 code path works unchanged.
+pub fn narrow_to_bf16(x: f32) -> f32 {
+    bf16_bits_to_f32(f32_to_bf16_bits(x))
+}
+
+/// Issue #23 escape hatch: `BITNET_BF16_MASTERS=0` keeps the masters
+/// at full f32 (pre-#23 behaviour) for A/B runs. Read once.
+pub fn bf16_masters_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("BITNET_BF16_MASTERS").map_or(true, |v| v.trim() != "0"))
+}
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 
@@ -1888,5 +1932,55 @@ mod tests {
         let a = Tensor::from_vec(vec![5.0, 7.0, 9.0], vec![3]);
         let b = Tensor::from_vec(vec![1.0, 2.0, 3.0], vec![3]);
         assert_eq!(a.sub(&b).data, vec![4.0, 5.0, 6.0]);
+    }
+}
+
+#[cfg(test)]
+mod bf16_tests {
+    use super::*;
+
+    /// Issue #23: bf16-representable values round-trip exactly, the
+    /// RNE boundary rounds to even, and narrowing is idempotent.
+    #[test]
+    fn bf16_rne_round_trip_and_boundaries() {
+        // Exactly representable: sign, zero, powers of two, 1.0 + 2^-7.
+        for &x in &[0.0f32, -0.0, 1.0, -1.0, 0.5, 2.0, 1.0078125] {
+            assert_eq!(
+                narrow_to_bf16(x).to_bits(),
+                x.to_bits(),
+                "{x} should be exact"
+            );
+        }
+        // Any pattern with zero low 16 bits is exactly representable.
+        for h in [0x0001u16, 0x3F81, 0x7F7F, 0x8080, 0xC049, 0x0080] {
+            let x = bf16_bits_to_f32(h);
+            assert_eq!(
+                narrow_to_bf16(x).to_bits(),
+                x.to_bits(),
+                "bits {h:#06x} should be exact"
+            );
+        }
+        // Halfway cases round to EVEN mantissa:
+        // 1.0 + 2^-8 sits exactly between 1.0 (even) and 1.0078125 (odd) -> 1.0.
+        assert_eq!(narrow_to_bf16(f32::from_bits(0x3F80_8000)), 1.0);
+        // 1.0 + 3*2^-8 sits between 1.0078125 (odd) and 1.015625 (even) -> up.
+        assert_eq!(narrow_to_bf16(f32::from_bits(0x3F81_8000)), 1.015625);
+        // One ULP above the halfway point rounds up.
+        assert_eq!(narrow_to_bf16(f32::from_bits(0x3F80_8001)), 1.0078125);
+        // Idempotence over a value sweep.
+        for i in 0..1000 {
+            let x = (i as f32 * 0.7391).sin() * 10f32.powi(i % 60 - 30);
+            let once = narrow_to_bf16(x);
+            assert_eq!(
+                once.to_bits(),
+                narrow_to_bf16(once).to_bits(),
+                "not idempotent at {x}"
+            );
+            assert_eq!(once.to_bits() & 0xFFFF, 0, "low bits survive at {x}");
+        }
+        // Overflow to infinity is monotone (f32::MAX exceeds bf16 max).
+        assert!(narrow_to_bf16(f32::MAX).is_infinite());
+        // NaN stays NaN.
+        assert!(narrow_to_bf16(f32::NAN).is_nan());
     }
 }
