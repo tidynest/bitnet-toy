@@ -183,7 +183,8 @@ numbers are included for calibration.
 | CPU (300% quota)        | 366-444 | 1138-1201 |
 | GPU, graph replay       | 145-178 | 492 |
 | GPU, graph + flat readback (#15) | 139 | 394 |
-| GPU + device AdamW (#16)         | 116 | **276** |
+| GPU + device AdamW (#16)         | 116 | 276 |
+| GPU + batched replay (#22)       | 61  | **176** |
 | GPU, eager launches     | 164     | 499 |
 | CPU uncapped (v0.13-era historical) | ~180 | ~800 (est. 4-5x v0.13) |
 | GPU pre-#1/#2/#3 (historical)       | ~300 | - |
@@ -217,7 +218,19 @@ Conclusions:
   reduction reorders a sum and BitNet's ternary rounding amplifies
   the last-ULP difference, so GPU and CPU runs at the same seed stay
   statistically equivalent but no longer print identical loss lines.
-- Remaining lever: larger batches per graph replay.
+- Batched graph replay (#22) folds the whole batch into ONE
+  `[batch*seq, hidden]` slab per step: block-diagonal-causal masking
+  and periodic RoPE keep windows independent, weight gradients arrive
+  batch-summed from the matmul backward, and the CE `1/(batch*seq)`
+  row scale makes them batch-averaged in place - so the per-window
+  replay loop, the gradient accumulate kernels and the averaging pass
+  all disappear. One replay per training STEP: another -36-47%
+  (v0.13 116 -> 61 ms/step, large 276 -> 176; x6.6 vs the capped
+  CPU at the large scale).
+- Numerics after #22: batched and per-window paths agree to FP
+  tolerance (the batch division moves across a summation), graph and
+  eager batched paths stay bitwise-identical, and the same-seed
+  GPU-vs-CPU statistical-equivalence story from #16 is unchanged.
 
 ## Watching the run
 

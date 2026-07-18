@@ -599,14 +599,18 @@ fn ensure_cuda_step_graph(
     cuda_model: &crate::cuda::CudaModel,
     step_graph: &mut Option<crate::cuda::CudaStepGraph>,
     seq: usize,
+    batch: usize,
 ) {
     static GRAPH_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
     let graph_wanted = std::env::var("BITNET_CUDA_GRAPH").map_or(true, |v| v.trim() != "0")
         && GRAPH_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
     if step_graph.is_none() && graph_wanted {
-        match cuda_model.build_step_graph(seq) {
+        match cuda_model.build_step_graph(seq, batch) {
             Ok(g) => {
-                println!("captured CUDA step graph (seq_len {seq}); replaying it per window");
+                println!(
+                    "captured CUDA step graph (seq_len {seq}, batch {batch}); \
+                     ONE replay per training step"
+                );
                 *step_graph = Some(g);
             }
             Err(e) => {
@@ -617,12 +621,34 @@ fn ensure_cuda_step_graph(
     }
 }
 
-/// Issue #16: one fully device-resident training step. Gradients are
-/// computed (graph replay when available), the token-embed gradient is
-/// fused on-device, the batch is accumulated and averaged on-device,
-/// and the AdamW kernel updates the master weights in place - nothing
-/// crosses back to the host except each window's mean loss and the
-/// pre-clip gradient norm. Returns `(batch_loss, pre_clip_norm)`.
+/// Sample `batch_size` window indices (identical RNG consumption to the
+/// CPU path, so data order matches at the same seed) and concatenate
+/// the chosen windows into one ids slab + one targets slab (issue #22).
+#[cfg(feature = "cuda")]
+fn sample_batch_slab(
+    windows: &[(Vec<usize>, Vec<usize>)],
+    rng: &mut crate::data::Lcg,
+    batch_size: usize,
+) -> (Vec<usize>, Vec<usize>) {
+    let indices: Vec<usize> = (0..batch_size)
+        .map(|_| rng.gen_range(windows.len()))
+        .collect();
+    let seq = windows[0].0.len();
+    let mut ids = Vec::with_capacity(batch_size * seq);
+    let mut targets = Vec::with_capacity(batch_size * seq);
+    for &idx in &indices {
+        ids.extend_from_slice(&windows[idx].0);
+        targets.extend_from_slice(&windows[idx].1);
+    }
+    (ids, targets)
+}
+
+/// Issues #16 + #22: one fully device-resident training step - the
+/// whole batch as ONE `[batch*seq, hidden]` slab, one graph replay
+/// (or one eager pass), fused embed gradient, then the AdamW kernel
+/// updating the masters in place. Nothing crosses back to the host
+/// except the batch-mean loss and the pre-clip gradient norm.
+/// Returns `(batch_loss, pre_clip_norm)`.
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 fn cuda_device_train_step(
@@ -637,23 +663,19 @@ fn cuda_device_train_step(
     grad_clip: f32,
 ) -> (f32, f32) {
     assert!(batch_size >= 1, "batch_size must be >= 1");
-    ensure_cuda_step_graph(cuda_model, step_graph, windows[0].0.len());
-    // Same up-front index sampling as the other paths: RNG consumption
-    // per step is identical, so data order matches at the same seed.
-    let indices: Vec<usize> = (0..batch_size)
-        .map(|_| rng.gen_range(windows.len()))
-        .collect();
-    dev_opt.begin_batch();
-    let mut loss_sum = 0.0f32;
-    for &idx in &indices {
-        let (input, target) = &windows[idx];
-        loss_sum += match step_graph.as_mut() {
-            Some(g) => cuda_model.run_step_graph_accumulate(g, dev_opt, input, target),
-            None => cuda_model.accumulate_window_grads(bufs, dev_opt, input, target),
-        };
-    }
-    let norm = dev_opt.step(batch_size, lr, grad_clip);
-    (loss_sum / batch_size as f32, norm)
+    let seq = windows[0].0.len();
+    ensure_cuda_step_graph(cuda_model, step_graph, seq, batch_size);
+    let (ids, targets) = sample_batch_slab(windows, rng, batch_size);
+    let loss = match step_graph.as_mut() {
+        Some(g) => cuda_model.run_step_graph_grads(g, &ids, &targets),
+        None => cuda_model.device_step_grads(bufs, &ids, &targets, seq),
+    };
+    // The gradients sit in whichever buffer the step wrote.
+    let norm = match step_graph.as_ref() {
+        Some(g) => dev_opt.step(g.step_bufs(), lr, grad_clip),
+        None => dev_opt.step(bufs, lr, grad_clip),
+    };
+    (loss, norm)
 }
 
 /// Phase 5.a: CUDA-backed batched gradient computation (CPU-optimiser
@@ -686,41 +708,18 @@ fn compute_batched_grads_cuda_bitnet(
     batch_size: usize,
 ) -> (Vec<crate::tensor::Tensor>, f32) {
     assert!(batch_size >= 1, "batch_size must be >= 1");
-    ensure_cuda_step_graph(cuda_model, step_graph, windows[0].0.len());
-
-    // Sample all window indices up front so changing batch_size does
-    // not change which windows the run sees at the same RNG state.
-    let indices: Vec<usize> = (0..batch_size)
-        .map(|_| rng.gen_range(windows.len()))
-        .collect();
-
-    let mut grads_for = |input: &[usize], target: &[usize]| match step_graph.as_mut() {
-        Some(g) => cuda_model.run_step_graph(g, input, target),
-        None => cuda_model.compute_grads_for_window_bitnet(input, target),
-    };
-
-    // Average gradients across the batch. Start from the first
-    // result's tensors (move out, no clone) and sum the rest into them.
-    let first_idx = indices[0];
-    let (input, target) = &windows[first_idx];
-    let (mut avg_grads, mut total_loss) = grads_for(input, target);
-    for &idx in &indices[1..] {
-        let (input, target) = &windows[idx];
-        let (other_grads, other_loss) = grads_for(input, target);
-        for (a, b) in avg_grads.iter_mut().zip(&other_grads) {
-            for (av, bv) in a.data.iter_mut().zip(&b.data) {
-                *av += bv;
-            }
-        }
-        total_loss += other_loss;
+    let seq = windows[0].0.len();
+    ensure_cuda_step_graph(cuda_model, step_graph, seq, batch_size);
+    let (ids, targets) = sample_batch_slab(windows, rng, batch_size);
+    // Issue #22: the batched step core computes the whole batch in one
+    // pass (one graph replay when available) and its CE row scale
+    // `1/(batch*seq)` means `assemble_grads` returns batch-AVERAGED
+    // gradients and the batch-mean loss directly - no host-side
+    // accumulation loop.
+    match step_graph.as_mut() {
+        Some(g) => cuda_model.run_step_graph(g, &ids, &targets),
+        None => cuda_model.compute_grads_batched_bitnet(&ids, &targets, seq),
     }
-    let n = batch_size as f32;
-    for g in avg_grads.iter_mut() {
-        for v in g.data.iter_mut() {
-            *v /= n;
-        }
-    }
-    (avg_grads, total_loss / n)
 }
 
 /// Mean cross-entropy and perplexity (`exp(mean_ce)`) over a deterministic,
@@ -986,7 +985,9 @@ fn train_bitnet_lm(
                     };
                     let bufs = match cuda_step_bufs.as_mut() {
                         Some(b) => b,
-                        None => cuda_step_bufs.insert(cm.alloc_step_buffers(windows[0].0.len())),
+                        // Slab buffers: batch * seq rows (issue #22).
+                        None => cuda_step_bufs
+                            .insert(cm.alloc_step_buffers(batch_size * windows[0].0.len())),
                     };
                     let (loss, norm) = cuda_device_train_step(
                         cm,
@@ -2077,7 +2078,8 @@ fn run_cuda_forward_bench() {
                     w_up: b.ffn_up_w.clone(),
                     w_down: b.ffn_down_w.clone(),
                 };
-                x = block_inference(&x, &heads, &ffn, model.config.head_dim);
+                let rows = x.shape[0];
+                x = block_inference(&x, &heads, &ffn, model.config.head_dim, rows);
             }
             // Tied LM head: same tensor as token_embed, transposed.
             x.rmsnorm().matmul(&model.token_embed.transpose_2d())
