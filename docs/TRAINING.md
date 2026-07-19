@@ -281,10 +281,44 @@ First A/B (v0.13 shape, 2000 steps, batch 4, val split 0.1):
 | BPE | 1024 | 786.8 | 3.90 |
 
 The char vocab wins at this budget: a 1024-way softmax and a ~2x
-harder per-token task need far more than 2k steps to amortise. The
-BPE payoff thesis stays what issue #24 stated - seq_len 128 spanning
-~4-5x more TEXT should help the larger model generalise - but it must
-be demonstrated at a real step budget, not asserted from a smoke run.
+harder per-token task need far more than 2k steps to amortise.
+
+### The full study (char vs BPE, corpus size, step budget)
+
+The issue #24 thesis - subword tokens let seq_len 128 span ~4-5x more
+TEXT, which should help the larger model - was then tested properly on
+the shakespeare-large shape (~8.5M params, hidden 256, 8 blocks, seq
+128, batch 4). Two corpora: tinyshakespeare (1.1M chars) and the
+Gutenberg Complete Works (`data/shakespeare-full.txt`, 5.4M chars,
+4.8x bigger). All numbers are bits/char (the cross-tokeniser metric).
+
+| corpus | tokeniser | 10k steps | 50k steps | best val during 50k |
+|---|---|---|---|---|
+| tiny 1.1M   | char-65   | 3.33 | -    | -                |
+| full 5.4M   | char-100  | 3.63 | 3.22 | **~2.46** @ step ~17k |
+| full 5.4M   | BPE-1024  | 3.98 | 4.41 | ~3.90 @ step ~10k    |
+
+**Char wins at every budget and both corpus sizes, and the BPE gap
+widened with more optimisation** (0.35 -> 1.19 bits/char from 10k to
+50k). Why the thesis failed at this scale:
+
+- A 1024-way softmax over a large tied embedding memorises faster than
+  a 100-way char one; 5.4M chars is not enough distinct subword
+  contexts to regularise 8.5M params. A tiny char vocab is an implicit
+  regulariser - fewer output classes, denser per-class statistics.
+- BPE overfit hard and early (min train 1.85 while val blew up past
+  7). The literature's BPE wins live at 10-100x this data scale, with
+  far more params-per-token headroom.
+
+**The load-bearing finding is about step budget, not tokenisation.**
+Both 50k runs overfit past their optimum: the full-corpus char run
+bottomed at ~2.46 bits/char around step 17k, then slid to 3.22 by the
+end - the best model was overwritten ~45 times by the latest-only
+periodic checkpoint. That observation is what motivated the
+best-validation checkpoint (issue #28, above): every long run now
+keeps its peak in `models/<out>.best.f32.bin`, so a training run
+doubles as an early-stopping sweep. Reruns should read the `.best`
+artefact, not the final one.
 
 ## Watching the run
 
