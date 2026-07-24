@@ -286,6 +286,36 @@ BPE payoff thesis stays what issue #24 stated - seq_len 128 spanning
 ~4-5x more TEXT should help the larger model generalise - but it must
 be demonstrated at a real step budget, not asserted from a smoke run.
 
+### Full-corpus retest with the tuned recipe
+
+The thesis was retested on the 5.36M-char full works at the
+shakespeare-large shape, using the tuned recipe from the LR study
+(peak 1.5e-3, 4k cosine) that floored char at 2.43 bits/char. BPE-1024
+compresses the corpus to ~2.54 chars/token.
+
+| tokeniser | vocab | train windows | best bits/char | overfit onset | baseline ratio |
+|---|---|---|---|---|---|
+| char | 100 | 4.82M | **2.43** | none (monotonic) | 0.057 |
+| BPE | 1024 | 1.97M | ~3.50 | step 500 | 0.767 |
+
+BPE lost on both counts and overfit almost immediately. The cause is
+not the LR this time but **data starvation**: 2.54 chars/token gives
+only 1.97M sliding windows (char had 4.82M) to fit the same ~8.5M
+parameters, and the near-random baseline ratio (0.767, vs char's
+0.057) shows the model barely learned the 1024-way distribution before
+memorising the smaller window set. The tuned recipe was calibrated to
+char's data volume; transplanted onto 2.5x fewer windows it overfits
+by step 500.
+
+Lesson: BPE's subword payoff is not free at this corpus size. It needs
+more data (or fewer parameters, or a gentler schedule matched to the
+smaller window count), not the char recipe copied across. At 5.36M
+chars, char tokenisation wins outright. A separate generation check on
+the char artefact explains what 2.43 bits/char buys: correct
+playscript structure and English word-morphology, but invented
+non-words rather than a real lexicon - the failure mode a well-fed BPE
+model would be expected to fix.
+
 ## Watching the run
 
 Most log lines look like this:
