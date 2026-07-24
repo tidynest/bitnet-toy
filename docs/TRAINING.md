@@ -320,6 +320,41 @@ keeps its peak in `models/<out>.best.f32.bin`, so a training run
 doubles as an early-stopping sweep. Reruns should read the `.best`
 artefact, not the final one.
 
+## LR schedule vs overfit: the full-corpus char study
+
+Training the shakespeare-large shape (hidden 256, ffn 1024, 16 heads,
+8 blocks, seq_len 128, ~8.5M params) on the 5.36M-char full works
+(`data/shakespeare-full.txt`) showed the overfit is **learning-rate
+driven, not capacity driven**. All three runs share the shape and
+corpus; only the LR schedule differs. `bits/char` is the best-val
+checkpoint, so it is directly comparable across runs.
+
+| run | steps | peak LR | cosine spans | best val_loss | bits/char | best step |
+|---|---|---|---|---|---|---|
+| 30k    | 30000 | 2.9e-3 | 30000 | 2.169 | 3.13 | 1500 (then overfit) |
+| tuned 4k | 4000 | 1.5e-3 | 4000  | 1.686 | 2.43 | 3999 |
+| tuned 8k | 8000 | 1.5e-3 | 8000  | **1.683** | **2.43** | 7500 |
+
+Two lessons:
+
+- **The 30k run's val bottomed at step 1500 and rose for the
+  remaining 28500** - not from exhausting the corpus but because the
+  cosine kept LR near peak (~2.9e-3) for thousands of steps. Best-val
+  (issue #28) froze the step-1500 artefact; the rest was wasted heat.
+  Halving the peak and shortening the cosine so LR decays *through*
+  the 1500-3000 zone removed the overfit entirely: the tuned runs'
+  val fell monotonically to the floor with no upturn.
+- **4k already hits the floor.** Doubling to 8k improved best val by
+  0.003 (1.686 -> 1.683) - noise. This shape at 1.5e-3 bottoms at
+  ~1.68 val / ~2.43 bits/char. Breaking below that needs a
+  capacity/architecture change (bigger hidden, longer seq_len, or a
+  different LR shape), not more steps.
+
+Takeaway for any new corpus: match the cosine length to the step
+budget and keep the peak LR low enough that LR is already decaying
+when val approaches its minimum. A long schedule at a hot peak buys
+overfit, not quality.
+
 ## Watching the run
 
 Most log lines look like this:
