@@ -2,7 +2,7 @@
 
 ![version](https://img.shields.io/badge/version-v0.19.0-3b6ea5)
 ![Rust](https://img.shields.io/badge/Rust-2024%20edition-ce412b?logo=rust&logoColor=white)
-![tests](https://img.shields.io/badge/tests-147%20passing-3f9142)
+![tests](https://img.shields.io/badge/tests-157%20passing-3f9142)
 ![CUDA](https://img.shields.io/badge/CUDA-optional%20(cudarc%200.19)-76b900?logo=nvidia&logoColor=white)
 ![ML dependencies](https://img.shields.io/badge/ML%20dependencies-none-3f9142)
 
@@ -28,13 +28,20 @@ inference, binary export. No third-party ML dependencies.
 
 ## Status
 
-- **147** tests passing on `cargo test`; **183** with `cargo test --features cuda`.
+- **157** tests passing on `cargo test`; **200** with `cargo test --features cuda`.
 - **0** warnings on `cargo build --release` (or `--features cuda`).
 - `cargo audit` clean for the default build (stdlib-only); the optional
   `cuda` feature pulls `cudarc` and its small dynamic-loading deps.
 - Trains end-to-end on the full TinyShakespeare corpus in ~8-15
-  minutes on CPU (v0.13 ~5M-param config); current best **val_ppl
-  4.869** at 30k cumulative steps.
+  minutes on CPU (v0.13 ~5M-param config).
+- Current best model: **2.263 bits/char** on the 5.36M-char complete
+  works (`models/full-char-seq256-b8.best.f32.bin`; ~8.5M params,
+  seq_len 256, batch 8, val_ppl 4.80 at step 3500 of 4000). Reached by
+  tuning the LR schedule and gradient throughput rather than by adding
+  parameters - a 2.25x larger 19M-param run scores *worse* (2.370).
+  Quality is measured in bits per character because per-token
+  perplexity is not comparable across vocabularies; `docs/TRAINING.md`
+  carries the full sweep and its negative results.
 - **Real BitNet ternary training runs on the GPU through Ada
   tensor cores.** Phase 5.a added STE quant kernels and a
   `BitLinear` trait; Phase 5.b rewrote the `CudaTensor` impl to
@@ -286,8 +293,12 @@ Milestones, in priority order:
 3. **Phase 6 - model fidelity & scale** - BF16 masters landed (#23); a
    hand-rolled byte-level BPE tokeniser landed (#24: `bpe <corpus>
    --vocab-size N`, checkpoint-embedded merges, bits/char metric for
-   cross-tokeniser comparisons). Open question: BPE vs char at a real
-   step budget (first 2k-step A/B: char 3.11 bits/char, BPE-1024 3.90).
+   cross-tokeniser comparisons). The BPE-vs-char question is now
+   settled at this corpus size: char wins outright (2.43 against BPE's
+   3.50 on the full works under an identical recipe), because BPE's
+   ~2.54 chars/token leaves only 1.97M sliding windows against char's
+   4.82M and the model memorises them by step 500. Subword needs more
+   text, not a longer run.
 4. **CPU SIMD & threading** - done: the persistent matmul thread pool (#7),
    Zen 4 AVX2 auto-select (v0.19), and the ARM64 NEON path (#6, bit-identity
    validated under qemu-aarch64; native perf numbers await real ARM hardware).
