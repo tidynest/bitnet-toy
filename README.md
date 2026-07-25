@@ -218,7 +218,7 @@ The importer in `export::import` reads any of the three formats, returning a
 
 ```sh
 cargo build --release       # optimised binary at target/release/bitnet-toy
-cargo test                  # runs 139 tests
+cargo test                  # runs 157 tests (200 with --features cuda)
 cargo fmt                   # apply rustfmt
 cargo clippy --all-targets  # extra lints (pedantic warnings allowed at crate level)
 cargo audit                 # security audit; trivially clean (no deps)
