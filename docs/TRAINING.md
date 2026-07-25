@@ -363,10 +363,13 @@ the ~2.43 bits/char floor. It was tested directly: same tuned recipe
 
 | run | seq_len | best val_loss | best bits/char | wall time |
 |---|---|---|---|---|
-| tuned 4k | 128 | 1.6858 | 2.432 | ~14 min |
-| seq256 4k | 256 | **1.6565** | **2.390** | ~25 min |
+| tuned 4k | 128 | 1.6858 | 2.432 | 22 min |
+| seq256 4k | 256 | **1.6565** | **2.390** | 35 min |
 
-A real but small win: **1.7% relative** for 1.8x the wall time. Two
+(Wall times are end-to-end: 4000 steps plus the final validation pass,
+generation samples and artefact writes.)
+
+A real but small win: **1.7% relative** for 1.6x the wall time. Two
 details matter more than the headline:
 
 - **The lead narrows.** seq256 was 0.064 val_loss ahead at step 2000
@@ -380,11 +383,40 @@ details matter more than the headline:
   ambiguous between context and throughput.
 
 Conclusion: the 2.43 floor was not a hard wall, but context length
-barely moved it. **~2.39 bits/char looks like the practical ceiling
-for this ~8.5M-parameter shape on a 5.36M-char corpus**, whatever the
-window length. The remaining levers are parameter count and corpus
+barely moved it. The remaining levers are parameter count and corpus
 size - and the BPE result above is the warning that more parameters
 against the same 4.82M windows can simply overfit instead.
+
+### Parameter count is the better lever (hidden 384)
+
+That warning was tested next. Same tuned recipe, `seq_len` held at 128
+so parameter count is the *only* change: `--hidden 384 --ffn 1536
+--heads 24` (~19M params against the baseline's ~8.5M, the ffn keeping
+the baseline's 4x ratio).
+
+| run | change | best val_loss | best bits/char | vs baseline | wall time |
+|---|---|---|---|---|---|
+| tuned 4k | baseline (h256, seq 128) | 1.6858 | 2.432 | - | 22 min |
+| seq256 4k | 2x context | 1.6565 | 2.390 | -1.7% | 35 min |
+| hidden384 4k | 2.25x parameters | **1.6429** | **2.370** | **-2.5%** | 38 min |
+
+**The BPE-style data starvation did not recur.** Validation fell
+monotonically to step 3999 with no upturn, so 4.82M windows still feed
+a ~19M-parameter model at a 4k budget. The BPE run's collapse was
+about its 1.97M windows, not about parameter count as such.
+
+But note the magnitudes: 2x context bought 1.7%, 2.25x parameters
+bought 2.5%. **Every axis gives a little and none gives a lot** -
+the signature of a model roughly balanced against its data, not one
+sharply bottlenecked on any single resource. Do not expect a further
+size bump to break the ~2.37-2.43 band on this corpus.
+
+One thread stays open: hidden384's validation was **still falling at
+step 3999** (1.659 -> 1.643). The 4k-vs-8k test above showed extending
+the schedule bought 0.003 - but that was the 8.5M model. A 19M model
+plausibly wants a longer schedule than 4k, so the 8k null result may
+not transfer, and hidden384 at 8k is the one cheap test with real
+upside left.
 
 ## Watching the run
 
