@@ -400,10 +400,12 @@ the baseline's 4x ratio).
 | seq256 4k | 2x context | 1.6565 | 2.390 | -1.7% | 35 min |
 | hidden384 4k | 2.25x parameters | **1.6429** | **2.370** | **-2.5%** | 38 min |
 
-**The BPE-style data starvation did not recur.** Validation fell
-monotonically to step 3999 with no upturn, so 4.82M windows still feed
-a ~19M-parameter model at a 4k budget. The BPE run's collapse was
-about its 1.97M windows, not about parameter count as such.
+**The BPE-style data starvation did not recur at this budget.**
+Validation fell monotonically to step 3999 with no upturn, so 4.82M
+windows still feed a ~19M-parameter model over 4000 steps. The BPE
+run's collapse was about its 1.97M windows, not about parameter count
+as such. (The 8k test below shows this holds *only* at this budget -
+the same model does starve given twice the steps.)
 
 But note the magnitudes: 2x context bought 1.7%, 2.25x parameters
 bought 2.5%. **Every axis gives a little and none gives a lot** -
@@ -411,12 +413,47 @@ the signature of a model roughly balanced against its data, not one
 sharply bottlenecked on any single resource. Do not expect a further
 size bump to break the ~2.37-2.43 band on this corpus.
 
-One thread stays open: hidden384's validation was **still falling at
-step 3999** (1.659 -> 1.643). The 4k-vs-8k test above showed extending
-the schedule bought 0.003 - but that was the 8.5M model. A 19M model
-plausibly wants a longer schedule than 4k, so the 8k null result may
-not transfer, and hidden384 at 8k is the one cheap test with real
-upside left.
+### A longer schedule makes the bigger model worse (hidden384 at 8k)
+
+hidden384's validation was still falling at step 3999 (1.659 ->
+1.643), and the earlier 4k-vs-8k null came from the 8.5M model, so the
+obvious hypothesis was that a 19M model simply wants a longer
+schedule. It does not. Same shape and peak LR, cosine doubled to 8000:
+
+| run | cosine | best val_loss | best bits/char | best step | end train/val gap |
+|---|---|---|---|---|---|
+| hidden384 4k | 4000 | **1.6429** | **2.370** | 3999 (still falling) | ~0 |
+| hidden384 8k | 8000 | 1.7145 | 2.473 | 7000 (then rose) | ~0.70 |
+
+Doubling the schedule cost **0.10 bits/char (4.3% relative)** and
+landed the 19M model back near the 8.5M baseline. Validation bottomed
+at step 7000 and then genuinely rose (1.7145 -> 1.7306 -> 1.7372),
+while `min_seen` train loss fell to 1.0318 against a final val of
+1.7372 - a ~0.70 generalisation gap where the 4k run had almost none.
+
+So the answer is the third possibility, not the hopeful one: **19M
+parameters do exhaust 4.82M windows.** The 4k run was not stopping
+early and leaving gains behind; its faster cosine decay simply reached
+a good minimum *before* memorisation set in. The extra 4000 steps of
+the 8k schedule are spent at higher LR for longer, and that is the
+window in which the model memorises - the same mechanism as the
+original 30k run, just milder.
+
+This closes the capacity investigation. Best result on this corpus
+remains **hidden384 at 4k, 2.370 bits/char**, and the ranking of
+levers is unambiguous:
+
+| lever | effect on bits/char |
+|---|---|
+| LR schedule shape | **3.13 -> 2.43 (the dominant factor)** |
+| 2.25x parameters | 2.432 -> 2.370 |
+| 2x context | 2.432 -> 2.390 |
+| 2x schedule length (big model) | 2.370 -> 2.473 (**worse**) |
+| BPE tokenisation | 3.50 (data-starved) |
+
+Schedule *shape* dominates every architectural knob tried, and once
+the shape is right, more steps actively hurt. To go meaningfully below
+~2.37 the corpus itself has to grow.
 
 ## Watching the run
 
