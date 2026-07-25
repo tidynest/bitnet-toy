@@ -638,8 +638,14 @@ the previous run's, you cannot resume from that previous checkpoint.
 
 ## Limitations to know about
 
-- The corpus must fit in memory. For TinyShakespeare (1.1 MB) this is fine;
-  for a 1 GB corpus you'd want streamed window iteration.
+- The corpus must fit in memory, but only *once*: training windows are
+  sliced from the id stream on demand rather than materialised
+  (`data::WindowSet`, issue #36), so resident memory is `O(corpus)`
+  rather than `O(corpus * seq_len)`. Before that change the 5.36M-char
+  corpus at `seq_len 256` peaked at **22.6 GB** and could not have gone
+  larger on a 30 GB machine; the same run now peaks at **1.72 GB**, a
+  13.1x reduction. Reading a corpus straight off disk in fixed chunks
+  would be the next step for something in the gigabyte range.
 - AdamW state IS persisted across `cargo run` invocations as of v0.7
   (BNT3 + OPTM payload). Old pre-v0.7 BNT3 checkpoints still load but
   the optimiser starts at zero momentum. The cosine LR schedule still
