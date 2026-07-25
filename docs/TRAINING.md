@@ -355,6 +355,37 @@ budget and keep the peak LR low enough that LR is already decaying
 when val approaches its minimum. A long schedule at a hot peak buys
 overfit, not quality.
 
+### Context length is not the lever (seq_len 256)
+
+The study above named "longer seq_len" as one candidate for breaking
+the ~2.43 bits/char floor. It was tested directly: same tuned recipe
+(1.5e-3 peak, 4k cosine), same shape, `--seq-len 128 -> 256`.
+
+| run | seq_len | best val_loss | best bits/char | wall time |
+|---|---|---|---|---|
+| tuned 4k | 128 | 1.6858 | 2.432 | ~14 min |
+| seq256 4k | 256 | **1.6565** | **2.390** | ~25 min |
+
+A real but small win: **1.7% relative** for 1.8x the wall time. Two
+details matter more than the headline:
+
+- **The lead narrows.** seq256 was 0.064 val_loss ahead at step 2000
+  but only 0.029 ahead at step 3999 - the seq128 run was catching up.
+  Much of the advantage is *faster convergence*, not a higher ceiling.
+- **The comparison is not a clean context ablation.** At `batch_size
+  4`, seq 256 processes 1024 tokens per step against seq 128's 512, so
+  the run also sees 2x the data per step. Isolating context alone
+  would need seq 256 at batch 2. `bits/char` is still a fair endpoint
+  metric (it is per-character), but the *cause* of the gain is
+  ambiguous between context and throughput.
+
+Conclusion: the 2.43 floor was not a hard wall, but context length
+barely moved it. **~2.39 bits/char looks like the practical ceiling
+for this ~8.5M-parameter shape on a 5.36M-char corpus**, whatever the
+window length. The remaining levers are parameter count and corpus
+size - and the BPE result above is the warning that more parameters
+against the same 4.82M windows can simply overfit instead.
+
 ## Watching the run
 
 Most log lines look like this:
