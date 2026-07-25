@@ -355,37 +355,63 @@ budget and keep the peak LR low enough that LR is already decaying
 when val approaches its minimum. A long schedule at a hot peak buys
 overfit, not quality.
 
-### Context length is not the lever (seq_len 256)
+### Batch size and context length: the 2x2 (the biggest win)
 
-The study above named "longer seq_len" as one candidate for breaking
-the ~2.43 bits/char floor. It was tested directly: same tuned recipe
-(1.5e-3 peak, 4k cosine), same shape, `--seq-len 128 -> 256`.
+The study above named "longer seq_len" as a candidate for breaking the
+~2.43 bits/char floor. The first test raised `--seq-len 128 -> 256` at
+the stock `batch_size 4` and gained 1.7% (2.432 -> 2.390), but that
+comparison is confounded: at batch 4, seq 256 processes 1024 tokens
+per step against seq 128's 512, so context length and throughput move
+together. Separating them took a full 2x2 over `{seq 128, 256}` x
+`{batch 2, 4, 8}`, every cell on the same tuned recipe (1.5e-3 peak,
+4k cosine, hidden 256).
 
-| run | seq_len | best val_loss | best bits/char | wall time |
-|---|---|---|---|---|
-| tuned 4k | 128 | 1.6858 | 2.432 | 22 min |
-| seq256 4k | 256 | **1.6565** | **2.390** | 35 min |
+Best bits/char per cell:
 
-(Wall times are end-to-end: 4000 steps plus the final validation pass,
-generation samples and artefact writes.)
+| | batch 2 | batch 4 | batch 8 |
+|---|---|---|---|
+| **seq 128** | - | 2.432 | 2.348 |
+| **seq 256** | 2.499 | 2.390 | **2.263** |
 
-A real but small win: **1.7% relative** for 1.6x the wall time. Two
-details matter more than the headline:
+Both levers are real, and **batch size is roughly twice the lever
+context length is**:
 
-- **The lead narrows.** seq256 was 0.064 val_loss ahead at step 2000
-  but only 0.029 ahead at step 3999 - the seq128 run was catching up.
-  Much of the advantage is *faster convergence*, not a higher ceiling.
-- **The comparison is not a clean context ablation.** At `batch_size
-  4`, seq 256 processes 1024 tokens per step against seq 128's 512, so
-  the run also sees 2x the data per step. Isolating context alone
-  would need seq 256 at batch 2. `bits/char` is still a fair endpoint
-  metric (it is per-character), but the *cause* of the gain is
-  ambiguous between context and throughput.
+- **Batch doubling** (seq 128, batch 4 -> 8): 2.432 -> 2.348, **-0.084**
+- **Batch halving** (seq 256, batch 4 -> 2): 2.390 -> 2.499, **+0.109**
+- **Context doubling at fixed batch 4**: 2.432 -> 2.390, **-0.042**
 
-Conclusion: the 2.43 floor was not a hard wall, but context length
-barely moved it. The remaining levers are parameter count and corpus
-size - and the BPE result above is the warning that more parameters
-against the same 4.82M windows can simply overfit instead.
+Read the cells carefully, because two natural shortcuts both give the
+wrong answer:
+
+- **Matching tokens per step is not the controlled comparison.** At a
+  fixed 512 tokens/step, seq 256 (batch 2) looks *worse* than seq 128
+  (batch 4) - 2.499 against 2.432. That is not context being harmful;
+  holding tokens/step fixed forces the batch down, and the batch
+  penalty (+0.109) simply exceeds the context gain (-0.042). What
+  matters is the number of independent sequences per gradient
+  estimate, not the token count.
+- **The effects are super-additive, so mid-run readings mislead.**
+  Main effects predict 2.432 - 0.084 - 0.042 = 2.306 for the seq 256 /
+  batch 8 corner; it actually reaches **2.263**, beating the additive
+  forecast by 0.043. The interaction is genuine, but it is *not*
+  visible as a stable lead during training: at step 1500 seq256/b8 led
+  seq128/b8 by 0.094, at step 2500 by only 0.031, and it still ended
+  ahead. Longer-context runs converge faster early and give much of
+  that back, so only end-of-schedule numbers are comparable.
+
+**This is the largest win after the LR schedule itself**: 2.432 ->
+2.263, **-6.9%**, at unchanged parameter count. It also beats the
+hidden-384 capacity result below (2.370) without adding a single
+weight, so reach for batch size and context before reaching for a
+bigger model.
+
+One caution comes with the winning cell. Its best checkpoint lands at
+step **3500, not 3999** - the only arm in the sweep where the end of
+the schedule was not the best point - and it finishes with a ~0.55
+train/val gap. That is the leading edge of the same overfit documented
+under the 8k run below: at batch 8 the model consumes 2048 tokens per
+step against a fixed 4.82M-window corpus. Best-val (issue #28) caught
+the turn, which is exactly what it exists for.
 
 ### Parameter count is the better lever (hidden 384)
 
@@ -407,11 +433,15 @@ run's collapse was about its 1.97M windows, not about parameter count
 as such. (The 8k test below shows this holds *only* at this budget -
 the same model does starve given twice the steps.)
 
-But note the magnitudes: 2x context bought 1.7%, 2.25x parameters
-bought 2.5%. **Every axis gives a little and none gives a lot** -
-the signature of a model roughly balanced against its data, not one
-sharply bottlenecked on any single resource. Do not expect a further
-size bump to break the ~2.37-2.43 band on this corpus.
+Note the magnitudes against the 2x2 above: 2.25x parameters bought
+2.5%, while batch 8 with seq 256 bought 6.9% at unchanged parameter
+count. **Capacity is the weakest of the three levers tested.** An
+earlier revision of this section read the small per-axis gains as a
+model "balanced against its data" and predicted a ~2.37-2.43 band
+that no size bump would break; the 2x2 broke it to 2.263 without
+adding a weight, so that reading was wrong. The gains were small
+because parameter count specifically was near its useful limit here,
+not because every axis was.
 
 ### A longer schedule makes the bigger model worse (hidden384 at 8k)
 
@@ -439,21 +469,36 @@ the 8k schedule are spent at higher LR for longer, and that is the
 window in which the model memorises - the same mechanism as the
 original 30k run, just milder.
 
-This closes the capacity investigation. Best result on this corpus
-remains **hidden384 at 4k, 2.370 bits/char**, and the ranking of
-levers is unambiguous:
+This closes the schedule-length question. Combined with the 2x2 above,
+the full ranking of everything tried on this corpus:
 
 | lever | effect on bits/char |
 |---|---|
 | LR schedule shape | **3.13 -> 2.43 (the dominant factor)** |
+| 2x batch **and** 2x context together | **2.432 -> 2.263 (best model)** |
+| 2x batch (seq 128) | 2.432 -> 2.348 |
+| 2x context (batch 4) | 2.432 -> 2.390 |
 | 2.25x parameters | 2.432 -> 2.370 |
-| 2x context | 2.432 -> 2.390 |
 | 2x schedule length (big model) | 2.370 -> 2.473 (**worse**) |
 | BPE tokenisation | 3.50 (data-starved) |
 
-Schedule *shape* dominates every architectural knob tried, and once
-the shape is right, more steps actively hurt. To go meaningfully below
-~2.37 the corpus itself has to grow.
+Best artefact on this corpus: **seq 256 / batch 8 at hidden 256,
+2.263 bits/char** (`models/full-char-seq256-b8.best.f32.bin`).
+
+Two rules generalise out of the whole sweep:
+
+1. **Schedule shape beats every architectural knob**, and once the
+   shape is right, more steps actively hurt.
+2. **Gradient quality beats model size.** Batch size, context length
+   and parameter count all help, but the first two together (-6.9%)
+   outrun 2.25x the parameters (-2.5%) at no extra weight. Every
+   failure in this sweep - BPE's 1.97M windows, the 8k run's
+   memorisation, the batch-2 arm - traces back to how much
+   *independent* signal each gradient step sees.
+
+The corpus is still the standing limit: 4.82M windows now support a
+2.263 bits/char model, but the winning cell already turns over at step
+3500, so the next real gain needs more text rather than another knob.
 
 ## Watching the run
 
