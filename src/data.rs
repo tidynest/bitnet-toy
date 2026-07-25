@@ -132,6 +132,13 @@ impl Tokeniser {
 ///
 /// Number of windows = `ids.len() - seq_len`. Caller must ensure
 /// `ids.len() > seq_len` so at least one window exists.
+///
+/// The training path uses [`WindowSet`] instead (issue #36): materialising
+/// every pair costs `O(corpus * seq_len)` memory for data that is already
+/// in the id stream. This is kept as the reference implementation the
+/// `WindowSet` tests pin against, and as a reasonable API for a caller who
+/// genuinely wants owned pairs.
+#[allow(dead_code)]
 pub fn make_windows(ids: &[usize], seq_len: usize) -> Vec<(Vec<usize>, Vec<usize>)> {
     assert!(
         ids.len() > seq_len,
@@ -148,6 +155,78 @@ pub fn make_windows(ids: &[usize], seq_len: usize) -> Vec<(Vec<usize>, Vec<usize
         windows.push((input, target));
     }
     windows
+}
+
+/// Zero-copy view over every sliding window of a token stream (issue #36).
+///
+/// Window `i` is exactly what `make_windows` would produce at index `i`:
+/// `(ids[i .. i+seq], ids[i+1 .. i+seq+1])`. The difference is that nothing
+/// is copied - the pairs are sliced on demand, so memory is `O(corpus)`
+/// instead of `O(corpus * seq_len)`.
+///
+/// That distinction is not academic. `make_windows` allocates two owned
+/// `Vec<usize>` per character of corpus, so the 5.36M-char corpus costs
+/// ~9.9 GB at `seq_len 128` and ~19.7 GB at 256 - enough that the seq-256
+/// training runs sat at ~22 GB on a 30 GB machine, and enough to make any
+/// larger corpus impossible. The same data as a `WindowSet` is ~43 MB.
+///
+/// `make_windows` is kept for callers that genuinely want owned pairs (and
+/// for the tests that pin this type against it).
+#[derive(Debug, Clone, Copy)]
+pub struct WindowSet<'a> {
+    ids: &'a [usize],
+    seq: usize,
+}
+
+impl<'a> WindowSet<'a> {
+    /// Borrow `ids` as a window set of length `seq`. Caller must ensure
+    /// `ids.len() > seq` so at least one window exists - same contract as
+    /// `make_windows`, and asserted the same way.
+    pub fn new(ids: &'a [usize], seq: usize) -> Self {
+        assert!(
+            ids.len() > seq,
+            "corpus has {} ids, seq_len = {} - need ids.len() > seq_len",
+            ids.len(),
+            seq
+        );
+        Self { ids, seq }
+    }
+
+    /// A set with no windows, for the case where a split is too short to
+    /// yield any (a tiny validation tail). Callers guard on `is_empty`
+    /// rather than treating this as an error.
+    pub fn empty() -> Self {
+        Self { ids: &[], seq: 0 }
+    }
+
+    /// Number of windows, identical to `make_windows(ids, seq).len()`.
+    /// Saturating so the `empty()` case stays well-defined.
+    pub fn len(&self) -> usize {
+        self.ids.len().saturating_sub(self.seq)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Window length; every window in the set shares it.
+    pub fn seq_len(&self) -> usize {
+        self.seq
+    }
+
+    /// The `(input, target)` slices for window `i`. Panics on out-of-range
+    /// `i`: a bad index is a bug, not a runtime condition.
+    pub fn get(&self, i: usize) -> (&'a [usize], &'a [usize]) {
+        assert!(
+            i < self.len(),
+            "window {i} out of range (len {})",
+            self.len()
+        );
+        (
+            &self.ids[i..i + self.seq],
+            &self.ids[i + 1..i + self.seq + 1],
+        )
+    }
 }
 
 /// Read a UTF-8 corpus from disk. Trivial wrapper around `fs::read_to_string`,
@@ -275,6 +354,48 @@ mod tests {
     fn make_windows_panics_when_corpus_too_short() {
         // ids.len() == seq_len → 0 windows → assertion fires.
         let _ = make_windows(&[1, 2, 3], 3);
+    }
+
+    /// The load-bearing property of issue #36: the lazy view must be
+    /// indistinguishable from the materialised pairs, window for window.
+    /// If this holds, swapping the training path over cannot change which
+    /// data a given seed sees.
+    #[test]
+    fn window_set_matches_make_windows_exactly() {
+        let ids: Vec<usize> = (0..500).map(|i| (i * 7 + 3) % 97).collect();
+        for seq in [1_usize, 3, 64, 128] {
+            let owned = make_windows(&ids, seq);
+            let lazy = WindowSet::new(&ids, seq);
+            assert_eq!(lazy.len(), owned.len(), "window count differs at seq {seq}");
+            assert_eq!(lazy.seq_len(), seq);
+            for i in 0..owned.len() {
+                let (inp, tgt) = lazy.get(i);
+                assert_eq!(
+                    inp,
+                    &owned[i].0[..],
+                    "input differs at seq {seq}, window {i}"
+                );
+                assert_eq!(
+                    tgt,
+                    &owned[i].1[..],
+                    "target differs at seq {seq}, window {i}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic]
+    fn window_set_panics_when_corpus_too_short() {
+        // Same contract as make_windows: ids.len() == seq_len → no windows.
+        let _ = WindowSet::new(&[1, 2, 3], 3);
+    }
+
+    #[test]
+    #[should_panic]
+    fn window_set_panics_on_out_of_range_index() {
+        let ids = [1, 2, 3, 4, 5];
+        WindowSet::new(&ids, 3).get(2); // len() == 2, so index 2 is past the end
     }
 
     #[test]

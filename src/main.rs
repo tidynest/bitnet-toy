@@ -514,7 +514,7 @@ fn compute_grads_for_window(
 /// batch sees - only the wall-clock cost of processing them.
 fn compute_batched_grads(
     model: &crate::model::Model,
-    windows: &[(Vec<usize>, Vec<usize>)],
+    windows: &crate::data::WindowSet<'_>,
     rng: &mut crate::data::Lcg,
     batch_size: usize,
     n_workers: usize,
@@ -533,7 +533,7 @@ fn compute_batched_grads(
         indices
             .iter()
             .map(|&i| {
-                let (input, target) = &windows[i];
+                let (input, target) = windows.get(i);
                 compute_grads_for_window(model, input, target)
             })
             .collect()
@@ -553,7 +553,7 @@ fn compute_batched_grads(
                         chunk_indices
                             .iter()
                             .map(|&i| {
-                                let (input, target) = &windows[i];
+                                let (input, target) = windows.get(i);
                                 compute_grads_for_window(model, input, target)
                             })
                             .collect::<Vec<_>>()
@@ -636,21 +636,22 @@ fn ensure_cuda_step_graph(
 /// Sample `batch_size` window indices (identical RNG consumption to the
 /// CPU path, so data order matches at the same seed) and concatenate
 /// the chosen windows into one ids slab + one targets slab (issue #22).
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 fn sample_batch_slab(
-    windows: &[(Vec<usize>, Vec<usize>)],
+    windows: &crate::data::WindowSet<'_>,
     rng: &mut crate::data::Lcg,
     batch_size: usize,
 ) -> (Vec<usize>, Vec<usize>) {
     let indices: Vec<usize> = (0..batch_size)
         .map(|_| rng.gen_range(windows.len()))
         .collect();
-    let seq = windows[0].0.len();
+    let seq = windows.seq_len();
     let mut ids = Vec::with_capacity(batch_size * seq);
     let mut targets = Vec::with_capacity(batch_size * seq);
     for &idx in &indices {
-        ids.extend_from_slice(&windows[idx].0);
-        targets.extend_from_slice(&windows[idx].1);
+        let (input, target) = windows.get(idx);
+        ids.extend_from_slice(input);
+        targets.extend_from_slice(target);
     }
     (ids, targets)
 }
@@ -668,14 +669,14 @@ fn cuda_device_train_step(
     step_graph: &mut Option<crate::cuda::CudaStepGraph>,
     dev_opt: &mut crate::cuda::CudaAdamW,
     bufs: &mut crate::cuda::StepBuffers,
-    windows: &[(Vec<usize>, Vec<usize>)],
+    windows: &crate::data::WindowSet<'_>,
     rng: &mut crate::data::Lcg,
     batch_size: usize,
     lr: f32,
     grad_clip: f32,
 ) -> (f32, f32) {
     assert!(batch_size >= 1, "batch_size must be >= 1");
-    let seq = windows[0].0.len();
+    let seq = windows.seq_len();
     ensure_cuda_step_graph(cuda_model, step_graph, seq, batch_size);
     let (ids, targets) = sample_batch_slab(windows, rng, batch_size);
     let loss = match step_graph.as_mut() {
@@ -715,12 +716,12 @@ fn cuda_device_train_step(
 fn compute_batched_grads_cuda_bitnet(
     cuda_model: &crate::cuda::CudaModel,
     step_graph: &mut Option<crate::cuda::CudaStepGraph>,
-    windows: &[(Vec<usize>, Vec<usize>)],
+    windows: &crate::data::WindowSet<'_>,
     rng: &mut crate::data::Lcg,
     batch_size: usize,
 ) -> (Vec<crate::tensor::Tensor>, f32) {
     assert!(batch_size >= 1, "batch_size must be >= 1");
-    let seq = windows[0].0.len();
+    let seq = windows.seq_len();
     ensure_cuda_step_graph(cuda_model, step_graph, seq, batch_size);
     let (ids, targets) = sample_batch_slab(windows, rng, batch_size);
     // Issue #22: the batched step core computes the whole batch in one
@@ -744,7 +745,7 @@ fn compute_batched_grads_cuda_bitnet(
 /// drawn that time.
 pub fn eval_val_perplexity(
     model: &crate::model::Model,
-    val_windows: &[(Vec<usize>, Vec<usize>)],
+    val_windows: &crate::data::WindowSet<'_>,
     n_samples: usize,
 ) -> (f32, f32) {
     if val_windows.is_empty() || n_samples == 0 {
@@ -755,7 +756,7 @@ pub fn eval_val_perplexity(
     let mut total_ce = 0.0_f32;
     let mut count = 0_usize;
     for i in 0..n {
-        let (input, target) = &val_windows[i * stride];
+        let (input, target) = val_windows.get(i * stride);
         let tape = Tape::new();
         let leaves = model.register_leaves(&tape);
         let logits = model.forward(&leaves, input);
@@ -787,7 +788,7 @@ fn train_bitnet_lm(
     crate::data::Tokeniser,
     crate::optim::OptimState,
 ) {
-    use crate::data::{Lcg, TINY_CORPUS, Vocab, make_windows, read_corpus};
+    use crate::data::{Lcg, TINY_CORPUS, Vocab, read_corpus};
     use crate::model::Model;
     use crate::optim::{AdamW, clip_grad_norm_tensors, cosine_lr};
 
@@ -867,11 +868,14 @@ fn train_bitnet_lm(
     let train_ids = &ids[..train_end];
     let val_ids = &ids[train_end..];
 
-    let windows = make_windows(train_ids, model_cfg.max_seq_len);
+    // Issue #36: windows are sliced on demand, not materialised. At
+    // seq_len 256 the owned form cost ~20 GB on the 5.36M-char corpus;
+    // this borrows the id stream instead, so memory is O(corpus).
+    let windows = crate::data::WindowSet::new(train_ids, model_cfg.max_seq_len);
     let val_windows = if val_ids.len() > model_cfg.max_seq_len + 1 {
-        make_windows(val_ids, model_cfg.max_seq_len)
+        crate::data::WindowSet::new(val_ids, model_cfg.max_seq_len)
     } else {
-        Vec::new()
+        crate::data::WindowSet::empty()
     };
 
     let mut rng = Lcg::new(cfg.seed ^ 0xDEADBEEF);
@@ -934,7 +938,8 @@ fn train_bitnet_lm(
         logits.cross_entropy(target).value().data[0]
     };
 
-    let (input0, target0) = (windows[0].0.clone(), windows[0].1.clone());
+    let (w0_in, w0_tgt) = windows.get(0);
+    let (input0, target0) = (w0_in.to_vec(), w0_tgt.to_vec());
     let initial_loss = eval_loss(&model, &input0, &target0);
     let mut min_loss = initial_loss;
     // Issue #28: best mid-run validation seen, and where it happened.
@@ -1025,7 +1030,7 @@ fn train_bitnet_lm(
                         Some(b) => b,
                         // Slab buffers: batch * seq rows (issue #22).
                         None => cuda_step_bufs
-                            .insert(cm.alloc_step_buffers(batch_size * windows[0].0.len())),
+                            .insert(cm.alloc_step_buffers(batch_size * windows.seq_len())),
                     };
                     let (loss, norm) = cuda_device_train_step(
                         cm,
@@ -2527,7 +2532,7 @@ fn run_cuda_demo() {
 #[cfg(feature = "cuda")]
 fn run_cuda_train_demo() {
     use crate::cuda::{CudaModel, cuda_state};
-    use crate::data::{Lcg, TINY_CORPUS, Vocab, make_windows};
+    use crate::data::{Lcg, TINY_CORPUS, Vocab, WindowSet};
     use crate::model::{Model, ModelConfig};
     use crate::optim::{AdamW, clip_grad_norm_tensors};
     use std::time::Instant;
@@ -2562,7 +2567,7 @@ fn run_cuda_train_demo() {
     let peak_lr = 5e-3_f32;
 
     let ids = vocab.encode(TINY_CORPUS);
-    let windows = make_windows(&ids, model_cfg.max_seq_len);
+    let windows = WindowSet::new(&ids, model_cfg.max_seq_len);
     assert!(!windows.is_empty(), "TINY_CORPUS produced no windows");
     let mut rng = Lcg::new(1337);
 
@@ -2589,7 +2594,7 @@ fn run_cuda_train_demo() {
     let mut cuda_model = CudaModel::from_cpu(&model);
     for step in 0..n_steps {
         let idx = rng.gen_range(windows.len());
-        let (input, target) = &windows[idx];
+        let (input, target) = windows.get(idx);
         if step > 0 {
             cuda_model.sync_from_cpu(&model);
         }
@@ -2931,7 +2936,7 @@ mod tests {
     /// close to the baseline; trained perplexity drops below it.
     #[test]
     fn eval_val_perplexity_returns_sensible_values() {
-        use crate::data::{TINY_CORPUS, Vocab, make_windows};
+        use crate::data::{TINY_CORPUS, Vocab, WindowSet};
         use crate::model::{Model, ModelConfig};
 
         let vocab = Vocab::from_text(TINY_CORPUS);
@@ -2946,7 +2951,7 @@ mod tests {
             n_blocks: 1,
         };
         let model = Model::new(&cfg, 42);
-        let val_windows = make_windows(&ids, cfg.max_seq_len);
+        let val_windows = WindowSet::new(&ids, cfg.max_seq_len);
 
         let (val_loss, val_ppl) = eval_val_perplexity(&model, &val_windows, 16);
 
@@ -2967,6 +2972,51 @@ mod tests {
         );
     }
 
+    /// Issue #36's load-bearing guarantee: swapping the materialised
+    /// windows for the lazy `WindowSet` must not change which data a given
+    /// seed sees. Both paths draw indices with the same `gen_range` calls
+    /// in the same order, so the assembled batch slabs have to come out
+    /// byte-identical - otherwise every number already recorded in
+    /// `docs/TRAINING.md` would silently stop being comparable to new runs.
+    ///
+    /// Reimplements the old materialised slab here rather than keeping the
+    /// dead code in the binary: `make_windows` is still the reference for
+    /// what a window *is*, so building from it is a genuine cross-check.
+    #[test]
+    fn lazy_window_batches_match_the_materialised_path() {
+        use crate::data::{Lcg, TINY_CORPUS, Vocab, WindowSet, make_windows};
+
+        let vocab = Vocab::from_text(TINY_CORPUS);
+        let ids = vocab.encode(TINY_CORPUS);
+
+        for (seq, batch) in [(4_usize, 1_usize), (8, 4), (16, 8)] {
+            let owned = make_windows(&ids, seq);
+            let lazy = WindowSet::new(&ids, seq);
+
+            // The old sample_batch_slab, verbatim in behaviour.
+            let mut rng_owned = Lcg::new(0x5EED ^ seq as u64);
+            let indices: Vec<usize> = (0..batch)
+                .map(|_| rng_owned.gen_range(owned.len()))
+                .collect();
+            let mut want_ids = Vec::new();
+            let mut want_targets = Vec::new();
+            for &i in &indices {
+                want_ids.extend_from_slice(&owned[i].0);
+                want_targets.extend_from_slice(&owned[i].1);
+            }
+
+            let mut rng_lazy = Lcg::new(0x5EED ^ seq as u64);
+            let (got_ids, got_targets) = sample_batch_slab(&lazy, &mut rng_lazy, batch);
+
+            assert_eq!(got_ids, want_ids, "ids differ at seq {seq}, batch {batch}");
+            assert_eq!(
+                got_targets, want_targets,
+                "targets differ at seq {seq}, batch {batch}"
+            );
+            assert_eq!(got_ids.len(), batch * seq, "slab is not batch * seq long");
+        }
+    }
+
     /// Parallel batched gradients must match the serial-batched result
     /// numerically. Same RNG state, same windows sampled in the same order,
     /// same per-window forward+backward; only the dispatch differs. Float
@@ -2974,7 +3024,7 @@ mod tests {
     /// drift is at machine-epsilon level.
     #[test]
     fn compute_batched_grads_parallel_matches_serial() {
-        use crate::data::{Lcg, TINY_CORPUS, Vocab, make_windows};
+        use crate::data::{Lcg, TINY_CORPUS, Vocab};
         use crate::model::{Model, ModelConfig};
 
         let vocab = Vocab::from_text(TINY_CORPUS);
@@ -2989,7 +3039,7 @@ mod tests {
             n_blocks: 1,
         };
         let model = Model::new(&cfg, 99);
-        let windows = make_windows(&ids, cfg.max_seq_len);
+        let windows = crate::data::WindowSet::new(&ids, cfg.max_seq_len);
 
         let mut rng_a = Lcg::new(0xBEEFCAFE);
         let (grads_serial, loss_serial) = compute_batched_grads(&model, &windows, &mut rng_a, 4, 1);
@@ -3051,11 +3101,12 @@ mod tests {
         };
         let model = Model::new(&cfg, 0);
 
-        let (loss_a, ppl_a) = eval_val_perplexity(&model, &[], 8);
+        let (loss_a, ppl_a) = eval_val_perplexity(&model, &crate::data::WindowSet::empty(), 8);
         assert!(loss_a.is_nan(), "expected NaN val_loss for empty windows");
         assert!(ppl_a.is_nan(), "expected NaN val_ppl for empty windows");
 
-        let dummy = vec![(vec![0_usize; 4], vec![1_usize; 4])];
+        let dummy_ids = [0_usize, 1, 2, 3, 4];
+        let dummy = crate::data::WindowSet::new(&dummy_ids, 4);
         let (loss_b, ppl_b) = eval_val_perplexity(&model, &dummy, 0);
         assert!(loss_b.is_nan(), "expected NaN val_loss for n_samples=0");
         assert!(ppl_b.is_nan(), "expected NaN val_ppl for n_samples=0");
