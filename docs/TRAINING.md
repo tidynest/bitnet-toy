@@ -12,6 +12,8 @@ How to train, what to expect, what to watch for, and what knobs to turn.
 - [Training any corpus: the train subcommand](#training-any-corpus-the-train-subcommand)
 - [GPU vs CPU benchmark](#gpu-vs-cpu-benchmark-issue-4)
 - [BPE tokenisation](#bpe-tokenisation-issue-24)
+- [LR schedule vs overfit](#lr-schedule-vs-overfit-the-full-corpus-char-study) - plus the batch/context 2x2 and capacity results
+- [Scaling the corpus](#scaling-the-corpus-5885m-chars) - and the conclusion it corrected
 - [Watching the run](#watching-the-run)
 - [Generation modes](#generation-modes)
 - [Tuning](#tuning)
@@ -513,26 +515,123 @@ the full ranking of everything tried on this corpus:
 | 2x batch (seq 128) | 2.432 -> 2.348 |
 | 2x context (batch 4) | 2.432 -> 2.390 |
 | 2.25x parameters | 2.432 -> 2.370 |
-| 2x schedule length (big model) | 2.370 -> 2.473 (**worse**) |
+| 2x schedule length (big model) | 2.370 -> 2.473 (**worse, but see below**) |
 | BPE tokenisation | 3.50 (data-starved) |
 
 Best artefact on this corpus: **seq 256 / batch 8 at hidden 256,
 2.263 bits/char** (`models/full-char-seq256-b8.best.f32.bin`).
 
-Two rules generalise out of the whole sweep:
+Two rules generalise out of the sweep, but only one of them survived
+contact with a bigger corpus:
 
-1. **Schedule shape beats every architectural knob**, and once the
-   shape is right, more steps actively hurt.
-2. **Gradient quality beats model size.** Batch size, context length
+1. **Gradient quality beats model size.** Batch size, context length
    and parameter count all help, but the first two together (-6.9%)
    outrun 2.25x the parameters (-2.5%) at no extra weight. Every
    failure in this sweep - BPE's 1.97M windows, the 8k run's
    memorisation, the batch-2 arm - traces back to how much
-   *independent* signal each gradient step sees.
+   *independent* signal each gradient step sees. This one held up.
+2. **Schedule shape beats every architectural knob.** True, and still
+   true. An earlier revision added "and once the shape is right, more
+   steps actively hurt", generalising from the 8k row above. That
+   second clause was **wrong**, and the section below shows why: it
+   was a fact about 4.82M windows, not about schedules.
 
-The corpus is still the standing limit: 4.82M windows now support a
-2.263 bits/char model, but the winning cell already turns over at step
-3500, so the next real gain needs more text rather than another knob.
+The corpus is the standing limit: 4.82M windows support a 2.263
+bits/char model, but the winning cell already turns over at step 3500,
+so the next real gain needs more text rather than another knob. That
+prediction is tested directly below, and it holds.
+
+## Scaling the corpus (58.85M chars)
+
+Every conclusion above was drawn on 5.36M characters of one author.
+`data/gutenberg-lit.txt` is 11x that, and it changes one of them.
+
+### Building the corpus
+
+Reproducible from the official metadata, so the composition is not a
+matter of anyone's recall:
+
+1. Fetch `https://www.gutenberg.org/cache/epub/feeds/pg_catalog.csv`
+   (21 MB).
+2. Keep `Type == Text`, `Language == en`, and LoCC in `{PR, PS}` -
+   English and American *literature*, excluding technical and
+   reference material. That leaves 21,893 records.
+3. Sample 200 evenly across the ID range, so the set spans accession
+   eras rather than clustering on early low-numbered texts.
+4. Download each as `cache/epub/<id>/pg<id>.txt`, one request per
+   second with an identifying user-agent. Project Gutenberg asks
+   bulk users to be gentle; 200 files at that rate is fine, a
+   full-catalogue scrape is not (use a mirror for that).
+5. Strip the `*** START/END OF THE PROJECT GUTENBERG EBOOK ***`
+   boilerplate, normalise CRLF to LF, drop texts under 2 KB.
+6. Drop characters occurring fewer than 1000 times. This is the one
+   judgement call: the raw text has **291** distinct characters, most
+   of them a singleton tail of Greek quotations and stray symbols.
+   Keeping them would nearly triple the output layer to buy 0.034% of
+   the text. At the 1000 threshold the vocabulary is **89**, close
+   enough to Shakespeare's 100 that model shape and the uniform
+   baseline stay comparable.
+
+Result: **58,847,646 characters, vocab 89, 52.96M training windows**
+at `seq_len 256`.
+
+This corpus is only usable because of issue #36. Under the old
+materialising window path it would have wanted roughly **2.4 TB** of
+resident memory; it now trains at **2.27 GB**.
+
+### The schedule rule was really a data rule
+
+The same 4k-vs-8k manipulation that made the larger Shakespeare model
+*worse* makes this one substantially **better**. Same recipe, same
+shape (hidden 256, seq 256, batch 8, 1.5e-3 peak), one variable
+changed between the two settings - the corpus.
+
+| corpus | windows | 4k best | 8k best | effect of 2x schedule |
+|---|---|---|---|---|
+| Shakespeare | 4.82M | 2.370 | 2.473 | **worse by 0.103** |
+| Gutenberg | 52.96M | 2.170 | **1.986** | **better by 0.184** |
+
+The mechanism shows up in the train/val gap, which is what actually
+distinguishes the two cases:
+
+| run | best step | end train/val gap |
+|---|---|---|
+| Shakespeare 8k | 7000, then rose | ~0.70 |
+| Gutenberg 4k | 3999 (last step) | 0.222 |
+| Gutenberg 8k | 7999 (last step) | 0.146 |
+
+On Shakespeare the extra 4000 steps were spent memorising a fixed
+window set, so validation turned over at 7000. Here neither run turns
+over at all - both end at their final step, still descending - because
+8k steps at batch 8 consume 16.4M tokens against 52.96M windows, under
+a third of an epoch. There is nothing to memorise yet.
+
+So "more steps hurt" was never a property of schedules. It was data
+exhaustion wearing a schedule costume, and doubling the budget only
+reached the wall sooner.
+
+### Where this leaves things
+
+Best model in the project: **1.969 bits/char** on the final-validation
+pass (`models/gutenberg-8k.best.f32.bin`, 8k steps), the first result
+under 2.0.
+
+Two caveats worth keeping attached to that number:
+
+- **It is not comparable to the 2.263 Shakespeare result.** Different
+  domain and a different vocabulary (89 against 100), and the smaller
+  vocabulary mechanically lowers per-character loss. Cross-corpus
+  bits/char is indicative, not a like-for-like ranking. The
+  *within*-corpus comparisons on this page are the sound ones.
+- **It does not show that schedules scale indefinitely.** It shows
+  they scale while data lasts. At 8k steps this corpus is still under
+  a third of an epoch; the interesting question is where the turnover
+  reappears, and that has not been located yet.
+
+Open from here: batch 16 (the lever the Shakespeare sweep had to defer
+for lack of data), a longer schedule still, and a larger model - all
+three now testable for the first time, because the corpus is no longer
+the binding constraint.
 
 ## Watching the run
 
