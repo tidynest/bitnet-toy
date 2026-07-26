@@ -732,18 +732,30 @@ pub fn attention_head_forward_save_bitnet<T>(
     window: usize,
 ) -> (T, AttentionHeadSaved<T>)
 where
-    T: MatMul + MulScalar + Transpose2D + Softmax + CausalMask + Rope + BitLinear,
+    T: MatMul
+        + MulScalar
+        + Transpose2D
+        + Softmax
+        + CausalMask
+        + Rope
+        + BitLinear
+        + BlockedAttention,
 {
     let q = x.bit_linear(w_q).rope(window);
     let k = x.bit_linear(w_k).rope(window);
     let v = x.bit_linear(w_v);
     let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    // Issue #39: scores are [rows, window], not [rows, rows]. The old
+    // path built the full cross-sequence matrix and masked it back down
+    // to this same block diagonal, so the maths is unchanged; what goes
+    // away is allocating and differentiating through the 94% of cells
+    // that were always -inf at batch 16.
     let scores = q
-        .matmul(&k.transpose_2d())
+        .blocked_qkt(&k, window)
         .mul_scalar(scale)
-        .causal_mask(window);
+        .causal_mask_blocked(window);
     let attn = scores.softmax();
-    let ctx = attn.matmul(&v);
+    let ctx = attn.blocked_av(&v, window);
     let out = ctx.bit_linear(w_o);
     let saved = AttentionHeadSaved { q, k, v, attn, ctx };
     (out, saved)
@@ -779,19 +791,31 @@ where
         + CausalMaskBackward
         + RopeBackward
         + QuantiseActsSTE
-        + QuantiseWeightsSTE,
+        + QuantiseWeightsSTE
+        + BlockedAttention,
 {
     // out = bit_linear(ctx, w_o)
     let (grad_ctx, grad_w_o) = bit_linear_backward(grad_out, &saved.ctx, w_o);
-    // ctx = attn @ v   (act @ act, NOT quantised)
-    let (grad_attn, grad_v) = matmul_backward(&grad_ctx, &saved.attn, &saved.v);
+    // ctx = blocked_av(attn, v)   (act @ act, NOT quantised)
+    //
+    // Issue #39: the two blocked products differentiate into each other,
+    // so the backward pass needs no kernels of its own. With scores held
+    // as [rows, window]:
+    //   grad_attn[i, j] = dot(grad_ctx[i], v[block_start(i) + j])
+    //                   = blocked_qkt(grad_ctx, v)
+    //   grad_v[bs + r]  = sum_i attn[i, r] * grad_ctx[i]
+    //                   = blocked_atv(attn, grad_ctx)
+    let grad_attn = grad_ctx.blocked_qkt(&saved.v, window);
+    let grad_v = saved.attn.blocked_atv(&grad_ctx, window);
     let grad_scores_msk = softmax_backward(&grad_attn, &saved.attn);
-    let grad_scores_scl = causal_mask_backward(&grad_scores_msk, window);
+    let grad_scores_scl = grad_scores_msk.causal_mask_blocked_backward(window);
     let scale = 1.0_f32 / (head_dim as f32).sqrt();
     let grad_scores_raw = mul_scalar_backward(&grad_scores_scl, scale);
-    let kt = saved.k.transpose_2d();
-    let (grad_q_post, grad_kt) = matmul_backward(&grad_scores_raw, &saved.q, &kt);
-    let grad_k_post = grad_kt.transpose_2d();
+    // scores = blocked_qkt(q, k), mirroring the pair above:
+    //   grad_q[i]      = sum_j grad_scores[i, j] * k[bs(i) + j]
+    //   grad_k[bs + r] = sum_i grad_scores[i, r] * q[i]
+    let grad_q_post = grad_scores_raw.blocked_av(&saved.k, window);
+    let grad_k_post = grad_scores_raw.blocked_atv(&saved.q, window);
     let grad_q_pre = rope_backward(&grad_q_post, window);
     let grad_k_pre = rope_backward(&grad_k_post, window);
     // v = bit_linear(x, w_v)
@@ -890,7 +914,8 @@ where
         + RmsNorm
         + Silu
         + Mul
-        + BitLinear,
+        + BitLinear
+        + BlockedAttention,
 {
     assert!(
         !heads.is_empty(),
@@ -956,6 +981,7 @@ where
         + SiluBackward
         + QuantiseActsSTE
         + QuantiseWeightsSTE
+        + BlockedAttention
         + Clone,
 {
     assert!(
@@ -1256,6 +1282,48 @@ pub trait Softmax {
 /// `j > i`, else `out[i, j] = self[i, j]`. Input shape `[seq, seq]`.
 /// Applied to scores BEFORE softmax so that `softmax(-inf) = 0` keeps
 /// queries from attending to future keys.
+/// Block-diagonal attention (issue #39).
+///
+/// The batched slab from issue #22 lays `B` sequences end to end as
+/// `[B*seq, d]` and previously scored them with a full `[B*seq, B*seq]`
+/// matrix reduced to its block diagonal by `causal_mask(window)`. That
+/// costs `(B*seq)^2` storage for `B*seq^2` of signal: at batch 16 and
+/// seq 256, 94% of the matrix is cross-sequence entries computed,
+/// stored, masked to zero and carried through backward - which is what
+/// put batch 16 out of reach on an 8 GB card.
+///
+/// These operations keep scores as `[rows, window]`, so memory is
+/// linear in the batch rather than quadratic. Column `j` is always the
+/// *block-local* key index: absolute key row `(i / window) * window + j`.
+///
+/// The three products cover both directions by symmetry:
+///
+/// | forward | backward reuse |
+/// |---|---|
+/// | `scores = blocked_qkt(q, k)` | `grad_attn = blocked_qkt(grad_ctx, v)` |
+/// | `ctx = blocked_av(attn, v)`  | `grad_q = blocked_av(grad_scores, k)` |
+/// | -                            | `grad_k = blocked_atv(grad_scores, q)`, `grad_v = blocked_atv(attn, grad_ctx)` |
+pub trait BlockedAttention {
+    /// `[rows, d] x [rows, d] -> [rows, window]`, block-local scores:
+    /// `out[i, j] = dot(self[i], k[block_start(i) + j])`.
+    fn blocked_qkt(&self, k: &Self, window: usize) -> Self;
+
+    /// `[rows, window] x [rows, d] -> [rows, d]`:
+    /// `out[i] = sum_j self[i, j] * v[block_start(i) + j]`.
+    fn blocked_av(&self, v: &Self, window: usize) -> Self;
+
+    /// Key-side reduction, `[rows, window] x [rows, d] -> [rows, d]`:
+    /// `out[block_start + r] = sum_i self[i, r] * x[i]` over the block.
+    fn blocked_atv(&self, x: &Self, window: usize) -> Self;
+
+    /// Causal mask on block-local scores: column `j` is tested against
+    /// `i % window`, since blocks no longer share a matrix.
+    fn causal_mask_blocked(&self, window: usize) -> Self;
+
+    /// Backward of [`Self::causal_mask_blocked`].
+    fn causal_mask_blocked_backward(&self, window: usize) -> Self;
+}
+
 pub trait CausalMask {
     /// `window` (issue #22): cells `(i, j)` survive iff `j <= i` AND
     /// `i / window == j / window` - block-diagonal-causal, so a
