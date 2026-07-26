@@ -107,6 +107,108 @@ extern "C" __global__ void causal_mask_f32(
     }
 }
 
+// Issue #39: block-diagonal attention without the cross-sequence waste.
+//
+// The batched slab (issue #22) is [B*seq, d] and used to build a full
+// [B*seq, B*seq] score matrix that the mask above then reduced to its
+// block diagonal. That is (B*seq)^2 of storage for B*seq^2 of signal:
+// at batch 16 / seq 256, 94% of the matrix is cross-sequence entries
+// computed, stored, masked to zero and dragged through the backward
+// pass. These three kernels keep scores as [rows, window] instead, so
+// memory is linear in the batch rather than quadratic.
+//
+// Every column index j below is BLOCK-LOCAL: key row (i/window)*window + j.
+
+// scores[i, j] = dot(q[i], k[block_start(i) + j])
+// Forward attention scores, and in backward, grad_attn from grad_ctx.
+extern "C" __global__ void blocked_qkt_f32(
+    const float* __restrict__ q,
+    const float* __restrict__ k,
+    float* __restrict__ out,
+    int rows, int d, int window)
+{
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+    if (i < rows && j < window) {
+        int base = (i / window) * window;
+        float acc = 0.0f;
+        for (int t = 0; t < d; ++t) {
+            acc += q[i * d + t] * k[(base + j) * d + t];
+        }
+        out[i * window + j] = acc;
+    }
+}
+
+// out[i] = sum_j s[i, j] * v[block_start(i) + j]
+// Forward context, and in backward, grad_q from grad_scores.
+extern "C" __global__ void blocked_av_f32(
+    const float* __restrict__ s,
+    const float* __restrict__ v,
+    float* __restrict__ out,
+    int rows, int d, int window)
+{
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+    if (i < rows && t < d) {
+        int base = (i / window) * window;
+        float acc = 0.0f;
+        for (int j = 0; j < window; ++j) {
+            acc += s[i * window + j] * v[(base + j) * d + t];
+        }
+        out[i * d + t] = acc;
+    }
+}
+
+// out[block_start + r] = sum_{i in block} s[i, r] * x[i]
+// The key-side reduction: grad_k from scores, grad_v from ctx. Each
+// output row is written by exactly one thread (it owns the whole sum
+// over its block), so no atomics are needed.
+extern "C" __global__ void blocked_atv_f32(
+    const float* __restrict__ s,
+    const float* __restrict__ x,
+    float* __restrict__ out,
+    int rows, int d, int window)
+{
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    int o = blockIdx.y * blockDim.y + threadIdx.y;   // output row
+    if (o < rows && t < d) {
+        int base = (o / window) * window;
+        int r = o - base;                            // block-local column
+        float acc = 0.0f;
+        for (int i = 0; i < window; ++i) {
+            acc += s[(base + i) * window + r] * x[(base + i) * d + t];
+        }
+        out[o * d + t] = acc;
+    }
+}
+
+// Causal mask over block-local scores. Column j is compared against the
+// row's position WITHIN its block; there is no cross-block case left.
+extern "C" __global__ void causal_mask_blocked_f32(
+    const float* __restrict__ in_,
+    float* __restrict__ out,
+    int rows, int window)
+{
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+    if (i < rows && j < window) {
+        float v = in_[i * window + j];
+        out[i * window + j] = (j > (i % window)) ? -INFINITY : v;
+    }
+}
+
+extern "C" __global__ void causal_mask_blocked_backward_f32(
+    const float* __restrict__ grad_y,
+    float* __restrict__ out,
+    int rows, int window)
+{
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+    if (i < rows && j < window) {
+        out[i * window + j] = (j > (i % window)) ? 0.0f : grad_y[i * window + j];
+    }
+}
+
 extern "C" __global__ void softmax_row_f32(
     const float* __restrict__ x,
     float* __restrict__ out,
@@ -773,6 +875,11 @@ pub struct CudaContextHolder {
     pub mul_scalar_fn: CudaFunction,
     pub transpose_2d_fn: CudaFunction,
     pub causal_mask_fn: CudaFunction,
+    pub blocked_qkt_fn: CudaFunction,
+    pub blocked_av_fn: CudaFunction,
+    pub blocked_atv_fn: CudaFunction,
+    pub causal_mask_blocked_fn: CudaFunction,
+    pub causal_mask_blocked_backward_fn: CudaFunction,
     pub softmax_row_fn: CudaFunction,
     pub rope_fn: CudaFunction,
     pub silu_fn: CudaFunction,
@@ -903,6 +1010,11 @@ pub fn cuda_state() -> Result<&'static CudaContextHolder, String> {
         let mul_scalar_fn = load("mul_scalar_f32")?;
         let transpose_2d_fn = load("transpose_2d_f32")?;
         let causal_mask_fn = load("causal_mask_f32")?;
+        let blocked_qkt_fn = load("blocked_qkt_f32")?;
+        let blocked_av_fn = load("blocked_av_f32")?;
+        let blocked_atv_fn = load("blocked_atv_f32")?;
+        let causal_mask_blocked_fn = load("causal_mask_blocked_f32")?;
+        let causal_mask_blocked_backward_fn = load("causal_mask_blocked_backward_f32")?;
         let softmax_row_fn = load("softmax_row_f32")?;
         let rope_fn = load("rope_f32")?;
         let silu_fn = load("silu_f32")?;
@@ -944,6 +1056,11 @@ pub fn cuda_state() -> Result<&'static CudaContextHolder, String> {
             mul_scalar_fn,
             transpose_2d_fn,
             causal_mask_fn,
+            blocked_qkt_fn,
+            blocked_av_fn,
+            blocked_atv_fn,
+            causal_mask_blocked_fn,
+            causal_mask_blocked_backward_fn,
             softmax_row_fn,
             rope_fn,
             silu_fn,
@@ -1313,6 +1430,121 @@ impl crate::device::Transpose2D for CudaTensor {
             data: out,
             shape: vec![c, r],
         }
+    }
+}
+
+impl CudaTensor {
+    /// Shared launcher for the three issue-#39 blocked kernels. They all
+    /// map one thread to one output cell of a `[rows, cols]` result and
+    /// take the same `(a, b, out, rows, inner, window)` argument shape.
+    fn launch_blocked(
+        &self,
+        f: &CudaFunction,
+        rhs: &CudaTensor,
+        rows: usize,
+        cols: usize,
+        inner: usize,
+        window: usize,
+    ) -> CudaTensor {
+        let s = cuda_state().expect("cuda_state failed");
+        let mut out = s
+            .active_stream()
+            .alloc_zeros::<f32>(rows * cols)
+            .expect("alloc_zeros failed");
+        const TILE: u32 = 16;
+        let cfg = LaunchConfig {
+            grid_dim: (
+                (cols as u32).div_ceil(TILE),
+                (rows as u32).div_ceil(TILE),
+                1,
+            ),
+            block_dim: (TILE, TILE, 1),
+            shared_mem_bytes: 0,
+        };
+        let (rows_i, inner_i, window_i) = (
+            i32::try_from(rows).expect("rows exceeds i32"),
+            i32::try_from(inner).expect("inner exceeds i32"),
+            i32::try_from(window).expect("window exceeds i32"),
+        );
+        let stream = s.active_stream();
+        let mut l = stream.launch_builder(f);
+        l.arg(&self.data);
+        l.arg(&rhs.data);
+        l.arg(&mut out);
+        l.arg(&rows_i);
+        l.arg(&inner_i);
+        l.arg(&window_i);
+        unsafe { l.launch(cfg) }.expect("blocked kernel launch failed");
+        CudaTensor {
+            data: out,
+            shape: vec![rows, cols],
+        }
+    }
+
+    /// Mask over block-local scores; shares the launch shape with its
+    /// own backward, so both go through here.
+    fn launch_mask_blocked(&self, f: &CudaFunction, window: usize) -> CudaTensor {
+        let s = cuda_state().expect("cuda_state failed");
+        let (rows, cols) = (self.shape[0], self.shape[1]);
+        let mut out = s
+            .active_stream()
+            .alloc_zeros::<f32>(rows * cols)
+            .expect("alloc_zeros failed");
+        const TILE: u32 = 16;
+        let cfg = LaunchConfig {
+            grid_dim: (
+                (cols as u32).div_ceil(TILE),
+                (rows as u32).div_ceil(TILE),
+                1,
+            ),
+            block_dim: (TILE, TILE, 1),
+            shared_mem_bytes: 0,
+        };
+        let (rows_i, window_i) = (
+            i32::try_from(rows).expect("rows exceeds i32"),
+            i32::try_from(window).expect("window exceeds i32"),
+        );
+        let stream = s.active_stream();
+        let mut l = stream.launch_builder(f);
+        l.arg(&self.data);
+        l.arg(&mut out);
+        l.arg(&rows_i);
+        l.arg(&window_i);
+        unsafe { l.launch(cfg) }.expect("blocked mask launch failed");
+        CudaTensor {
+            data: out,
+            shape: vec![rows, cols],
+        }
+    }
+}
+
+impl crate::device::BlockedAttention for CudaTensor {
+    fn blocked_qkt(&self, k: &Self, window: usize) -> Self {
+        let (rows, d) = (self.shape[0], self.shape[1]);
+        let s = cuda_state().expect("cuda_state failed");
+        self.launch_blocked(&s.blocked_qkt_fn, k, rows, window, d, window)
+    }
+
+    fn blocked_av(&self, v: &Self, window: usize) -> Self {
+        let (rows, d) = (self.shape[0], v.shape[1]);
+        let s = cuda_state().expect("cuda_state failed");
+        self.launch_blocked(&s.blocked_av_fn, v, rows, d, d, window)
+    }
+
+    fn blocked_atv(&self, x: &Self, window: usize) -> Self {
+        let (rows, d) = (self.shape[0], x.shape[1]);
+        let s = cuda_state().expect("cuda_state failed");
+        self.launch_blocked(&s.blocked_atv_fn, x, rows, d, d, window)
+    }
+
+    fn causal_mask_blocked(&self, window: usize) -> Self {
+        let s = cuda_state().expect("cuda_state failed");
+        self.launch_mask_blocked(&s.causal_mask_blocked_fn, window)
+    }
+
+    fn causal_mask_blocked_backward(&self, window: usize) -> Self {
+        let s = cuda_state().expect("cuda_state failed");
+        self.launch_mask_blocked(&s.causal_mask_blocked_backward_fn, window)
     }
 }
 

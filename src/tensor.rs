@@ -998,6 +998,166 @@ impl Tensor {
         }
     }
 
+    /// Block-diagonal attention scores (issue #39): `q @ k.T` computed
+    /// only within each `window`-sized block, returning `[rows, window]`
+    /// instead of `[rows, rows]`.
+    ///
+    /// The batched slab from issue #22 lays `B` sequences end to end as
+    /// `[B*seq, d]` and masks a full `[B*seq, B*seq]` score matrix down
+    /// to its block diagonal. That allocates `(B*seq)^2` for `B*seq^2`
+    /// of signal - at batch 16 / seq 256, 94% of the matrix is
+    /// cross-sequence entries computed, stored and masked to zero.
+    /// Storing only the block-local scores makes memory linear in the
+    /// batch instead of quadratic.
+    ///
+    /// `out[i, j] = dot(q[i], k[block_start(i) + j])`, where
+    /// `block_start(i) = (i / window) * window`. Column `j` is the
+    /// *block-local* key index, so `j` ranges over `0..window`.
+    pub fn blocked_qkt(&self, k: &Tensor, window: usize) -> Tensor {
+        let (rows, d) = (self.shape[0], self.shape[1]);
+        assert_eq!(self.ndim(), 2, "blocked_qkt: q must be rank-2");
+        assert_eq!(k.shape, self.shape, "blocked_qkt: q and k shapes differ");
+        assert!(
+            window > 0 && rows.is_multiple_of(window),
+            "blocked_qkt: rows {rows} not a multiple of window {window}"
+        );
+        let mut data = vec![0.0_f32; rows * window];
+        for i in 0..rows {
+            let base = (i / window) * window;
+            for j in 0..window {
+                let mut acc = 0.0_f32;
+                for t in 0..d {
+                    acc += self.data[i * d + t] * k.data[(base + j) * d + t];
+                }
+                data[i * window + j] = acc;
+            }
+        }
+        Tensor {
+            data,
+            shape: vec![rows, window],
+        }
+    }
+
+    /// Block-diagonal `scores @ v` (issue #39). `self` is `[rows, window]`
+    /// block-local scores, `v` is `[rows, d]`; returns `[rows, d]` with
+    /// `out[i] = sum_j self[i, j] * v[block_start(i) + j]`.
+    ///
+    /// Also serves the backward pass: `grad_q = blocked_av(grad_scores, k)`
+    /// has exactly this form.
+    pub fn blocked_av(&self, v: &Tensor, window: usize) -> Tensor {
+        let (rows, w) = (self.shape[0], self.shape[1]);
+        let d = v.shape[1];
+        assert_eq!(
+            w, window,
+            "blocked_av: score columns {w} != window {window}"
+        );
+        assert_eq!(
+            v.shape[0], rows,
+            "blocked_av: v rows {} != {rows}",
+            v.shape[0]
+        );
+        let mut data = vec![0.0_f32; rows * d];
+        for i in 0..rows {
+            let base = (i / window) * window;
+            for j in 0..window {
+                let s = self.data[i * window + j];
+                if s == 0.0 {
+                    continue;
+                }
+                for t in 0..d {
+                    data[i * d + t] += s * v.data[(base + j) * d + t];
+                }
+            }
+        }
+        Tensor {
+            data,
+            shape: vec![rows, d],
+        }
+    }
+
+    /// Transposed block-diagonal accumulate (issue #39): the gradient
+    /// that flows back to the *key* side of a blocked product. `self` is
+    /// `[rows, window]`, `x` is `[rows, d]`; returns `[rows, d]` with
+    /// `out[block_start + r] = sum_i self[i, r] * x[i]` summed over the
+    /// rows `i` of that block.
+    ///
+    /// Covers both `grad_k` (from scores) and `grad_v` (from ctx), which
+    /// are the same shape of reduction.
+    pub fn blocked_atv(&self, x: &Tensor, window: usize) -> Tensor {
+        let (rows, w) = (self.shape[0], self.shape[1]);
+        let d = x.shape[1];
+        assert_eq!(
+            w, window,
+            "blocked_atv: score columns {w} != window {window}"
+        );
+        assert_eq!(
+            x.shape[0], rows,
+            "blocked_atv: x rows {} != {rows}",
+            x.shape[0]
+        );
+        let mut data = vec![0.0_f32; rows * d];
+        for i in 0..rows {
+            let base = (i / window) * window;
+            for r in 0..window {
+                let s = self.data[i * window + r];
+                if s == 0.0 {
+                    continue;
+                }
+                for t in 0..d {
+                    data[(base + r) * d + t] += s * x.data[i * d + t];
+                }
+            }
+        }
+        Tensor {
+            data,
+            shape: vec![rows, d],
+        }
+    }
+
+    /// Causal mask over block-local scores (issue #39). `self` is
+    /// `[rows, window]`; column `j` is the block-local key index, so the
+    /// causal test is against `i % window` rather than `i`. The
+    /// cross-block condition disappears entirely - blocks no longer
+    /// share a matrix.
+    pub fn causal_mask_blocked(&self, window: usize) -> Tensor {
+        let (rows, w) = (self.shape[0], self.shape[1]);
+        assert_eq!(
+            w, window,
+            "causal_mask_blocked: columns {w} != window {window}"
+        );
+        let mut data = self.data.clone();
+        for i in 0..rows {
+            let local = i % window;
+            for j in (local + 1)..window {
+                data[i * window + j] = f32::NEG_INFINITY;
+            }
+        }
+        Tensor {
+            data,
+            shape: vec![rows, window],
+        }
+    }
+
+    /// Backward of [`causal_mask_blocked`]: zero where forward masked.
+    pub fn causal_mask_blocked_backward(&self, window: usize) -> Tensor {
+        let (rows, w) = (self.shape[0], self.shape[1]);
+        assert_eq!(
+            w, window,
+            "causal_mask_blocked_backward: columns {w} != window {window}"
+        );
+        let mut data = self.data.clone();
+        for i in 0..rows {
+            let local = i % window;
+            for j in (local + 1)..window {
+                data[i * window + j] = 0.0;
+            }
+        }
+        Tensor {
+            data,
+            shape: vec![rows, window],
+        }
+    }
+
     /// Per-row softmax backward (Phase 4 chunk 4.3). `self` is the
     /// upstream gradient `grad_y`, `s_out` is the saved softmax
     /// forward output. Implements the JVP of `J = diag(s) - s s^T`:
@@ -1405,6 +1565,24 @@ impl crate::device::Softmax for Tensor {
     }
 }
 
+impl crate::device::BlockedAttention for Tensor {
+    fn blocked_qkt(&self, k: &Self, window: usize) -> Self {
+        Tensor::blocked_qkt(self, k, window)
+    }
+    fn blocked_av(&self, v: &Self, window: usize) -> Self {
+        Tensor::blocked_av(self, v, window)
+    }
+    fn blocked_atv(&self, x: &Self, window: usize) -> Self {
+        Tensor::blocked_atv(self, x, window)
+    }
+    fn causal_mask_blocked(&self, window: usize) -> Self {
+        Tensor::causal_mask_blocked(self, window)
+    }
+    fn causal_mask_blocked_backward(&self, window: usize) -> Self {
+        Tensor::causal_mask_blocked_backward(self, window)
+    }
+}
+
 impl crate::device::CausalMask for Tensor {
     fn causal_mask(&self, window: usize) -> Self {
         Tensor::causal_mask_window(self, window)
@@ -1501,6 +1679,157 @@ impl crate::device::RmsNorm for Tensor {
 #[cfg(test)]
 // Entire module compiled out of release / `cargo run` build; only `cargo test` sees it
 mod tests {
+
+    /// Issue #39's core guarantee: the block-diagonal attention path is
+    /// mathematically identical to the old masked full-matrix path, just
+    /// without allocating the cross-sequence entries. If this holds, the
+    /// switch cannot move any recorded training number.
+    ///
+    /// Compares against the reference chain a batched slab used to run:
+    /// full [rows, rows] scores, block-diagonal causal mask, row softmax,
+    /// then @ v.
+    #[test]
+    fn blocked_attention_matches_masked_full_matrix() {
+        let (batch, seq, d) = (3_usize, 4_usize, 5_usize);
+        let rows = batch * seq;
+        let mk = |seed: u64, n: usize| {
+            let mut st = seed;
+            let mut v = Vec::with_capacity(n);
+            for _ in 0..n {
+                st = st
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                v.push(((st >> 40) as i64 as f32) / 8.0e6 - 1.0);
+            }
+            v
+        };
+        let q = Tensor {
+            data: mk(1, rows * d),
+            shape: vec![rows, d],
+        };
+        let k = Tensor {
+            data: mk(2, rows * d),
+            shape: vec![rows, d],
+        };
+        let v = Tensor {
+            data: mk(3, rows * d),
+            shape: vec![rows, d],
+        };
+
+        // Reference: the pre-#39 path.
+        let full = q.matmul(&k.transpose_2d()).causal_mask_window(seq);
+        let attn_full = full.softmax();
+        let ctx_full = attn_full.matmul(&v);
+
+        // Blocked: scores are [rows, seq], never [rows, rows].
+        let blocked = q.blocked_qkt(&k, seq).causal_mask_blocked(seq);
+        let attn_blocked = blocked.softmax();
+        let ctx_blocked = attn_blocked.blocked_av(&v, seq);
+
+        assert_eq!(
+            blocked.shape,
+            vec![rows, seq],
+            "scores must be [rows, window]"
+        );
+        assert_eq!(ctx_full.shape, ctx_blocked.shape);
+        for (i, (a, b)) in ctx_full.data.iter().zip(&ctx_blocked.data).enumerate() {
+            assert!((a - b).abs() < 1e-5, "ctx differs at {i}: {a} vs {b}");
+        }
+
+        // The saved attention weights must agree too, block-diagonal
+        // entry for entry - the backward pass consumes these.
+        for i in 0..rows {
+            let base = (i / seq) * seq;
+            for j in 0..seq {
+                let got = attn_blocked.data[i * seq + j];
+                let want = attn_full.data[i * rows + base + j];
+                assert!((got - want).abs() < 1e-6, "attn differs at [{i},{j}]");
+            }
+        }
+    }
+
+    /// The two blocked backward reductions must agree with dense
+    /// gradients computed through the masked full-matrix path.
+    #[test]
+    fn blocked_backward_reductions_match_dense() {
+        let (batch, seq, d) = (2_usize, 3_usize, 4_usize);
+        let rows = batch * seq;
+        let mk = |seed: u64, n: usize| {
+            let mut st = seed;
+            let mut v = Vec::with_capacity(n);
+            for _ in 0..n {
+                st = st
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                v.push(((st >> 40) as i64 as f32) / 8.0e6 - 1.0);
+            }
+            v
+        };
+        let s_blocked = Tensor {
+            data: mk(7, rows * seq),
+            shape: vec![rows, seq],
+        };
+        let x = Tensor {
+            data: mk(8, rows * d),
+            shape: vec![rows, d],
+        };
+
+        // Densify the block-local scores into [rows, rows] so the dense
+        // reference can use plain matmul.
+        let mut dense = vec![0.0_f32; rows * rows];
+        for i in 0..rows {
+            let base = (i / seq) * seq;
+            for j in 0..seq {
+                dense[i * rows + base + j] = s_blocked.data[i * seq + j];
+            }
+        }
+        let s_dense = Tensor {
+            data: dense,
+            shape: vec![rows, rows],
+        };
+
+        // blocked_av == S @ X
+        let got_av = s_blocked.blocked_av(&x, seq);
+        let want_av = s_dense.matmul(&x);
+        for (i, (a, b)) in want_av.data.iter().zip(&got_av.data).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-5,
+                "blocked_av differs at {i}: {a} vs {b}"
+            );
+        }
+
+        // blocked_atv == S.T @ X
+        let got_atv = s_blocked.blocked_atv(&x, seq);
+        let want_atv = s_dense.transpose_2d().matmul(&x);
+        for (i, (a, b)) in want_atv.data.iter().zip(&got_atv.data).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-5,
+                "blocked_atv differs at {i}: {a} vs {b}"
+            );
+        }
+    }
+
+    /// Memory shape is the whole point: scores must be rows x window,
+    /// not rows x rows.
+    #[test]
+    fn blocked_scores_are_linear_in_batch() {
+        let (seq, d) = (8_usize, 3_usize);
+        for batch in [1_usize, 2, 8] {
+            let rows = batch * seq;
+            let q = Tensor {
+                data: vec![0.5; rows * d],
+                shape: vec![rows, d],
+            };
+            let s = q.blocked_qkt(&q, seq);
+            assert_eq!(
+                s.data.len(),
+                rows * seq,
+                "batch {batch}: expected rows*window"
+            );
+            // The old path would have been rows*rows; confirm the saving.
+            assert_eq!(rows * rows / (rows * seq), batch, "saving must equal batch");
+        }
+    }
     use super::*; // pulls `Tensor` into the test module's scope
 
     /// Decode the effective CPU family from representative CPUID leaf-1 EAX
