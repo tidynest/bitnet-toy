@@ -768,6 +768,84 @@ pub fn eval_val_perplexity(
     (mean_ce, mean_ce.exp())
 }
 
+/// Pick the validation backend (issue #41): device-side when a
+/// `CudaModel` is live, the CPU autograd path otherwise.
+///
+/// Both compute the same deterministic strided subset and agree to
+/// within float-reassociation noise (pinned by
+/// `device_eval_matches_cpu_eval`), so the choice is purely about cost.
+/// The device path reuses the training batch size, which is already
+/// sized to fit the card.
+fn run_validation(
+    model: &crate::model::Model,
+    #[cfg(feature = "cuda")] cuda_model: Option<&crate::cuda::CudaModel>,
+    val_windows: &crate::data::WindowSet<'_>,
+    n_samples: usize,
+    batch: usize,
+) -> (f32, f32) {
+    #[cfg(feature = "cuda")]
+    if let Some(cm) = cuda_model {
+        return eval_val_perplexity_cuda(cm, val_windows, n_samples, batch);
+    }
+    let _ = batch;
+    eval_val_perplexity(model, val_windows, n_samples)
+}
+
+/// Device-side validation (issue #41): the same deterministic strided
+/// window subset as `eval_val_perplexity`, evaluated on the GPU in
+/// batches instead of one window at a time through the CPU autograd
+/// tape.
+///
+/// The CPU path builds a `Tape` per window for a forward-only
+/// computation. Measured on a live seq 256 / batch 16 run that was
+/// ~40s per 100-window eval, against ~0.24s for a 4096-token training
+/// step: roughly 26x more wall per token while doing strictly less
+/// work. That priced out any larger sample, and at 100 windows the
+/// sampling error is ~0.02 bits/char - the same order as the effects
+/// being compared in `docs/TRAINING.md`.
+///
+/// `batch` windows are concatenated into one slab per forward, exactly
+/// as training batches them, so the block-diagonal attention keeps
+/// them independent. The trailing partial batch is evaluated as a
+/// smaller slab rather than padded, and rows are summed rather than
+/// averaged per batch, so every window carries equal weight.
+#[cfg(feature = "cuda")]
+pub fn eval_val_perplexity_cuda(
+    cuda_model: &crate::cuda::CudaModel,
+    val_windows: &crate::data::WindowSet<'_>,
+    n_samples: usize,
+    batch: usize,
+) -> (f32, f32) {
+    if val_windows.is_empty() || n_samples == 0 {
+        return (f32::NAN, f32::NAN);
+    }
+    let n = n_samples.min(val_windows.len());
+    let stride = (val_windows.len() / n).max(1);
+    let seq = val_windows.seq_len();
+    let batch = batch.max(1);
+    let mut total_ce = 0.0_f32;
+    let mut rows_total = 0_usize;
+    let mut ids: Vec<usize> = Vec::with_capacity(batch * seq);
+    let mut targets: Vec<usize> = Vec::with_capacity(batch * seq);
+    for chunk_start in (0..n).step_by(batch) {
+        ids.clear();
+        targets.clear();
+        for i in chunk_start..(chunk_start + batch).min(n) {
+            let (input, target) = val_windows.get(i * stride);
+            ids.extend_from_slice(input);
+            targets.extend_from_slice(target);
+        }
+        let (sum, rows) = cuda_model.eval_loss_batched(&ids, &targets, seq);
+        total_ce += sum;
+        rows_total += rows;
+    }
+    // Per-row cross-entropy summed over every token, so the mean is a
+    // per-token figure directly comparable to the CPU path's mean over
+    // per-window means (both weight windows equally at fixed seq).
+    let mean_ce = total_ce / rows_total as f32;
+    (mean_ce, mean_ce.exp())
+}
+
 /// Train the full BitNet LM on either the embedded TINY_CORPUS or a corpus
 /// loaded from disk. AdamW + global-L2 grad clip + cosine-with-warmup LR.
 /// Each step samples a uniformly random training window. If `cfg.val_split`
@@ -1112,8 +1190,14 @@ fn train_bitnet_lm(
         if on_log_step {
             let anchor_loss = eval_loss(&model, &input0, &target0);
             if on_eval_step {
-                let (val_loss, val_ppl) =
-                    eval_val_perplexity(&model, &val_windows, cfg.val_eval_samples);
+                let (val_loss, val_ppl) = run_validation(
+                    &model,
+                    #[cfg(feature = "cuda")]
+                    cuda_model.as_ref(),
+                    &val_windows,
+                    cfg.val_eval_samples,
+                    cfg.batch_size,
+                );
                 stepped_val = Some(val_loss);
                 println!(
                     "step {:>5}   train_loss = {:.4}   anchor_loss = {:.4}   \
@@ -1131,8 +1215,14 @@ fn train_bitnet_lm(
         } else if on_eval_step {
             // Eval-only step (no training-loss log fires). Print a single
             // val_ppl line so the cadence stays visible.
-            let (val_loss, val_ppl) =
-                eval_val_perplexity(&model, &val_windows, cfg.val_eval_samples);
+            let (val_loss, val_ppl) = run_validation(
+                &model,
+                #[cfg(feature = "cuda")]
+                cuda_model.as_ref(),
+                &val_windows,
+                cfg.val_eval_samples,
+                cfg.batch_size,
+            );
             stepped_val = Some(val_loss);
             println!(
                 "step {:>5}   val_loss = {:.4}   val_ppl = {:.2}",
@@ -1246,7 +1336,14 @@ fn train_bitnet_lm(
     // less noisily than any individual training-time eval.
     if val_enabled {
         let n = (cfg.val_eval_samples * 5).min(val_windows.len());
-        let (val_loss, val_ppl) = eval_val_perplexity(&model, &val_windows, n);
+        let (val_loss, val_ppl) = run_validation(
+            &model,
+            #[cfg(feature = "cuda")]
+            cuda_model.as_ref(),
+            &val_windows,
+            n,
+            cfg.batch_size,
+        );
         let baseline_ppl = vocab.size() as f32;
         // Issue #24: bits per CHARACTER - the only loss unit comparable
         // across tokenisers (per-token perplexities are not: a BPE
@@ -1503,6 +1600,8 @@ options:
   --val-split F    held-out validation fraction 0..1 (default 0.10)
   --out STEM       artefact name: models/<STEM>.f32.bin and
                    models/<STEM>.ternary_packed.bin  (default custom)
+  --eval-every N   validation cadence in steps (default 500)
+  --val-samples N  held-out windows per validation pass (default 100)
   --resume PATH    continue from a checkpoint (.f32.bin for identity)
   --tokenizer PATH .bpe artefact from `bpe <corpus> --vocab-size N`;
                    default is the char vocab built from the corpus
@@ -1537,6 +1636,8 @@ fn parse_train_args(args: &[String]) -> Result<TrainArgs, String> {
     let mut cfg = TrainConfig::shakespeare();
     let mut corpus: Option<String> = None;
     let mut resume: Option<std::path::PathBuf> = None;
+    let mut cuda_val_default = false;
+    let mut val_samples_explicit = false;
     let mut out_stem = "custom".to_string();
     // Geometry is resolved after the loop, because the derivations
     // depend on which of the three flags were given.
@@ -1574,6 +1675,13 @@ fn parse_train_args(args: &[String]) -> Result<TrainArgs, String> {
                     "--tokenizer",
                 )?));
             }
+            "--eval-every" => {
+                cfg.eval_every = num(value(args, &mut i, "--eval-every")?, "--eval-every")?;
+            }
+            "--val-samples" => {
+                cfg.val_eval_samples = num(value(args, &mut i, "--val-samples")?, "--val-samples")?;
+                val_samples_explicit = true;
+            }
             "--checkpoint-every" => {
                 cfg.checkpoint_every = num(
                     value(args, &mut i, "--checkpoint-every")?,
@@ -1585,6 +1693,18 @@ fn parse_train_args(args: &[String]) -> Result<TrainArgs, String> {
             }
             "--cuda" => {
                 cfg.use_cuda_backward = true;
+                // Issue #41: device validation costs ~0.0055 s/window
+                // against the CPU path's ~0.41, so a GPU run can afford
+                // a sample that actually pins the number down. Sampling
+                // error falls as 1/sqrt(n), so 100 -> 2000 is roughly a
+                // 4.5x tighter error bar for ~11s per eval, still less
+                // than the ~41s the old 100-window CPU pass cost.
+                //
+                // Deliberately NOT raised for CPU runs: 2000 windows
+                // through the autograd tape would be ~14 minutes per
+                // eval. An explicit --val-samples always wins, whichever
+                // order the flags appear in (applied after the loop).
+                cuda_val_default = true;
                 // GPU is the parallelism layer; multiple dispatch
                 // threads would serialise on the default stream anyway.
                 cfg.n_workers = 1;
@@ -1637,6 +1757,12 @@ fn parse_train_args(args: &[String]) -> Result<TrainArgs, String> {
     cfg.model.head_dim = head_dim;
     cfg.model.ffn_dim = ffn.unwrap_or(2 * hidden); // preset ratio
     cfg.corpus_path = Some(std::path::PathBuf::from(corpus));
+    // Applied after the loop so flag order does not matter: an explicit
+    // --val-samples always beats the GPU default, whether it came before
+    // or after --cuda.
+    if cuda_val_default && !val_samples_explicit {
+        cfg.val_eval_samples = 2000;
+    }
     Ok(TrainArgs {
         cfg,
         resume,
@@ -2929,6 +3055,59 @@ mod tests {
         );
     }
 
+    /// Issue #41's correctness requirement: device-side validation must
+    /// report the same number as the CPU reference for the same weights
+    /// and the same windows. If it does not, every recorded val_loss
+    /// changes meaning the moment the fast path lands.
+    ///
+    /// Tolerance is loose because the two paths reduce in different
+    /// orders (batched device rows against a per-window host loop) and
+    /// the tiled GEMM reassociates, the same class of drift documented
+    /// for blocked attention in issue #39. It is tight enough to catch a
+    /// real disagreement: the ~0.02 sampling noise this work exists to
+    /// reduce is an order of magnitude larger.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn device_eval_matches_cpu_eval() {
+        use crate::data::{TINY_CORPUS, Vocab, WindowSet};
+        use crate::model::{Model, ModelConfig};
+
+        if crate::cuda::cuda_state().is_err() {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        }
+        let vocab = Vocab::from_text(TINY_CORPUS);
+        let ids = vocab.encode(TINY_CORPUS);
+        let cfg = ModelConfig {
+            vocab_size: vocab.size(),
+            hidden_dim: 64,
+            n_heads: 4,
+            head_dim: 16,
+            ffn_dim: 128,
+            max_seq_len: 16,
+            n_blocks: 2,
+        };
+        let model = Model::new(&cfg, 4242);
+        let windows = WindowSet::new(&ids, cfg.max_seq_len);
+        let cuda_model = crate::cuda::CudaModel::from_cpu(&model);
+
+        // Several batch sizes, including one that does not divide the
+        // sample count, so the trailing partial slab is exercised.
+        let n = 12;
+        let (cpu_loss, cpu_ppl) = eval_val_perplexity(&model, &windows, n);
+        for batch in [1_usize, 4, 5] {
+            let (dev_loss, dev_ppl) = eval_val_perplexity_cuda(&cuda_model, &windows, n, batch);
+            assert!(
+                (cpu_loss - dev_loss).abs() < 2e-3,
+                "batch {batch}: device val_loss {dev_loss} vs cpu {cpu_loss}"
+            );
+            assert!(
+                (cpu_ppl - dev_ppl).abs() < 2e-2,
+                "batch {batch}: device val_ppl {dev_ppl} vs cpu {cpu_ppl}"
+            );
+        }
+    }
+
     /// `eval_val_perplexity` should produce finite, sensible values:
     /// `val_loss` non-negative finite, `val_ppl` between 1 and the
     /// uniform-vocab baseline (`vocab_size`) for a model that has done
@@ -3196,6 +3375,41 @@ mod tests {
         assert_eq!(a.cfg.model.n_heads, 12);
         assert_eq!(a.cfg.model.head_dim, 8);
         // Resume path is carried through for the runner to load.
+        // Issue #41: the eval knobs are CLI-settable, so a run can buy a
+        // tighter error bar without a recompile.
+        let e = parse_train_args(&cli(&[
+            "c.txt",
+            "--eval-every",
+            "250",
+            "--val-samples",
+            "2000",
+        ]))
+        .unwrap();
+        assert_eq!(e.cfg.eval_every, 250);
+        assert_eq!(e.cfg.val_eval_samples, 2000);
+        // GPU runs default to a much larger sample, since device eval
+        // makes it affordable; CPU runs must not, and an explicit value
+        // wins from either side of --cuda.
+        let g = parse_train_args(&cli(&["c.txt", "--cuda"])).unwrap();
+        assert_eq!(g.cfg.val_eval_samples, 2000);
+        let gc = parse_train_args(&cli(&["c.txt"])).unwrap();
+        assert_eq!(gc.cfg.val_eval_samples, 100);
+        for order in [
+            vec!["c.txt", "--cuda", "--val-samples", "50"],
+            vec!["c.txt", "--val-samples", "50", "--cuda"],
+        ] {
+            let x = parse_train_args(&cli(&order)).unwrap();
+            assert_eq!(
+                x.cfg.val_eval_samples, 50,
+                "explicit --val-samples must win"
+            );
+        }
+
+        // Defaults survive when the flags are absent.
+        let d = parse_train_args(&cli(&["c.txt"])).unwrap();
+        assert_eq!(d.cfg.eval_every, 500);
+        assert_eq!(d.cfg.val_eval_samples, 100);
+
         let b = parse_train_args(&cli(&["c.txt", "--resume", "models/x.f32.bin"])).unwrap();
         assert_eq!(
             b.resume.as_deref(),
