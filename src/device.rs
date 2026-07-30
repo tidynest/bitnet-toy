@@ -896,6 +896,104 @@ where
 /// with the same residual / rmsnorm structure as `block_forward_save`
 /// (chunk 4.5.c).
 #[allow(dead_code)]
+/// Forward-only BitNet block for validation (issue #41).
+///
+/// Same maths as `block_forward_save_bitnet` and the same quantisation,
+/// so the loss it produces matches what training reports for identical
+/// weights. The difference is that it saves nothing: validation reads
+/// no gradients, so keeping per-head `q`/`k`/`v`/`attn`/`ctx` and the
+/// FFN intermediates alive is pure waste.
+///
+/// Kept beside the saving variant deliberately - if the forward chain
+/// here ever drifts from the one in `block_forward_save_bitnet`,
+/// validation stops measuring the model that training is fitting.
+pub fn block_inference_bitnet<T>(
+    x: &T,
+    heads: &[HeadWeights<T>],
+    ffn: &FfnWeights<T>,
+    head_dim: usize,
+    window: usize,
+) -> T
+where
+    T: MatMul
+        + Add
+        + MulScalar
+        + Transpose2D
+        + Softmax
+        + CausalMask
+        + Rope
+        + RmsNorm
+        + Silu
+        + Mul
+        + BitLinear
+        + BlockedAttention,
+{
+    assert!(
+        !heads.is_empty(),
+        "block_inference_bitnet: at least one head"
+    );
+    let y1_pre = x.rmsnorm();
+    let mut y1 = attention_head_inference_bitnet(
+        &y1_pre,
+        &heads[0].w_q,
+        &heads[0].w_k,
+        &heads[0].w_v,
+        &heads[0].w_o,
+        head_dim,
+        window,
+    );
+    for h in &heads[1..] {
+        let out_h = attention_head_inference_bitnet(
+            &y1_pre, &h.w_q, &h.w_k, &h.w_v, &h.w_o, head_dim, window,
+        );
+        y1 = y1.add(&out_h);
+    }
+    let x1 = x.add(&y1);
+    let y2_pre = x1.rmsnorm();
+    // SwiGLU, matching ffn_forward_save_bitnet without the saves.
+    let gate = y2_pre.bit_linear(&ffn.w_gate);
+    let up = y2_pre.bit_linear(&ffn.w_up);
+    let y2 = gate.silu().mul(&up).bit_linear(&ffn.w_down);
+    x1.add(&y2)
+}
+
+/// Forward-only BitNet attention head (issue #41). Mirrors
+/// `attention_head_forward_save_bitnet` exactly, including the
+/// block-diagonal scores from issue #39, minus the saved activations.
+pub fn attention_head_inference_bitnet<T>(
+    x: &T,
+    w_q: &T,
+    w_k: &T,
+    w_v: &T,
+    w_o: &T,
+    head_dim: usize,
+    window: usize,
+) -> T
+where
+    T: MatMul
+        + MulScalar
+        + Transpose2D
+        + Softmax
+        + CausalMask
+        + Rope
+        + BitLinear
+        + BlockedAttention,
+{
+    let q = x.bit_linear(w_q).rope(window);
+    let k = x.bit_linear(w_k).rope(window);
+    let v = x.bit_linear(w_v);
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    let attn = q
+        .blocked_qkt(&k, window)
+        .mul_scalar(scale)
+        .causal_mask_blocked(window)
+        .softmax();
+    attn.blocked_av(&v, window).bit_linear(w_o)
+}
+
+/// Used by the CUDA training step core; the default build compiles the
+/// generic but never instantiates it.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub fn block_forward_save_bitnet<T>(
     x: &T,
     heads: &[HeadWeights<T>],
