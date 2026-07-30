@@ -1434,6 +1434,17 @@ impl crate::device::Transpose2D for CudaTensor {
 }
 
 impl CudaTensor {
+    /// The Phase 5.a f32 sgemm path: quantise both operands with the
+    /// same STE semantics, then a normal f32 matmul. Algebraically
+    /// identical to the int8 tensor-core route, just slower, so it
+    /// serves as the fallback for every shape cuBLAS declines.
+    fn bit_linear_f32_fallback(&self, rhs: &CudaTensor) -> CudaTensor {
+        use crate::device::{MatMul, QuantiseActsSTE, QuantiseWeightsSTE};
+        let x_eff = self.quantise_acts_ste();
+        let w_eff = rhs.quantise_weights_ste();
+        x_eff.matmul(&w_eff)
+    }
+
     /// Shared launcher for the three issue-#39 blocked kernels. They all
     /// map one thread to one output cell of a `[rows, cols]` result and
     /// take the same `(a, b, out, rows, inner, window)` argument shape.
@@ -2285,14 +2296,18 @@ impl crate::device::BitLinear for CudaTensor {
         // be multiples of 4. In our row-major-via-col-major adapter
         // lda = n (B's row-major stride) and ldb = k (A's row-major
         // stride). When either fails the alignment check, fall back
-        // to the Phase 5.a f32 sgemm path (algebraically identical;
-        // the only matmul in the project that hits this fallback is
-        // the lm_head with n = vocab = 65).
+        // to the Phase 5.a f32 sgemm path (algebraically identical).
+        // The lm_head with n = vocab is the usual customer.
+        //
+        // This static check is necessary but NOT sufficient: cuBLAS
+        // also refuses some shapes that pass it, on heuristics it does
+        // not document. `m = 80, k = 16, n = 64` returns
+        // CUBLAS_STATUS_NOT_SUPPORTED while `m = 16` with the same k
+        // and n succeeds. Rather than guess the rule, the call below
+        // treats a NOT_SUPPORTED return as a signal to take this same
+        // fallback instead of panicking - see `int8_gemm_or_fallback`.
         if !k.is_multiple_of(4) || !n.is_multiple_of(4) {
-            use crate::device::{MatMul, QuantiseActsSTE, QuantiseWeightsSTE};
-            let x_eff = self.quantise_acts_ste();
-            let w_eff = rhs.quantise_weights_ste();
-            return x_eff.matmul(&w_eff);
+            return self.bit_linear_f32_fallback(rhs);
         }
 
         // ---- Stage 1: quantise self (acts) to INT8 + alpha[m]. ----
@@ -2366,7 +2381,7 @@ impl crate::device::BitLinear for CudaTensor {
         // Safety: pointer arithmetic + raw FFI call. Buffers are
         // sized correctly above. Stride / shape / type tags below
         // match the col-major view of the row-major data.
-        unsafe {
+        let gemm_result = unsafe {
             let gemm_stream = st.active_stream();
             let (b_ptr, _b_keep) = w_q.device_ptr(&gemm_stream);
             let (a_ptr, _a_keep) = x_q.device_ptr(&gemm_stream);
@@ -2392,7 +2407,16 @@ impl crate::device::BitLinear for CudaTensor {
                 sys::cublasComputeType_t::CUBLAS_COMPUTE_32I,
                 sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
             )
-            .expect("cublasGemmEx int8 failed");
+            .map_err(|e| (e, m, k, n))
+        };
+        if let Err((e, m, k, n)) = gemm_result {
+            // Only the documented "this shape is not supported" return
+            // is recoverable. Anything else is a real CUDA fault and
+            // must stay loud.
+            if e.0 != sys::cublasStatus_t::CUBLAS_STATUS_NOT_SUPPORTED {
+                panic!("cublasGemmEx int8 failed m={m} k={k} n={n}: {e:?}");
+            }
+            return self.bit_linear_f32_fallback(rhs);
         }
 
         // ---- Stage 4: dequantise int32 -> f32 with per-row alpha + scalar gamma. ----
@@ -3276,6 +3300,56 @@ impl CudaModel {
     /// batch-AVERAGED parameter gradients in the flat buffer for
     /// `CudaAdamW::step`. Returns the batch mean loss (one small D->H
     /// read of the per-row losses - the only host transfer).
+    /// Forward-only batched loss for validation (issue #41).
+    ///
+    /// Validation used to run on the CPU autograd path even during a
+    /// `--cuda` run, building a `Tape` per window for a computation
+    /// that never reads a gradient. Measured on a live seq 256 /
+    /// batch 16 run that cost ~40s per 100-window eval, against ~0.24s
+    /// for a training step of 4096 tokens - roughly 26x more wall per
+    /// token than fwd+bwd, for strictly less work.
+    ///
+    /// The real damage was to measurement rather than speed: at 100
+    /// windows the sampling error is ~0.02 bits/char, the same order as
+    /// effects being compared in `docs/TRAINING.md`. Cheap evaluation is
+    /// what makes a tighter error bar affordable.
+    ///
+    /// Shares `upload_step_inputs` and the exact forward chain of
+    /// `step_core_into`, so the number matches what training would
+    /// report for the same weights and windows. Returns the SUM of
+    /// per-row cross-entropy plus the row count, letting the caller
+    /// accumulate across batches without weighting a short final batch
+    /// as heavily as a full one.
+    pub fn eval_loss_batched(
+        &self,
+        input_ids: &[usize],
+        target_ids: &[usize],
+        window: usize,
+    ) -> (f32, usize) {
+        use crate::device::{BitLinear, RmsNorm, Transpose2D, block_inference_bitnet};
+        assert!(
+            window <= self.config.max_seq_len && input_ids.len().is_multiple_of(window),
+            "eval_loss_batched: {} ids do not form whole windows of {window}",
+            input_ids.len(),
+        );
+        let (x_embed, targets_dev) = self.upload_step_inputs(input_ids, target_ids, None);
+        let head_dim = self.config.head_dim;
+        let mut x = x_embed;
+        for block in &self.blocks {
+            x = block_inference_bitnet(&x, &block.heads, &block.ffn, head_dim, window);
+        }
+        let lm_head_w = self.token_embed_device.transpose_2d();
+        let logits = x.rmsnorm().bit_linear(&lm_head_w);
+        let (per_row_loss, _saved) = logits.cross_entropy_forward_device(&targets_dev);
+        let rows = input_ids.len();
+        let host = cuda_state()
+            .expect("cuda_state failed")
+            .active_stream()
+            .clone_dtoh(&per_row_loss)
+            .expect("eval loss D->H failed");
+        (host.iter().sum::<f32>(), rows)
+    }
+
     pub fn device_step_grads(
         &self,
         bufs: &mut StepBuffers,
