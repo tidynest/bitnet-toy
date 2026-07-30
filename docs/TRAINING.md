@@ -97,14 +97,44 @@ The trainer:
 2. Overrides the model config with the checkpoint's config (vocab, dims,
    block count must match).
 3. Restores the AdamW `m`/`v` buffers from the checkpoint's `OPTM` payload.
-4. Restarts the cosine LR schedule, including the warmup.
+4. **Continues** the cosine LR schedule from the checkpoint's step
+   count, rather than restarting it.
 
 Resuming from `shakespeare.f32.bin` is a true continuation: the first
 training step's loss matches the val_loss the previous run ended on,
 because the masters and the optimiser moments are byte-identical to the
-final state of the previous run. (The cosine LR schedule still restarts
-from the warmup floor; that is intentional and gives every fresh `cargo
-run` a clean, predictable trajectory.)
+final state of the previous run.
+
+The LR schedule continues too. `apply_resume_checkpoint` reads
+`step_count` out of the `OPTM` payload into `start_step_offset`, sets
+`cosine_total_steps = start_step_offset + n_steps`, and the loop asks
+for `cosine_lr(step + start_step_offset, ...)`. Since `cosine_lr` only
+takes its warmup branch while `step < warmup_steps`, any resume past
+step 200 skips warmup entirely. The run prints
+
+```
+continuing cosine LR schedule: offset 2000 -> total 8000
+```
+
+at startup, so the reconstructed schedule is checkable rather than
+assumed.
+
+Two consequences worth knowing:
+
+- **Pass the remainder to `--steps`, not the original total.** Resuming
+  a paused 8000-step run at step 2000 wants `--steps 6000`, which gives
+  `offset 2000 + 6000 = 8000` and reproduces the original cosine
+  exactly. Passing `--steps 8000` would stretch the schedule to 10000
+  and change the LR at every remaining step.
+- **Only `.f32.bin` continues the schedule.** The continuation is
+  gated on the checkpoint carrying `OPTM` state, so resuming from
+  `ternary_packed.bin` restarts the cosine from warmup.
+
+An earlier revision of this section said the schedule restarts from the
+warmup floor and called that intentional. That was true before v0.14
+and is no longer: the restart was diagnosed in the v0.13 cumulative-30k
+run as burning roughly 2k steps of each resume's productive budget, and
+perturbing already-converged weights.
 
 Resuming from `shakespeare.ternary_packed.bin` still works but pays
 roughly 500 wasted steps re-establishing the master values from the
