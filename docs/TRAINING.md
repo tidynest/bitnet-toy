@@ -13,7 +13,7 @@ How to train, what to expect, what to watch for, and what knobs to turn.
 - [GPU vs CPU benchmark](#gpu-vs-cpu-benchmark-issue-4)
 - [BPE tokenisation](#bpe-tokenisation-issue-24)
 - [LR schedule vs overfit](#lr-schedule-vs-overfit-the-full-corpus-char-study) - plus the batch/context 2x2 and capacity results
-- [Scaling the corpus](#scaling-the-corpus-5885m-chars) - and the conclusion it corrected
+- [Scaling the corpus](#scaling-the-corpus-5885m-chars) - batch, LR and model size, and the conclusions it corrected
 - [Watching the run](#watching-the-run)
 - [Generation modes](#generation-modes)
 - [Tuning](#tuning)
@@ -541,30 +541,24 @@ the full ranking of everything tried on this corpus:
 | lever | effect on bits/char |
 |---|---|
 | LR schedule shape | **3.13 -> 2.43 (the dominant factor)** |
-| 2x batch **and** 2x context together | **2.432 -> 2.263 (best model)** |
+| 2x batch **and** 2x context together | **2.432 -> 2.263 (best on this corpus)** |
 | 2x batch (seq 128) | 2.432 -> 2.348 |
 | 2x context (batch 4) | 2.432 -> 2.390 |
 | 2.25x parameters | 2.432 -> 2.370 |
-| 2x schedule length (big model) | 2.370 -> 2.473 (**worse, but see below**) |
+| 2x schedule length (big model) | 2.370 -> 2.473 (**worse**) |
 | BPE tokenisation | 3.50 (data-starved) |
 
 Best artefact on this corpus: **seq 256 / batch 8 at hidden 256,
 2.263 bits/char** (`models/full-char-seq256-b8.best.f32.bin`).
 
-Two rules generalise out of the sweep, but only one of them survived
-contact with a bigger corpus:
-
-1. **Gradient quality beats model size.** Batch size, context length
-   and parameter count all help, but the first two together (-6.9%)
-   outrun 2.25x the parameters (-2.5%) at no extra weight. Every
-   failure in this sweep - BPE's 1.97M windows, the 8k run's
-   memorisation, the batch-2 arm - traces back to how much
-   *independent* signal each gradient step sees. This one held up.
-2. **Schedule shape beats every architectural knob.** True, and still
-   true. An earlier revision added "and once the shape is right, more
-   steps actively hurt", generalising from the 8k row above. That
-   second clause was **wrong**, and the section below shows why: it
-   was a fact about 4.82M windows, not about schedules.
+**Read this table as a result about 4.82M windows, not about
+training.** Two of its rows were reproduced on an 11x corpus and came
+out with the opposite sign - the schedule-length row and the parameter
+row both invert. The bigger-corpus section below has the corrected
+numbers and the reason. What survives unchanged is the observation
+underneath all of it: every failure in this sweep - BPE's 1.97M
+windows, the 8k run's memorisation, the batch-2 arm - traces back to
+how much *independent* signal each gradient step sees.
 
 The corpus is the standing limit: 4.82M windows support a 2.263
 bits/char model, but the winning cell already turns over at step 3500,
@@ -640,28 +634,100 @@ So "more steps hurt" was never a property of schedules. It was data
 exhaustion wearing a schedule costume, and doubling the budget only
 reached the wall sooner.
 
+### Batch, LR and model size on the bigger corpus
+
+With the corpus no longer binding, the three levers the Shakespeare
+sweep could not test fairly were run in turn. All at seq 256, 8k
+cosine, on 52.96M windows; each row changes one thing from the row it
+is compared against. Figures are best-validation, so they compare
+like with like.
+
+| run | change | best bits/char | vs its control |
+|---|---|---|---|
+| `gutenberg-8k` | batch 8 baseline | 1.986 | - |
+| `gutenberg-b16` | batch 8 -> 16 | 1.935 | **-0.051** |
+| `gutenberg-b16-lr21e3` | peak 1.5e-3 -> 2.1e-3 | 1.995 | +0.060 (worse) |
+| `gutenberg-h384` | hidden 256 -> 384 | **1.772** | **-0.162** |
+
+**Batch 16 helps, but only half as much as the Shakespeare 2x2
+predicted** (~0.09 per doubling). The obvious suspect was learning
+rate, since a larger batch gives a less noisy gradient and usually
+tolerates a higher peak, so 1.5e-3 might simply have been left over
+from batch 8. It is not that: sqrt-scaling the peak to 2.1e-3 made
+things clearly *worse*, by 0.060 - about 3x the sampling noise. A
+3.0e-3 arm was started and abandoned once the direction was obvious.
+So 1.5e-3 remains right at batch 16, and 0.051 is genuinely what the
+doubling buys here. Diminishing returns, not mistuning.
+
+**Model size is the big one, and it inverts the Shakespeare ranking.**
+hidden 384 / ffn 1536 / 24 heads (~19M params against ~8.5M) gains
+0.162 bits/char, roughly triple the batch doubling. Validation fell
+monotonically to the final step with train at 1.1465 against val
+1.2285 - no gap worth the name. On Shakespeare the same architecture
+gained only 2.5% and then turned over at step 7000 with a ~0.70 gap.
+Same model, same recipe, 11x the data, opposite outcome.
+
+Cost belongs next to the gain, though. From the run summaries, hidden
+384 costs **658.7 ms/step** against roughly 240 ms/step for hidden 256
+at the same batch. Normalising:
+
+| lever | gain | wall-clock cost | gain per cost-multiple |
+|---|---|---|---|
+| 2x batch | 0.051 | 1.23x | 0.041 |
+| 2.25x parameters | 0.162 | 2.7x | 0.060 |
+
+Capacity still wins, but by about 50% on a compute-normalised basis
+rather than the 3x the raw numbers suggest. Parameters are not free.
+
 ### Where this leaves things
 
-Best model in the project: **1.969 bits/char** on the final-validation
-pass (`models/gutenberg-8k.best.f32.bin`, 8k steps), the first result
-under 2.0.
+Best model in the project: **1.772 bits/char**
+(`models/gutenberg-h384.best.f32.bin`, hidden 384, batch 16, 8k steps),
+best checkpoint at the final step and still descending.
 
-Two caveats worth keeping attached to that number:
+Three caveats worth keeping attached to that number:
 
 - **It is not comparable to the 2.263 Shakespeare result.** Different
   domain and a different vocabulary (89 against 100), and the smaller
   vocabulary mechanically lowers per-character loss. Cross-corpus
   bits/char is indicative, not a like-for-like ranking. The
   *within*-corpus comparisons on this page are the sound ones.
-- **It does not show that schedules scale indefinitely.** It shows
-  they scale while data lasts. At 8k steps this corpus is still under
-  a third of an epoch; the interesting question is where the turnover
-  reappears, and that has not been located yet.
+- **Nothing here has been trained to convergence.** Every run on this
+  corpus ends with its best checkpoint at the final step. The
+  schedules are the binding constraint now, not the data, and no
+  turnover has been located at all.
+- **The differences are only a few times the measurement noise.**
+  Validation samples 100 windows out of 5.88M, which is worth about
+  0.02 bits/char of sampling error (issue #41). The 0.162 model-size
+  result is comfortably clear of that; the 0.051 batch result is not
+  comfortably clear of it.
 
-Open from here: batch 16 (the lever the Shakespeare sweep had to defer
-for lack of data), a longer schedule still, and a larger model - all
-three now testable for the first time, because the corpus is no longer
-the binding constraint.
+### The lesson that keeps recurring
+
+Two conclusions on this page were drawn on 5.36M characters and then
+overturned by an 11x corpus:
+
+| conclusion on Shakespeare | what the bigger corpus showed |
+|---|---|
+| "once the shape is right, more steps actively hurt" | 4k -> 8k *gains* 0.184 bits/char |
+| capacity is the weakest lever (2.5%, below batch and context) | capacity is the **strongest** (8.4%, triple batch) |
+
+Both were correct *about 4.82M windows*. Neither was correct about
+training. The failure mode is the same each time: a lever looks weak
+because the data cannot exercise it, and its weakness gets recorded as
+a property of the lever.
+
+So read every ranking on this page as conditional. **A lever's measured
+value is bounded by whether the corpus is large enough to exercise
+it**, and any ordering established at one data scale should be
+re-derived rather than carried across. The one conclusion that has
+survived every corpus change so far is the weakest-sounding of them:
+what a gradient step needs is independent signal, and everything else
+follows from whether it is getting any.
+
+Open from here: batch 32 or 64 (both reachable since issue #39, though
+batch 16 already shows diminishing returns), hidden 512, and a longer
+schedule - none of which has a located ceiling yet.
 
 ## Watching the run
 
