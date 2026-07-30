@@ -181,6 +181,18 @@ worth knowing:
   bottomed ~0.75 bits/char below its own final state); the periodic
   checkpoint keeps only LATEST. Best tracking is per-run (a resumed
   run starts a fresh best).
+- `--eval-every N` and `--val-samples N` (issue #41) set the
+  validation cadence and how many held-out windows each pass measures.
+  Validation runs **on the device** when `--cuda` is active, forward
+  only, batched exactly as training batches: measured at ~0.0055 s per
+  window against the old CPU autograd path's ~0.41, roughly 74x
+  cheaper. That matters for precision rather than speed. At 100 windows
+  the sampling error is ~0.02 bits/char, which is the same order as
+  effects being compared elsewhere on this page, so GPU runs default to
+  **2000** windows (~11s per pass, still cheaper than the old 100-window
+  CPU pass at ~41s, and roughly a 4.5x tighter error bar). CPU runs keep
+  the 100 default, since 2000 windows through the autograd tape would
+  cost minutes per eval. An explicit `--val-samples` always wins.
 - `--checkpoint-every N` (issue #19) writes a crash-recovery
   checkpoint to `models/<out>.f32.bin` every N steps (default 500,
   `0` = only at run end). Writes are atomic (temp file + rename), so
