@@ -564,7 +564,8 @@ Best artefact on this corpus: **seq 256 / batch 8 at hidden 256,
 2.263 bits/char** (`models/full-char-seq256-b8.best.f32.bin`).
 
 **Read this table as a result about 4.82M windows, not about
-training.** Two of its rows were reproduced on an 11x corpus and came
+training**, and as 100-window measurements (~0.02 bits/char of
+sampling error - see the note in the corpus section below). Two of its rows were reproduced on an 11x corpus and came
 out with the opposite sign - the schedule-length row and the parameter
 row both invert. The bigger-corpus section below has the corrected
 numbers and the reason. What survives unchanged is the observation
@@ -654,6 +655,9 @@ cosine, on 52.96M windows; each row changes one thing from the row it
 is compared against. Figures are best-validation, so they compare
 like with like.
 
+(All measured at 100 validation windows, ~0.02 bits/char of sampling
+error. See the note below before comparing these to a newer run.)
+
 | run | change | best bits/char | vs its control |
 |---|---|---|---|
 | `gutenberg-8k` | batch 8 baseline | 1.986 | - |
@@ -708,11 +712,43 @@ Three caveats worth keeping attached to that number:
   corpus ends with its best checkpoint at the final step. The
   schedules are the binding constraint now, not the data, and no
   turnover has been located at all.
-- **The differences are only a few times the measurement noise.**
-  Validation samples 100 windows out of 5.88M, which is worth about
-  0.02 bits/char of sampling error (issue #41). The 0.162 model-size
-  result is comfortably clear of that; the 0.051 batch result is not
-  comfortably clear of it.
+- **Every figure on this page was measured on 100 validation
+  windows**, and carries about 0.02 bits/char of sampling error as a
+  result. See the note below before comparing any of them against a
+  newer run.
+
+### All figures above are 100-window measurements
+
+Every bits/char number on this page predates issue #41 and was taken
+with `val_eval_samples = 100`, sampled from 5.88M validation windows.
+That is worth roughly **0.02 bits/char of sampling error**, which is
+not a footnote at the sizes being compared here:
+
+| effect | size | vs the 0.02 noise |
+|---|---|---|
+| 2.25x parameters | 0.162 | comfortably clear |
+| 2x schedule (bigger corpus) | 0.184 | comfortably clear |
+| 2x batch | 0.051 | ~2.5x, not comfortably clear |
+| 2x context (batch fixed) | 0.042 | ~2x, not comfortably clear |
+
+This is measured, not estimated. The `gutenberg-h384` best checkpoint
+reads **1.772** bits/char on 100 windows and **1.752** on 2000 - the
+same weights, differing only in sample size, 0.020 apart.
+
+Since issue #41 made device-side validation ~74x cheaper per window,
+GPU runs default to **2000** windows (~0.0045 bits/char of error).
+That creates a trap worth naming: **a new run's figure is not directly
+comparable to anything above**, because the two differ in sample size
+as well as in whatever was being tested. Re-measure the older
+checkpoint on the same basis before comparing, which is now cheap:
+
+```sh
+bitnet-toy train <corpus> <same geometry flags> --steps 1 \
+    --resume models/<old>.best.f32.bin --cuda --checkpoint-every 0
+```
+
+The step-0 validation line reports the resumed weights on the current
+default sample count.
 
 ### The lesson that keeps recurring
 
