@@ -2,7 +2,7 @@
 
 ![version](https://img.shields.io/badge/version-v0.19.0-3b6ea5)
 ![Rust](https://img.shields.io/badge/Rust-2024%20edition-ce412b?logo=rust&logoColor=white)
-![tests](https://img.shields.io/badge/tests-157%20passing-3f9142)
+![tests](https://img.shields.io/badge/tests-163%20passing-3f9142)
 ![CUDA](https://img.shields.io/badge/CUDA-optional%20(cudarc%200.19)-76b900?logo=nvidia&logoColor=white)
 ![ML dependencies](https://img.shields.io/badge/ML%20dependencies-none-3f9142)
 
@@ -28,7 +28,7 @@ inference, binary export. No third-party ML dependencies.
 
 ## Status
 
-- **157** tests passing on `cargo test`; **200** with `cargo test --features cuda`.
+- **163** tests passing on `cargo test`; **206** with `cargo test --features cuda`.
 - **0** warnings on `cargo build --release` (or `--features cuda`).
 - `cargo audit` clean for the default build (stdlib-only); the optional
   `cuda` feature pulls `cudarc` and its small dynamic-loading deps.
@@ -225,7 +225,7 @@ The importer in `export::import` reads any of the three formats, returning a
 
 ```sh
 cargo build --release       # optimised binary at target/release/bitnet-toy
-cargo test                  # runs 157 tests (200 with --features cuda)
+cargo test                  # runs 163 tests (206 with --features cuda)
 cargo fmt                   # apply rustfmt
 cargo clippy --all-targets  # extra lints (pedantic warnings allowed at crate level)
 cargo audit                 # security audit; trivially clean (no deps)
