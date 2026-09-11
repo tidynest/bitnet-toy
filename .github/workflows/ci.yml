@@ -27,10 +27,14 @@ jobs:
       - run: cargo test
 
   deny:
+    # Plain `cargo deny check`, as the local gate runs it. The cargo-deny
+    # action defaults to --all-features, which pulls cudarc's ISC-licensed
+    # deps into a policy written for the dependency-free default build.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: taiki-e/install-action@cargo-deny
+      - run: cargo deny check
 
   neon:
     # Bit-identity of the NEON kernels against the scalar path. qemu-user
