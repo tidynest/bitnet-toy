@@ -118,12 +118,12 @@ mod tests {
         )
     }
 
-    fn build_heads<'t>(
-        tape: &'t Tape,
+    fn build_heads(
+        tape: &Tape,
         n_heads: usize,
         hidden_dim: usize,
         head_dim: usize,
-    ) -> Vec<AttentionHeadVars<'t>> {
+    ) -> Vec<AttentionHeadVars<'_>> {
         (0..n_heads)
             .map(|i| {
                 let off = (i as f32) * 0.001;
