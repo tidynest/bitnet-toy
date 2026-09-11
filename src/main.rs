@@ -279,7 +279,7 @@ pub struct TrainConfig {
     /// Issue #24: tokeniser recovered from a resume checkpoint's BPEM
     /// section. Wins over `tokenizer_path` - the checkpoint knows what
     /// it was trained with.
-    pub resume_tokenizer: Option<crate::bpe::Bpe>,
+    pub resume_tokenizer: Option<crate::data::Tokeniser>,
     /// Issue #19: write a crash-recovery checkpoint every N steps
     /// (`0` disables). Only fires when `checkpoint_stem` is set.
     pub checkpoint_every: usize,
@@ -885,14 +885,14 @@ fn train_bitnet_lm(
         None => TINY_CORPUS.to_string(),
     };
 
-    // Issue #24: checkpoint-embedded tokeniser wins, then a --tokenizer
-    // artefact, else the char vocab from the corpus.
-    let vocab = if let Some(b) = cfg.resume_tokenizer.clone() {
+    // Checkpoint-embedded tokeniser wins, then a --tokenizer artefact,
+    // else the char vocab from the corpus.
+    let vocab = if let Some(t) = cfg.resume_tokenizer.clone() {
         println!(
-            "using the checkpoint's embedded BPE tokeniser (vocab {})",
-            b.size()
+            "using the checkpoint's embedded tokeniser (vocab {})",
+            t.size()
         );
-        crate::data::Tokeniser::Bpe(b)
+        t
     } else {
         match &cfg.tokenizer_path {
             Some(p) => match std::fs::File::open(p).and_then(|mut f| crate::bpe::Bpe::load(&mut f))
@@ -1449,10 +1449,10 @@ fn apply_resume_checkpoint(cfg: &mut TrainConfig, p: &std::path::Path) {
         }
     };
     match export::import(&mut f) {
-        Ok((m, fmt, optim, bpe)) => {
-            if let Some(b) = bpe {
-                println!("checkpoint carries a BPE tokeniser (vocab {})", b.size());
-                cfg.resume_tokenizer = Some(b);
+        Ok((m, fmt, optim, tokeniser)) => {
+            if let Some(t) = tokeniser {
+                println!("checkpoint carries its tokeniser (vocab {})", t.size());
+                cfg.resume_tokenizer = Some(t);
             }
             let optim_msg = if optim.is_some() {
                 "with optim state"
@@ -1498,7 +1498,7 @@ fn write_f32_checkpoint(
 }
 
 /// Inner writer (issues #19 + #28): atomic, self-contained (bf16
-/// masters + OPTM + BPEM), any filename under `models/`.
+/// masters + OPTM + the tokeniser), any filename under `models/`.
 fn write_named_checkpoint(
     model: &crate::model::Model,
     optim_state: &crate::optim::OptimState,
@@ -1513,11 +1513,10 @@ fn write_named_checkpoint(
     // in the header is what imports dispatch on.
     export::export_bf16(model, &mut f32_buf, Some(optim_state))
         .expect("bf16 export to Vec cannot fail");
-    // Issue #24: a BPE-trained model is unusable without its merges -
-    // embed them so the checkpoint is self-contained.
-    if let crate::data::Tokeniser::Bpe(b) = tokeniser {
-        export::append_bpe_section(&mut f32_buf, b).expect("BPE section to Vec cannot fail");
-    }
+    // The tokeniser travels inside the checkpoint so `sample` and `eval`
+    // need no corpus: BPE merges (issue #24) or the char vocab.
+    export::append_tokeniser_section(&mut f32_buf, tokeniser)
+        .expect("tokeniser section to Vec cannot fail");
     let path = models_path(filename);
     let tmp = models_path(&format!(".{filename}.tmp"));
     std::fs::write(&tmp, &f32_buf)?;
@@ -1557,9 +1556,8 @@ fn save_train_artefacts(
     let mut packed = Vec::new();
     export::export_ternary_packed(model, &mut packed, None)
         .expect("packed export to Vec cannot fail");
-    if let crate::data::Tokeniser::Bpe(b) = tokeniser {
-        export::append_bpe_section(&mut packed, b).expect("BPE section to Vec cannot fail");
-    }
+    export::append_tokeniser_section(&mut packed, tokeniser)
+        .expect("tokeniser section to Vec cannot fail");
     let path = models_path(&format!("{stem}.ternary_packed.bin"));
     let _ = std::fs::write(&path, &packed);
     println!(
@@ -2302,7 +2300,7 @@ fn run_inspect_cli(path: std::path::PathBuf) {
             std::process::exit(1);
         }
     };
-    let (model, fmt, optim, bpe) = match export::import(&mut f) {
+    let (model, fmt, optim, tokeniser) = match export::import(&mut f) {
         Ok(parts) => parts,
         Err(e) => {
             eprintln!("could not parse checkpoint {}: {e}", path.display());
@@ -2325,9 +2323,13 @@ fn run_inspect_cli(path: std::path::PathBuf) {
         c.vocab_size * c.hidden_dim
     );
     println!(
-        "trailers  = optimiser state: {}, embedded BPE: {}",
+        "trailers  = optimiser state: {}, tokeniser: {}",
         if optim.is_some() { "yes" } else { "no" },
-        bpe.map_or("no".to_string(), |b| format!("yes ({} tokens)", b.size()))
+        match &tokeniser {
+            None => "none (pass --corpus to sample)".to_string(),
+            Some(crate::data::Tokeniser::Char(v)) => format!("char vocab ({} chars)", v.size()),
+            Some(crate::data::Tokeniser::Bpe(b)) => format!("BPE ({} tokens)", b.size()),
+        }
     );
 
     println!("\nternary histogram of BitLinear weights (absmean quantisation):");
@@ -2376,20 +2378,6 @@ fn run_sample_cli(
         eprintln!("checkpoint not found: {}", path.display());
         std::process::exit(1);
     }
-    let corpus_path =
-        corpus_override.unwrap_or_else(|| std::path::PathBuf::from("data/tinyshakespeare.txt"));
-    if !corpus_path.exists() {
-        eprintln!(
-            "Could not find {} (needed to rebuild the same vocab the model was trained against).\n\
-             For a model trained via `train <corpus>`, pass the same corpus with --corpus.\n\
-             For the Shakespeare models, download it with:\n  \
-             curl -sSL https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt \\\n    \
-             -o data/tinyshakespeare.txt",
-            corpus_path.display()
-        );
-        std::process::exit(1);
-    }
-
     let mut f = match std::fs::File::open(&path) {
         Ok(f) => f,
         Err(e) => {
@@ -2397,7 +2385,7 @@ fn run_sample_cli(
             std::process::exit(1);
         }
     };
-    let (model, fmt, _optim, embedded_bpe) = match export::import(&mut f) {
+    let (model, fmt, _optim, embedded) = match export::import(&mut f) {
         Ok(parts) => parts,
         Err(e) => {
             eprintln!("could not parse checkpoint {}: {}", path.display(), e);
@@ -2415,6 +2403,28 @@ fn run_sample_cli(
         model.config.max_seq_len
     );
 
+    // A checkpoint carrying its tokeniser is self-contained; the corpus
+    // is only needed for files written before the VOCB trailer existed.
+    if let Some(t) = embedded {
+        println!(
+            "using the checkpoint's embedded tokeniser (vocab {})",
+            t.size()
+        );
+        return sample_with_tokeniser(model, t, raw_prompt);
+    }
+    let corpus_path =
+        corpus_override.unwrap_or_else(|| std::path::PathBuf::from("data/tinyshakespeare.txt"));
+    if !corpus_path.exists() {
+        eprintln!(
+            "Could not find {} (needed to rebuild the same vocab the model was trained against).\n\
+             For a model trained via `train <corpus>`, pass the same corpus with --corpus.\n\
+             For the Shakespeare models, download it with:\n  \
+             curl -sSL https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt \\\n    \
+             -o data/tinyshakespeare.txt",
+            corpus_path.display()
+        );
+        std::process::exit(1);
+    }
     let corpus = match read_corpus(&corpus_path) {
         Ok(s) => s,
         Err(e) => {
@@ -2422,20 +2432,6 @@ fn run_sample_cli(
             std::process::exit(1);
         }
     };
-    // Issue #24: a checkpoint carrying its BPE tokeniser is
-    // self-contained - the corpus is only needed for char vocabs.
-    if let Some(b) = embedded_bpe {
-        assert_eq!(
-            b.size(),
-            model.config.vocab_size,
-            "embedded tokeniser vocab does not match the model config"
-        );
-        println!(
-            "using the checkpoint's embedded BPE tokeniser (vocab {})",
-            b.size()
-        );
-        return sample_with_tokeniser(model, crate::data::Tokeniser::Bpe(b), raw_prompt);
-    }
     let vocab = Vocab::from_text(&corpus);
     if vocab.size() != model.config.vocab_size {
         eprintln!(
@@ -3102,7 +3098,7 @@ fn main() {
     );
     let mut cursor = std::io::Cursor::new(packed_buf);
     match export::import(&mut cursor) {
-        Ok((loaded_model, fmt, _opt, _bpe)) => {
+        Ok((loaded_model, fmt, _opt, _tokeniser)) => {
             println!(
                 "loaded {:?}-format model with vocab={}",
                 fmt, loaded_model.config.vocab_size
