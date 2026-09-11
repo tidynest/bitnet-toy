@@ -46,6 +46,7 @@ mod inference;
 mod inference_kv;
 mod model;
 mod optim;
+mod plot;
 mod tensor;
 
 use autograd::{Tape, Var};
@@ -1936,6 +1937,7 @@ fn print_help() {
          shakespeare-large [resume]    ~8.5M-param variant, seq_len 128\n  \
          sample <checkpoint> [--corpus <path>] [prompt]\n                                generate from a checkpoint, no training; --corpus\n                                rebuilds the vocab for `train`-made checkpoints\n  \
          inspect <checkpoint>          config, parameter count, ternary histogram per block\n  \
+         plot <log> [--out FILE]       SVG loss curve from a training log (default <log>.svg)\n  \
          cuda-shakespeare [resume]     GPU ~5M training        (needs --features cuda)\n  \
          cuda-shakespeare-large        GPU ~8.5M training      (needs --features cuda)\n  \
          cuda-demo                     CPU vs CUDA matmul timings (needs --features cuda)\n  \
@@ -2239,6 +2241,53 @@ fn parse_sample_args(args: &[String]) -> Result<SampleArgs, String> {
 /// characters are dropped with a warning instead of panicking, so
 /// "feed it random BS" stays friendly. Without one, the stock prompts
 /// run, filtered to those the vocab can actually encode.
+/// `plot <log> [--out FILE]`. Output defaults to the log path with an
+/// `.svg` extension.
+fn parse_plot_args(args: &[String]) -> Result<(std::path::PathBuf, std::path::PathBuf), String> {
+    let mut log = None;
+    let mut out = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--out" => out = Some(it.next().ok_or("--out needs a path")?.into()),
+            flag if flag.starts_with("--") => return Err(format!("unknown flag: {flag}")),
+            p if log.is_none() => log = Some(std::path::PathBuf::from(p)),
+            extra => return Err(format!("unexpected argument: {extra}")),
+        }
+    }
+    let log: std::path::PathBuf = log.ok_or("missing log path")?;
+    let out = out.unwrap_or_else(|| log.with_extension("svg"));
+    Ok((log, out))
+}
+
+fn run_plot_cli(log: &std::path::Path, out: &std::path::Path) {
+    let text = match std::fs::read_to_string(log) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("could not read {}: {e}", log.display());
+            std::process::exit(1);
+        }
+    };
+    let series = crate::plot::parse_log(&text);
+    let title = log
+        .file_stem()
+        .map_or(String::new(), |s| s.to_string_lossy().into_owned());
+    let Some(svg) = crate::plot::render_svg(&series, &title) else {
+        eprintln!("no `step N   train_loss = ...` lines in {}", log.display());
+        std::process::exit(1);
+    };
+    if let Err(e) = std::fs::write(out, svg) {
+        eprintln!("could not write {}: {e}", out.display());
+        std::process::exit(1);
+    }
+    println!(
+        "{} train points, {} val points -> {}",
+        series.train.len(),
+        series.val.len(),
+        out.display()
+    );
+}
+
 /// `inspect <checkpoint>`: header, parameter count, and how the BitLinear
 /// weights split into -1 / 0 / +1 under absmean quantisation, per block
 /// and in total. The embedding is not a BitLinear weight and is left out
@@ -2878,6 +2927,18 @@ fn main() {
             .map(std::path::PathBuf::from)
             .filter(|p| p.exists());
         run_shakespeare_training(resume_path, large, /*use_cuda=*/ false);
+        return;
+    }
+    if args.len() > 1 && args[1] == "plot" {
+        match parse_plot_args(&args[2..]) {
+            Ok((log, out)) => run_plot_cli(&log, &out),
+            Err(e) => {
+                eprintln!(
+                    "error: {e}\nusage: cargo run --release -- plot <training.log> [--out curve.svg]"
+                );
+                std::process::exit(2);
+            }
+        }
         return;
     }
     if args.len() > 1 && args[1] == "inspect" {
