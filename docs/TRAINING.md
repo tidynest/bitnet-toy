@@ -891,13 +891,16 @@ the previous run's, you cannot resume from that previous checkpoint.
   would be the next step for something in the gigabyte range.
 - AdamW state IS persisted across `cargo run` invocations as of v0.7
   (BNT3 + OPTM payload). Old pre-v0.7 BNT3 checkpoints still load but
-  the optimiser starts at zero momentum. The cosine LR schedule still
-  restarts each run.
-- Batching is window-level only. The forward pass for a single window is
-  still serial across positions and matmul rows; if you want to actually
-  use all 16 threads, push `batch_size` and `n_workers` up to 8 or 16.
-  Future work: parallel matmul rows (TODO), then SIMD intrinsics, then
-  GPU back-end via cudarc.
+  the optimiser starts at zero momentum. Resuming from a checkpoint
+  continues the cosine LR schedule from the saved step (see "Resume"
+  above); only an import from `ternary_packed.bin` restarts it from
+  warmup.
+- CPU batching is window-level only. The forward pass for a single
+  window is still serial across positions and matmul rows; if you want
+  to actually use all 16 threads, push `batch_size` and `n_workers` up
+  to 8 or 16. The NEON kernels widen the inner loop, they do not split
+  rows across threads. The cudarc back-end (`--features cuda`) is the
+  path that parallelises within a window.
 
 ## Batching and threading notes
 
