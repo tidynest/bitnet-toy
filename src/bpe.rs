@@ -139,7 +139,8 @@ impl Bpe {
         let mut buf4 = [0u8; 4];
         r.read_exact(&mut buf4)?;
         let n = u32::from_le_bytes(buf4) as usize;
-        let mut merges = Vec::with_capacity(n);
+        // `n` is untrusted; cap the reservation, the loop grows past it.
+        let mut merges = Vec::with_capacity(n.min(1 << 20));
         for _ in 0..n {
             r.read_exact(&mut buf4)?;
             let a = u32::from_le_bytes(buf4);
@@ -215,6 +216,16 @@ mod tests {
             assert_eq!(&bpe.decode(&ids), case, "round-trip failed");
             assert!(ids.iter().all(|&i| i < bpe.size()), "id out of range");
         }
+    }
+
+    /// The merge count is untrusted. u32::MAX with no payload must be an
+    /// error, not a 32 GB preallocation.
+    #[test]
+    fn load_survives_absurd_merge_count() {
+        let mut bytes = BPE_MAGIC.to_vec();
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        let err = Bpe::load(&mut std::io::Cursor::new(bytes)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 
     /// Determinism: same corpus + size -> byte-identical artefacts.

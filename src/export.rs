@@ -167,6 +167,24 @@ fn read_header<R: Read>(r: &mut R) -> io::Result<(Format, ModelConfig)> {
     let max_seq_len = read_u32(r)? as usize;
     let n_blocks = read_u32(r)? as usize;
 
+    // The header is untrusted bytes. A zero dim describes no model, and
+    // every reader below sizes its allocation from these numbers.
+    let dims = [
+        vocab_size,
+        hidden_dim,
+        n_heads,
+        head_dim,
+        ffn_dim,
+        max_seq_len,
+        n_blocks,
+    ];
+    if dims.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "header has a zero dimension",
+        ));
+    }
+
     Ok((
         fmt,
         ModelConfig {
@@ -182,6 +200,22 @@ fn read_header<R: Read>(r: &mut R) -> io::Result<(Format, ModelConfig)> {
 }
 
 // ---- per-tensor helpers ----
+
+/// Largest element count a reader preallocates for. Sizes come from the
+/// file, so a hostile header must not turn into a multi-gigabyte
+/// reservation before the first byte is read; past this the Vec grows as
+/// bytes actually arrive and EOF ends it.
+const PREALLOC_CAP: usize = 1 << 24;
+
+/// Element count of `shape`, plus a Vec sized for it. Overflow is an
+/// error rather than a wrap or a capacity-overflow panic.
+fn shaped_vec(shape: &[usize]) -> io::Result<(usize, Vec<f32>)> {
+    let n = shape
+        .iter()
+        .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "tensor shape overflows usize"))?;
+    Ok((n, Vec::with_capacity(n.min(PREALLOC_CAP))))
+}
 
 fn write_f32_tensor<W: Write>(w: &mut W, t: &Tensor) -> io::Result<usize> {
     let mut bytes = 0;
@@ -206,8 +240,7 @@ fn write_bf16_tensor<W: Write>(w: &mut W, t: &Tensor) -> io::Result<usize> {
 }
 
 fn read_bf16_tensor<R: Read>(r: &mut R, shape: Vec<usize>) -> io::Result<Tensor> {
-    let len: usize = shape.iter().product();
-    let mut data = Vec::with_capacity(len);
+    let (len, mut data) = shaped_vec(&shape)?;
     let mut buf = [0u8; 2];
     for _ in 0..len {
         r.read_exact(&mut buf)?;
@@ -230,8 +263,7 @@ fn write_ternary_tensor<W: Write>(w: &mut W, t: &Tensor) -> io::Result<usize> {
 }
 
 fn read_f32_tensor<R: Read>(r: &mut R, shape: Vec<usize>) -> io::Result<Tensor> {
-    let n: usize = shape.iter().product();
-    let mut data = Vec::with_capacity(n);
+    let (n, mut data) = shaped_vec(&shape)?;
     let mut buf = [0u8; 4];
     for _ in 0..n {
         r.read_exact(&mut buf)?;
@@ -285,13 +317,12 @@ fn write_ternary_packed_tensor<W: Write>(w: &mut W, t: &Tensor) -> io::Result<us
 }
 
 fn read_ternary_packed_tensor<R: Read>(r: &mut R, shape: Vec<usize>) -> io::Result<Tensor> {
-    let n: usize = shape.iter().product();
+    let (n, mut data) = shaped_vec(&shape)?;
     let mut buf = [0u8; 4];
     r.read_exact(&mut buf)?;
     let gamma = f32::from_le_bytes(buf);
 
     let n_bytes = n.div_ceil(5);
-    let mut data = Vec::with_capacity(n);
     let mut byte = [0u8; 1];
     for _ in 0..n_bytes {
         r.read_exact(&mut byte)?;
@@ -353,11 +384,10 @@ fn read_optim_state_body<R: Read>(
 }
 
 fn read_ternary_tensor<R: Read>(r: &mut R, shape: Vec<usize>) -> io::Result<Tensor> {
-    let n: usize = shape.iter().product();
+    let (n, mut data) = shaped_vec(&shape)?;
     let mut buf = [0u8; 4];
     r.read_exact(&mut buf)?;
     let gamma = f32::from_le_bytes(buf);
-    let mut data = Vec::with_capacity(n);
     let mut byte = [0u8; 1];
     for _ in 0..n {
         r.read_exact(&mut byte)?;
@@ -514,7 +544,7 @@ pub fn import<R: Read>(
         _ => read_f32_tensor(r, vec![cfg.vocab_size, h])?,
     };
 
-    let mut blocks = Vec::with_capacity(cfg.n_blocks);
+    let mut blocks = Vec::with_capacity(cfg.n_blocks.min(PREALLOC_CAP));
     for _ in 0..cfg.n_blocks {
         let read_w = |r: &mut R, shape: Vec<usize>| match fmt {
             Format::Float32 => read_f32_tensor(r, shape),
@@ -522,7 +552,7 @@ pub fn import<R: Read>(
             Format::TernaryPacked => read_ternary_packed_tensor(r, shape),
             Format::MastersBf16 => read_bf16_tensor(r, shape),
         };
-        let mut heads = Vec::with_capacity(cfg.n_heads);
+        let mut heads = Vec::with_capacity(cfg.n_heads.min(PREALLOC_CAP));
         for _ in 0..cfg.n_heads {
             heads.push(AttentionHead {
                 w_q: read_w(r, vec![h, d])?,
@@ -1006,6 +1036,45 @@ mod tests {
         export_bf16(&model, &mut plain, None).unwrap();
         let (_m, _fmt, _opt, none) = import(&mut Cursor::new(&plain)).unwrap();
         assert!(none.is_none(), "phantom tokeniser from a plain checkpoint");
+    }
+
+    /// Build a BNT5 header by hand: magic, format byte, then seven
+    /// little-endian u32 dims in file order.
+    fn header(fmt: u8, dims: [u32; 7]) -> Vec<u8> {
+        let mut h = MAGIC.to_vec();
+        h.push(fmt);
+        for d in dims {
+            h.extend_from_slice(&d.to_le_bytes());
+        }
+        h
+    }
+
+    /// A header is untrusted input. Dims of u32::MAX must produce an
+    /// error, never a capacity-overflow panic or an allocation abort.
+    #[test]
+    fn import_survives_absurd_header_dims() {
+        let bytes = header(0, [u32::MAX; 7]);
+        let err = import(&mut Cursor::new(&bytes)).unwrap_err();
+        assert!(
+            matches!(
+                err.kind(),
+                io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof
+            ),
+            "unexpected error kind {:?}",
+            err.kind()
+        );
+    }
+
+    /// A zero dim describes no model at all; reject it at the header
+    /// rather than letting an empty tensor reach the forward pass.
+    #[test]
+    fn import_rejects_zero_dim_in_header() {
+        for i in 0..7 {
+            let mut dims = [8u32; 7];
+            dims[i] = 0;
+            let err = import(&mut Cursor::new(header(0, dims))).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "dim {i}");
+        }
     }
 
     #[test]
