@@ -34,6 +34,7 @@
 
 use crate::autograd::{Tape, Var};
 use crate::block::{BlockWeights, transformer_block};
+use crate::data::Lcg;
 use crate::tensor::Tensor;
 
 /// Hyperparameters. Cheap to clone - fields are all `usize`.
@@ -100,31 +101,12 @@ pub struct ModelLeaves<'t> {
     pub blocks: Vec<BlockWeights<'t>>,
 }
 
-/// Tiny linear congruential generator - Numerical Recipes constants.
-/// Not cryptographic, not statistically great; just good enough to break
-/// initialisation symmetry without adding a `rand` crate dependency.
-struct Lcg {
-    state: u64,
-}
-impl Lcg {
-    fn new(seed: u64) -> Self {
-        Self {
-            state: seed.wrapping_add(1),
-        }
-    }
-    /// Uniform sample in [-1, 1).
-    fn next_f32(&mut self) -> f32 {
-        self.state = self
-            .state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        ((self.state >> 41) as f32 / (1u32 << 22) as f32) - 1.0
-    }
-    fn fill_tensor(&mut self, shape: Vec<usize>, scale: f32) -> Tensor {
-        let n: usize = shape.iter().product();
-        let data = (0..n).map(|_| self.next_f32() * scale).collect();
-        Tensor { data, shape }
-    }
+/// Fill a tensor with `Lcg::next_symmetric() * scale` samples. Init lives
+/// here rather than on `Lcg` so `data.rs` stays free of `Tensor`.
+fn fill_tensor(rng: &mut Lcg, shape: Vec<usize>, scale: f32) -> Tensor {
+    let n: usize = shape.iter().product();
+    let data = (0..n).map(|_| rng.next_symmetric() * scale).collect();
+    Tensor { data, shape }
 }
 
 impl Model {
@@ -148,7 +130,7 @@ impl Model {
         // learned positional embedding: RoPE injects position info inside
         // attention (see `autograd::rope`).
         let scale_embed = 1.0 / (h as f32).sqrt();
-        let token_embed = rng.fill_tensor(vec![config.vocab_size, h], scale_embed);
+        let token_embed = fill_tensor(&mut rng, vec![config.vocab_size, h], scale_embed);
 
         // Linear-layer inits: scale by 1/√fan_in (a poor man's Kaiming).
         let scale_h_d = 1.0 / (h as f32).sqrt();
@@ -160,17 +142,17 @@ impl Model {
             .map(|_| {
                 let heads = (0..config.n_heads)
                     .map(|_| AttentionHead {
-                        w_q: rng.fill_tensor(vec![h, d], scale_h_d),
-                        w_k: rng.fill_tensor(vec![h, d], scale_h_d),
-                        w_v: rng.fill_tensor(vec![h, d], scale_h_d),
-                        w_o: rng.fill_tensor(vec![d, h], scale_d_h),
+                        w_q: fill_tensor(&mut rng, vec![h, d], scale_h_d),
+                        w_k: fill_tensor(&mut rng, vec![h, d], scale_h_d),
+                        w_v: fill_tensor(&mut rng, vec![h, d], scale_h_d),
+                        w_o: fill_tensor(&mut rng, vec![d, h], scale_d_h),
                     })
                     .collect();
                 BlockMasters {
                     heads,
-                    ffn_gate_w: rng.fill_tensor(vec![h, f], scale_h_f),
-                    ffn_up_w: rng.fill_tensor(vec![h, f], scale_h_f),
-                    ffn_down_w: rng.fill_tensor(vec![f, h], scale_f_h),
+                    ffn_gate_w: fill_tensor(&mut rng, vec![h, f], scale_h_f),
+                    ffn_up_w: fill_tensor(&mut rng, vec![h, f], scale_h_f),
+                    ffn_down_w: fill_tensor(&mut rng, vec![f, h], scale_f_h),
                 }
             })
             .collect();

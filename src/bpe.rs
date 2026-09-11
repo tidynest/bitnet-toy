@@ -195,7 +195,7 @@ mod tests {
     #[test]
     fn encode_decode_round_trips_arbitrary_utf8() {
         let bpe = Bpe::train(b"the quick brown fox jumps over the lazy dog. ", 300);
-        let mut lcg = 0x2545F4914F6CDD1Du64;
+        let mut lcg = crate::data::Lcg::new(0x2545_F491_4F6C_DD1D);
         let mut cases: Vec<String> = vec![
             String::new(),
             "the the the".into(),
@@ -205,10 +205,7 @@ mod tests {
         for _ in 0..50 {
             let mut s = String::new();
             for _ in 0..40 {
-                lcg = lcg
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                let c = char::from_u32((lcg >> 40) as u32 % 0x2FFF).unwrap_or('x');
+                let c = char::from_u32((lcg.next_u64() >> 40) as u32 % 0x2FFF).unwrap_or('x');
                 s.push(c);
             }
             cases.push(s);
