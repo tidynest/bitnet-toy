@@ -769,6 +769,14 @@ pub fn eval_val_perplexity(
     (mean_ce, mean_ce.exp())
 }
 
+/// Bits per CHARACTER, the only loss unit comparable across tokenisers
+/// (issue #24): per-token perplexities are not, since a BPE token spans
+/// several chars. nats/token * tokens/char / ln 2.
+fn bits_per_char(tokeniser: &data::Tokeniser, val_ids: &[usize], val_loss: f32) -> f32 {
+    let val_chars = tokeniser.decode(val_ids).chars().count().max(1);
+    val_loss * (val_ids.len() as f32 / val_chars as f32) / std::f32::consts::LN_2
+}
+
 /// Pick the validation backend (issue #41): device-side when a
 /// `CudaModel` is live, the CPU autograd path otherwise.
 ///
@@ -1346,18 +1354,12 @@ fn train_bitnet_lm(
             cfg.batch_size,
         );
         let baseline_ppl = vocab.size() as f32;
-        // Issue #24: bits per CHARACTER - the only loss unit comparable
-        // across tokenisers (per-token perplexities are not: a BPE
-        // token spans several chars). nats/token * tokens/char / ln 2.
-        let val_chars = vocab.decode(val_ids).chars().count().max(1);
-        let bits_per_char =
-            val_loss * (val_ids.len() as f32 / val_chars as f32) / std::f32::consts::LN_2;
         println!(
             "\nfinal validation:  val_loss = {:.4}   val_ppl = {:.3}   \
              bits/char = {:.3}   (uniform-vocab baseline = {:.1}, ratio = {:.3})",
             val_loss,
             val_ppl,
-            bits_per_char,
+            bits_per_char(&vocab, val_ids, val_loss),
             baseline_ppl,
             val_ppl / baseline_ppl
         );
@@ -1935,6 +1937,7 @@ fn print_help() {
          shakespeare-large [resume]    ~8.5M-param variant, seq_len 128\n  \
          sample <checkpoint> [--corpus <path>] [prompt]\n                                generate from a checkpoint, no training; --corpus\n                                rebuilds the vocab for `train`-made checkpoints\n  \
          inspect <checkpoint>          config, parameter count, ternary histogram per block\n  \
+         eval <checkpoint> <corpus>    validation loss and bits/char, no training (see below)\n  \
          plot <log> [--out FILE]       SVG loss curve from a training log (default <log>.svg)\n  \
          cuda-shakespeare [resume]     GPU ~5M training        (needs --features cuda)\n  \
          cuda-shakespeare-large        GPU ~8.5M training      (needs --features cuda)\n  \
@@ -1944,6 +1947,177 @@ fn print_help() {
          help | --help | -h            this text\n"
     );
     print!("{TRAIN_USAGE}");
+    print!("{EVAL_USAGE}");
+}
+
+const EVAL_USAGE: &str = "\
+usage: bitnet-toy eval <checkpoint> <corpus> [options]
+  Measures a checkpoint on the same held-out tail `train` used: the last
+  --val-split of the corpus, sampled at the same deterministic stride.
+  --val-split F    held-out fraction, must match the training run (default 0.10)
+  --val-samples N  windows per pass (default 2000 with --cuda, 100 without)
+  --batch-size N   windows per device forward (default 16)
+  --tokenizer PATH .bpe artefact for checkpoints that do not embed one
+  --cuda           evaluate on the GPU (needs a build with --features cuda)
+";
+
+/// `eval` arguments. Geometry comes from the checkpoint header; only the
+/// split and the sampling need saying.
+struct EvalArgs {
+    checkpoint: std::path::PathBuf,
+    corpus: std::path::PathBuf,
+    val_split: f32,
+    val_samples: usize,
+    batch_size: usize,
+    tokenizer: Option<std::path::PathBuf>,
+    cuda: bool,
+}
+
+fn parse_eval_args(args: &[String]) -> Result<EvalArgs, String> {
+    let mut positional = Vec::new();
+    let mut a = EvalArgs {
+        checkpoint: std::path::PathBuf::new(),
+        corpus: std::path::PathBuf::new(),
+        val_split: 0.10,
+        val_samples: 0,
+        batch_size: 16,
+        tokenizer: None,
+        cuda: false,
+    };
+    let mut it = args.iter();
+    let value = |flag: &str, it: &mut std::slice::Iter<'_, String>| {
+        it.next()
+            .ok_or_else(|| format!("{flag} needs a value"))
+            .cloned()
+    };
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--val-split" => {
+                a.val_split = value(arg, &mut it)?
+                    .parse()
+                    .map_err(|e| format!("--val-split: {e}"))?;
+            }
+            "--val-samples" => {
+                a.val_samples = value(arg, &mut it)?
+                    .parse()
+                    .map_err(|e| format!("--val-samples: {e}"))?;
+            }
+            "--batch-size" => {
+                a.batch_size = value(arg, &mut it)?
+                    .parse()
+                    .map_err(|e| format!("--batch-size: {e}"))?;
+            }
+            "--tokenizer" => a.tokenizer = Some(value(arg, &mut it)?.into()),
+            "--cuda" => a.cuda = true,
+            flag if flag.starts_with("--") => return Err(format!("unknown flag: {flag}")),
+            p => positional.push(std::path::PathBuf::from(p)),
+        }
+    }
+    let [checkpoint, corpus] = <[std::path::PathBuf; 2]>::try_from(positional)
+        .map_err(|_| "expected exactly <checkpoint> <corpus>".to_string())?;
+    a.checkpoint = checkpoint;
+    a.corpus = corpus;
+    if a.val_samples == 0 {
+        a.val_samples = if a.cuda { 2000 } else { 100 };
+    }
+    if a.batch_size == 0 {
+        return Err("--batch-size must be >= 1".into());
+    }
+    Ok(a)
+}
+
+/// `eval <checkpoint> <corpus>`: one validation pass, printed in the same
+/// units as the trainer's final-validation line, so a checkpoint measured
+/// at 100 windows can be re-measured at 2000 on one basis.
+fn run_eval_cli(a: EvalArgs) {
+    use crate::data::{Tokeniser, Vocab, WindowSet, read_corpus};
+
+    let mut f = match std::fs::File::open(&a.checkpoint) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("could not open checkpoint {}: {e}", a.checkpoint.display());
+            std::process::exit(1);
+        }
+    };
+    let (model, fmt, _optim, embedded) = match export::import(&mut f) {
+        Ok(parts) => parts,
+        Err(e) => {
+            eprintln!("could not parse checkpoint {}: {e}", a.checkpoint.display());
+            std::process::exit(1);
+        }
+    };
+    let corpus = match read_corpus(&a.corpus) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("could not read {}: {e}", a.corpus.display());
+            std::process::exit(1);
+        }
+    };
+    let tokeniser = match (embedded, &a.tokenizer) {
+        (Some(t), _) => t,
+        (None, Some(p)) => {
+            match std::fs::File::open(p).and_then(|mut f| crate::bpe::Bpe::load(&mut f)) {
+                Ok(b) => Tokeniser::Bpe(b),
+                Err(e) => {
+                    eprintln!("could not load tokeniser {}: {e}", p.display());
+                    std::process::exit(1);
+                }
+            }
+        }
+        (None, None) => Tokeniser::Char(Vocab::from_text(&corpus)),
+    };
+    if tokeniser.size() != model.config.vocab_size {
+        eprintln!(
+            "vocab size mismatch: tokeniser has {}, checkpoint expects {}",
+            tokeniser.size(),
+            model.config.vocab_size
+        );
+        std::process::exit(1);
+    }
+
+    // Same split as train_bitnet_lm: the validation tail is the last
+    // `val_split` of the id stream.
+    let ids = tokeniser.encode(&corpus);
+    let val_chars = ((ids.len() as f32) * a.val_split.clamp(0.0, 0.5)) as usize;
+    let val_ids = &ids[ids.len().saturating_sub(val_chars)..];
+    let seq = model.config.max_seq_len;
+    if val_ids.len() <= seq + 1 {
+        eprintln!(
+            "validation tail too short: {} ids for seq_len {seq}",
+            val_ids.len()
+        );
+        std::process::exit(1);
+    }
+    let val_windows = WindowSet::new(val_ids, seq);
+
+    #[cfg(feature = "cuda")]
+    let cuda_model = a.cuda.then(|| crate::cuda::CudaModel::from_cpu(&model));
+    #[cfg(not(feature = "cuda"))]
+    if a.cuda {
+        eprintln!("--cuda needs a build with --features cuda");
+        std::process::exit(1);
+    }
+
+    println!(
+        "{}: {fmt:?}, vocab {}, seq_len {seq}, val tail {} ids ({} windows), {} sampled",
+        a.checkpoint.display(),
+        tokeniser.size(),
+        val_ids.len(),
+        val_windows.len(),
+        a.val_samples.min(val_windows.len())
+    );
+    let (val_loss, val_ppl) = run_validation(
+        &model,
+        #[cfg(feature = "cuda")]
+        cuda_model.as_ref(),
+        &val_windows,
+        a.val_samples,
+        a.batch_size,
+    );
+    println!(
+        "val_loss = {val_loss:.4}   val_ppl = {val_ppl:.3}   bits/char = {:.3}",
+        bits_per_char(&tokeniser, val_ids, val_loss)
+    );
 }
 
 /// Print the same five generation passes the trainer prints at the end
@@ -2925,6 +3099,16 @@ fn main() {
         run_shakespeare_training(resume_path, large, /*use_cuda=*/ false);
         return;
     }
+    if args.len() > 1 && args[1] == "eval" {
+        match parse_eval_args(&args[2..]) {
+            Ok(a) => run_eval_cli(a),
+            Err(e) => {
+                eprintln!("error: {e}\n{EVAL_USAGE}");
+                std::process::exit(2);
+            }
+        }
+        return;
+    }
     if args.len() > 1 && args[1] == "plot" {
         match parse_plot_args(&args[2..]) {
             Ok((log, out)) => run_plot_cli(&log, &out),
@@ -3582,6 +3766,24 @@ mod tests {
             b.resume.as_deref(),
             Some(std::path::Path::new("models/x.f32.bin"))
         );
+    }
+
+    #[test]
+    fn eval_args_parse_flags_and_default_samples_per_backend() {
+        let args: Vec<String> = ["m.bin", "c.txt", "--val-split", "0.2", "--cuda"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let a = parse_eval_args(&args).unwrap();
+        assert_eq!(a.checkpoint, std::path::PathBuf::from("m.bin"));
+        assert_eq!(a.corpus, std::path::PathBuf::from("c.txt"));
+        assert!((a.val_split - 0.2).abs() < 1e-6);
+        assert!(a.cuda);
+        assert_eq!(a.val_samples, 2000, "cuda default");
+        let cpu = parse_eval_args(&args[..2]).unwrap();
+        assert_eq!(cpu.val_samples, 100, "cpu default");
+        assert!(parse_eval_args(&args[..1]).is_err(), "corpus is required");
+        assert!(parse_eval_args(&["a".into(), "b".into(), "--nope".into()]).is_err());
     }
 
     #[test]
