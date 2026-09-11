@@ -49,7 +49,7 @@ impl Bpe {
             vocab_size > BPE_BASE,
             "BPE vocab_size must exceed {BPE_BASE} (the byte alphabet)"
         );
-        let mut stream: Vec<u32> = corpus.iter().map(|&b| b as u32).collect();
+        let mut stream: Vec<u32> = corpus.iter().map(|&b| u32::from(b)).collect();
         let mut merges: Vec<(u32, u32)> = Vec::with_capacity(vocab_size - BPE_BASE);
         for rank in 0..(vocab_size - BPE_BASE) {
             let mut counts: HashMap<(u32, u32), usize> = HashMap::new();
@@ -184,7 +184,7 @@ mod tests {
     #[test]
     fn learns_the_obvious_merge_first() {
         let bpe = Bpe::train(b"ababab ababab", 258);
-        assert_eq!(bpe.merges[0], (b'a' as u32, b'b' as u32));
+        assert_eq!(bpe.merges[0], (u32::from(b'a'), u32::from(b'b')));
         // "ab" now encodes to the single merged token.
         assert_eq!(bpe.encode("ab"), vec![BPE_BASE]);
         assert_eq!(bpe.decode(&[BPE_BASE]), "ab");

@@ -72,7 +72,7 @@ pub fn f32_to_bf16_bits(x: f32) -> u16 {
 /// Widen a bf16 bit pattern back to f32 (exact - bf16 is a strict
 /// subset of f32).
 pub fn bf16_bits_to_f32(h: u16) -> f32 {
-    f32::from_bits((h as u32) << 16)
+    f32::from_bits(u32::from(h) << 16)
 }
 
 /// Narrow an f32 onto the bf16 grid (RNE) and widen it back. The
@@ -1693,15 +1693,10 @@ mod tests {
         let (batch, seq, d) = (3_usize, 4_usize, 5_usize);
         let rows = batch * seq;
         let mk = |seed: u64, n: usize| {
-            let mut st = seed;
-            let mut v = Vec::with_capacity(n);
-            for _ in 0..n {
-                st = st
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                v.push(((st >> 40) as i64 as f32) / 8.0e6 - 1.0);
-            }
-            v
+            let mut rng = crate::data::Lcg::new(seed);
+            (0..n)
+                .map(|_| ((rng.next_u64() >> 40) as i64 as f32) / 8.0e6 - 1.0)
+                .collect::<Vec<f32>>()
         };
         let q = Tensor {
             data: mk(1, rows * d),
@@ -1755,15 +1750,10 @@ mod tests {
         let (batch, seq, d) = (2_usize, 3_usize, 4_usize);
         let rows = batch * seq;
         let mk = |seed: u64, n: usize| {
-            let mut st = seed;
-            let mut v = Vec::with_capacity(n);
-            for _ in 0..n {
-                st = st
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                v.push(((st >> 40) as i64 as f32) / 8.0e6 - 1.0);
-            }
-            v
+            let mut rng = crate::data::Lcg::new(seed);
+            (0..n)
+                .map(|_| ((rng.next_u64() >> 40) as i64 as f32) / 8.0e6 - 1.0)
+                .collect::<Vec<f32>>()
         };
         let s_blocked = Tensor {
             data: mk(7, rows * seq),
@@ -1857,7 +1847,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
+    #[should_panic(expected = "does not match shape product")]
     // Assertion in `from_vec` MUST fire on mismatch - a silent shape lie would be a nightmare to
     // debug later
     fn from_vec_panics_on_mismatch() {
@@ -2273,7 +2263,7 @@ mod bf16_tests {
     #[test]
     fn bf16_rne_round_trip_and_boundaries() {
         // Exactly representable: sign, zero, powers of two, 1.0 + 2^-7.
-        for &x in &[0.0f32, -0.0, 1.0, -1.0, 0.5, 2.0, 1.0078125] {
+        for &x in &[0.0f32, -0.0, 1.0, -1.0, 0.5, 2.0, 1.007_812_5] {
             assert_eq!(
                 narrow_to_bf16(x).to_bits(),
                 x.to_bits(),
@@ -2290,12 +2280,12 @@ mod bf16_tests {
             );
         }
         // Halfway cases round to EVEN mantissa:
-        // 1.0 + 2^-8 sits exactly between 1.0 (even) and 1.0078125 (odd) -> 1.0.
+        // 1.0 + 2^-8 sits exactly between 1.0 (even) and 1.007_812_5 (odd) -> 1.0.
         assert_eq!(narrow_to_bf16(f32::from_bits(0x3F80_8000)), 1.0);
-        // 1.0 + 3*2^-8 sits between 1.0078125 (odd) and 1.015625 (even) -> up.
-        assert_eq!(narrow_to_bf16(f32::from_bits(0x3F81_8000)), 1.015625);
+        // 1.0 + 3*2^-8 sits between 1.007_812_5 (odd) and 1.015_625 (even) -> up.
+        assert_eq!(narrow_to_bf16(f32::from_bits(0x3F81_8000)), 1.015_625);
         // One ULP above the halfway point rounds up.
-        assert_eq!(narrow_to_bf16(f32::from_bits(0x3F80_8001)), 1.0078125);
+        assert_eq!(narrow_to_bf16(f32::from_bits(0x3F80_8001)), 1.007_812_5);
         // Idempotence over a value sweep.
         for i in 0..1000 {
             let x = (i as f32 * 0.7391).sin() * 10f32.powi(i % 60 - 30);

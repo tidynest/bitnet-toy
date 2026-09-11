@@ -214,7 +214,7 @@ pub fn cosine_lr(step: usize, warmup: usize, total: usize, peak: f32, floor: f32
         return floor;
     }
     let progress = (step - warmup) as f32 / ((total - warmup).max(1) as f32);
-    let cos_term = (1.0 + (std::f32::consts::PI * progress).cos()) * 0.5;
+    let cos_term = f32::midpoint(1.0, (std::f32::consts::PI * progress).cos());
     floor + (peak - floor) * cos_term
 }
 

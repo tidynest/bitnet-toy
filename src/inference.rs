@@ -353,7 +353,7 @@ mod tests {
         assert!((sum - 1.0).abs() < 1e-6, "top-k sum != 1: {}", sum);
         // Indices preserved: top three are 0, 1, 2.
         let mut indices: Vec<usize> = truncated.iter().map(|(i, _)| *i).collect();
-        indices.sort();
+        indices.sort_unstable();
         assert_eq!(indices, vec![0, 1, 2]);
     }
 

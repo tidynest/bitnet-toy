@@ -29,7 +29,7 @@ impl Vocab {
     /// `id_to_char` is sorted by char ordinal (so id 0 = the first char in Unicode order).
     pub fn from_text(text: &str) -> Self {
         let mut chars: Vec<char> = text.chars().collect();
-        chars.sort();
+        chars.sort_unstable();
         chars.dedup();
 
         let id_to_char = chars.clone();
@@ -151,7 +151,7 @@ pub fn make_windows(ids: &[usize], seq_len: usize) -> Vec<(Vec<usize>, Vec<usize
     let mut windows = Vec::with_capacity(n);
     for i in 0..n {
         let input = ids[i..i + seq_len].to_vec();
-        let target = ids[i + 1..i + seq_len + 1].to_vec();
+        let target = ids[i + 1..=i + seq_len].to_vec();
         windows.push((input, target));
     }
     windows
@@ -222,10 +222,7 @@ impl<'a> WindowSet<'a> {
             "window {i} out of range (len {})",
             self.len()
         );
-        (
-            &self.ids[i..i + self.seq],
-            &self.ids[i + 1..i + self.seq + 1],
-        )
+        (&self.ids[i..i + self.seq], &self.ids[i + 1..=i + self.seq])
     }
 }
 
@@ -251,8 +248,8 @@ impl Lcg {
     pub fn next_u64(&mut self) -> u64 {
         self.state = self
             .state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
         self.state
     }
     pub fn gen_range(&mut self, n: usize) -> usize {
@@ -326,7 +323,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
+    #[should_panic(expected = "not in vocab")]
     fn encode_panics_on_char_outside_vocab() {
         // Vocab has only 'a', 'b', 'c'; encoding 'z' must fail loudly.
         let v = Vocab::from_text("abc");
@@ -356,7 +353,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
+    #[should_panic(expected = "need ids.len() > seq_len")]
     fn make_windows_panics_when_corpus_too_short() {
         // ids.len() == seq_len → 0 windows → assertion fires.
         let _ = make_windows(&[1, 2, 3], 3);
@@ -391,14 +388,14 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
+    #[should_panic(expected = "need ids.len() > seq_len")]
     fn window_set_panics_when_corpus_too_short() {
         // Same contract as make_windows: ids.len() == seq_len → no windows.
         let _ = WindowSet::new(&[1, 2, 3], 3);
     }
 
     #[test]
-    #[should_panic]
+    #[should_panic(expected = "out of range")]
     fn window_set_panics_on_out_of_range_index() {
         let ids = [1, 2, 3, 4, 5];
         WindowSet::new(&ids, 3).get(2); // len() == 2, so index 2 is past the end
