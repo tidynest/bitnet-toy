@@ -3055,6 +3055,28 @@ mod tests {
         );
     }
 
+    /// Pins the tiny-demo loss trace. `tiny_demo` is serial and seeded, so
+    /// the numbers below are a function of weight init, the LR schedule,
+    /// AdamW, grad clipping and the STE forward pass. Any accidental
+    /// change to one of them moves the loss by far more than the
+    /// tolerance; the tolerance only absorbs ulp drift between the
+    /// scalar, AVX and NEON kernels. If a change is deliberate, re-record
+    /// both constants from the failure message.
+    #[test]
+    fn tiny_demo_loss_trace_is_pinned() {
+        let mut cfg = TrainConfig::tiny_demo();
+        cfg.n_steps = 40; // 30 warmup steps plus 10 on the cosine
+        cfg.log_every = usize::MAX;
+        let (initial, min_loss, _model, _vocab, _optim) = train_bitnet_lm(cfg);
+        let pinned = [(initial, 3.242_060_f32), (min_loss, 2.651_646_f32)];
+        for (got, want) in pinned {
+            assert!(
+                (got - want).abs() < 1e-4,
+                "loss trace moved: initial = {initial:.6}, min = {min_loss:.6}"
+            );
+        }
+    }
+
     /// Issue #41's correctness requirement: device-side validation must
     /// report the same number as the CPU reference for the same weights
     /// and the same windows. If it does not, every recorded val_loss
