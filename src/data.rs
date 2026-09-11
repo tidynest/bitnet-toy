@@ -268,6 +268,12 @@ impl Lcg {
         let bits = (self.next_u64() >> 40) as u32; // 24 bits
         bits as f32 / (1u32 << 24) as f32
     }
+
+    /// Uniform sample in [-1.0, 1.0). Takes the top 23 bits of `next_u64`
+    /// and shifts the [0, 2) result down by one. Used for weight init.
+    pub fn next_symmetric(&mut self) -> f32 {
+        ((self.next_u64() >> 41) as f32 / (1u32 << 22) as f32) - 1.0
+    }
 }
 
 /// Fisher-Yates shuffle in place using the given LCG. Deterministic for a
