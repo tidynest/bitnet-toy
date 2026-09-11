@@ -28,7 +28,7 @@ inference, binary export. No third-party ML dependencies.
 
 ## Status
 
-- **166** tests passing on `cargo test`; **209** with `cargo test --features cuda`.
+- **167** tests passing on `cargo test`; **210** with `cargo test --features cuda`.
 - **0** warnings on `cargo build --release` (or `--features cuda`).
 - `cargo audit` clean for the default build (stdlib-only); the optional
   `cuda` feature pulls `cudarc` and its small dynamic-loading deps.
@@ -229,7 +229,7 @@ rather than a capacity-overflow panic or a multi-gigabyte reservation.
 
 ```sh
 cargo build --release       # optimised binary at target/release/bitnet-toy
-cargo test                  # runs 166 tests (209 with --features cuda)
+cargo test                  # runs 167 tests (210 with --features cuda)
 cargo fmt                   # apply rustfmt
 cargo clippy --all-targets  # extra lints (pedantic warnings allowed at crate level)
 cargo audit                 # security audit; trivially clean (no deps)
