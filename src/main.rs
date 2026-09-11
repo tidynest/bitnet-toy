@@ -875,8 +875,8 @@ fn train_bitnet_lm(
             Ok(s) => s,
             Err(e) => {
                 eprintln!(
-                    "could not read corpus {:?}: {}; falling back to TINY_CORPUS",
-                    p, e
+                    "could not read corpus {}: {e}; falling back to TINY_CORPUS",
+                    p.display()
                 );
                 TINY_CORPUS.to_string()
             }
@@ -897,11 +897,11 @@ fn train_bitnet_lm(
             Some(p) => match std::fs::File::open(p).and_then(|mut f| crate::bpe::Bpe::load(&mut f))
             {
                 Ok(b) => {
-                    println!("loaded BPE tokeniser {:?} (vocab {})", p, b.size());
+                    println!("loaded BPE tokeniser {} (vocab {})", p.display(), b.size());
                     crate::data::Tokeniser::Bpe(b)
                 }
                 Err(e) => {
-                    eprintln!("could not load tokeniser {:?}: {e}", p);
+                    eprintln!("could not load tokeniser {}: {e}", p.display());
                     std::process::exit(1);
                 }
             },
@@ -956,7 +956,7 @@ fn train_bitnet_lm(
         crate::data::WindowSet::empty()
     };
 
-    let mut rng = Lcg::new(cfg.seed ^ 0xDEADBEEF);
+    let mut rng = Lcg::new(cfg.seed ^ 0xDEAD_BEEF);
 
     let mut opt = AdamW::new_for(&model, cfg.peak_lr);
     opt.beta1 = cfg.adamw_beta1;
@@ -1262,7 +1262,7 @@ fn train_bitnet_lm(
                             step,
                             v,
                             path.display()
-                        )
+                        );
                     }
                     Err(e) => eprintln!("step {:>5}   best-val checkpoint failed: {e}", step),
                 }
@@ -1291,7 +1291,7 @@ fn train_bitnet_lm(
                 let snap = opt.snapshot();
                 match write_f32_checkpoint(&model, &snap, stem, &vocab) {
                     Ok((path, _)) => {
-                        println!("step {:>5}   checkpoint -> {}", step, path.display())
+                        println!("step {step:>5}   checkpoint -> {}", path.display());
                     }
                     Err(e) => eprintln!("step {:>5}   checkpoint write failed: {e}", step),
                 }
@@ -1990,7 +1990,7 @@ fn print_generation_samples(
     // cutoff). Each call uses the same RNG so re-runs can be compared
     // bit-for-bit. Initialised once whether or not greedy ran above
     // (greedy is RNG-free, so its presence doesn't affect the stream).
-    let mut rng = data::Lcg::new(0xCAFEF00D);
+    let mut rng = data::Lcg::new(0xCAFE_F00D);
 
     if modes.contains(&Temp08) {
         println!("\n-- temperature sampling (T=0.8) --");
@@ -3220,10 +3220,10 @@ mod tests {
         let model = Model::new(&cfg, 99);
         let windows = crate::data::WindowSet::new(&ids, cfg.max_seq_len);
 
-        let mut rng_a = Lcg::new(0xBEEFCAFE);
+        let mut rng_a = Lcg::new(0xBEEF_CAFE);
         let (grads_serial, loss_serial) = compute_batched_grads(&model, &windows, &mut rng_a, 4, 1);
 
-        let mut rng_b = Lcg::new(0xBEEFCAFE);
+        let mut rng_b = Lcg::new(0xBEEF_CAFE);
         let (grads_par, loss_par) = compute_batched_grads(&model, &windows, &mut rng_b, 4, 4);
 
         assert!((loss_serial - loss_par).abs() < 1e-3);

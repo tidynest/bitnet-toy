@@ -1176,7 +1176,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic] // cross-tape operands must be rejected loudly, never silently desync
+    #[should_panic(expected = "operands belong to different tapes")] // never silently desync
     fn add_rejects_cross_tape_operands() {
         let t1 = Tape::new();
         let t2 = Tape::new();
@@ -1382,7 +1382,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic] // cross-tape rejection - same contract as add
+    #[should_panic(expected = "operands belong to different tapes")] // same contract as add
     fn matmul_rejects_cross_tape_operands() {
         let t1 = Tape::new();
         let t2 = Tape::new();
@@ -1849,7 +1849,7 @@ mod tests {
         let logits = Var::leaf(&tape, Tensor::from_vec(vec![1.0, 2.0, 3.0], vec![1, 3]));
         let loss = logits.cross_entropy(&[2]);
 
-        let expected = 0.40760595_f32;
+        let expected = 0.407_605_95_f32;
         assert!(
             (loss.value().data[0] - expected).abs() < 1e-4,
             "loss = {}, expected {}",

@@ -77,14 +77,14 @@ mod tests {
         )
     }
 
-    fn make_block_weights<'t>(
-        tape: &'t Tape,
+    fn make_block_weights(
+        tape: &Tape,
         n_heads: usize,
         hidden_dim: usize,
         head_dim: usize,
         ffn_dim: usize,
         offset: f32,
-    ) -> BlockWeights<'t> {
+    ) -> BlockWeights<'_> {
         // Each head gets a slightly bumped offset so two heads don't end up
         // numerically identical and accidentally pass tests they shouldn't.
         let heads = (0..n_heads)
