@@ -3068,7 +3068,7 @@ mod tests {
         cfg.n_steps = 40; // 30 warmup steps plus 10 on the cosine
         cfg.log_every = usize::MAX;
         let (initial, min_loss, _model, _vocab, _optim) = train_bitnet_lm(cfg);
-        let pinned = [(initial, 3.242_060_f32), (min_loss, 2.651_646_f32)];
+        let pinned = [(initial, 3.242_06_f32), (min_loss, 2.651_646_f32)];
         for (got, want) in pinned {
             assert!(
                 (got - want).abs() < 1e-4,
