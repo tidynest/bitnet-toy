@@ -28,7 +28,7 @@ inference, binary export. No third-party ML dependencies.
 
 ## Status
 
-- **168** tests passing on `cargo test`; **211** with `cargo test --features cuda`.
+- **171** tests passing on `cargo test`; **214** with `cargo test --features cuda`.
 - **0** warnings on `cargo build --release` (or `--features cuda`).
 - `cargo audit` clean for the default build (stdlib-only); the optional
   `cuda` feature pulls `cudarc` and its small dynamic-loading deps.
@@ -127,6 +127,7 @@ cargo run --release -- sample <path>                      # skip training; print
 cargo run --release -- sample <path> <prompt...>          # skip training; sample from a caller-supplied prompt
 cargo run --release -- sample <path> --corpus <corpus> .. # rebuild vocab from a custom training corpus
 cargo run --release -- inspect <path>                     # config, parameter count, ternary histogram per block
+cargo run --release -- plot <training.log> [--out f.svg]  # SVG loss curve (train line, val dots) from a trainer log
 BITNET_SAMPLE_MODES=min cargo run --release -- sample ... # only the 2 highest-signal modes (top-p T=0.5 + KV-cache)
 BITNET_SAMPLE_MODES=topp_low,kv cargo run -- shakespeare  # subset; same env var also gates the post-train tail
 cargo run --release --features cuda -- cuda-demo          # CPU-vs-cuBLAS matmul microbench
@@ -230,7 +231,7 @@ rather than a capacity-overflow panic or a multi-gigabyte reservation.
 
 ```sh
 cargo build --release       # optimised binary at target/release/bitnet-toy
-cargo test                  # runs 168 tests (211 with --features cuda)
+cargo test                  # runs 171 tests (214 with --features cuda)
 cargo fmt                   # apply rustfmt
 cargo clippy --all-targets  # extra lints (pedantic warnings allowed at crate level)
 cargo audit                 # security audit; trivially clean (no deps)
