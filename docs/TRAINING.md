@@ -308,9 +308,12 @@ bitnet-toy train data/tinyshakespeare.txt --tokenizer models/tinyshakespeare.bpe
   the same corpus and vocab size always produce a byte-identical
   `.bpe` artefact.
 - **The tokeniser travels inside the checkpoint** (a `BPEM` trailing
-  section next to the AdamW `OPTM` payload): `sample` needs no
-  `--corpus` for BPE checkpoints, and `--resume` picks the embedded
-  tokeniser up automatically (it wins over `--tokenizer`).
+  section next to the AdamW `OPTM` payload, or `VOCB` for a char
+  vocab): `sample` needs no `--corpus` for any checkpoint written
+  since VOCB landed, and `--resume` picks the embedded tokeniser up
+  automatically (it wins over `--tokenizer`). Older char-vocab files
+  have no trailer and still need `--corpus`. A tokeniser whose size
+  disagrees with the header is rejected as corruption at load.
 - Cross-tokeniser comparisons must use **bits per character** - the
   final-validation line prints it. Per-token perplexity is NOT
   comparable across vocabs: a BPE token spans ~2+ chars, so its
