@@ -2,7 +2,7 @@
 
 ![version](https://img.shields.io/badge/version-v0.19.0-3b6ea5)
 ![Rust](https://img.shields.io/badge/Rust-2024%20edition-ce412b?logo=rust&logoColor=white)
-![tests](https://img.shields.io/badge/tests-163%20passing-3f9142)
+[![ci](https://github.com/tidynest/bitnet-toy/actions/workflows/ci.yml/badge.svg)](https://github.com/tidynest/bitnet-toy/actions/workflows/ci.yml)
 ![CUDA](https://img.shields.io/badge/CUDA-optional%20(cudarc%200.19)-76b900?logo=nvidia&logoColor=white)
 ![ML dependencies](https://img.shields.io/badge/ML%20dependencies-none-3f9142)
 
