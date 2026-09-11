@@ -28,7 +28,7 @@ inference, binary export. No third-party ML dependencies.
 
 ## Status
 
-- **163** tests passing on `cargo test`; **206** with `cargo test --features cuda`.
+- **166** tests passing on `cargo test`; **209** with `cargo test --features cuda`.
 - **0** warnings on `cargo build --release` (or `--features cuda`).
 - `cargo audit` clean for the default build (stdlib-only); the optional
   `cuda` feature pulls `cudarc` and its small dynamic-loading deps.
@@ -219,13 +219,17 @@ quantised in the two ternary formats. The packed format uses base-3 encoding
 (`3^5 = 243 < 256`) to fit five ternary values per byte.
 
 The importer in `export::import` reads any of the three formats, returning a
-`Model` plus the `Format` it was stored as.
+`Model` plus the `Format` it was stored as. The header is treated as untrusted
+input: a zero dimension is rejected, tensor sizes are computed with checked
+arithmetic, and no reader preallocates more than 16M elements from a
+file-supplied count, so a truncated or crafted file fails with an `io::Error`
+rather than a capacity-overflow panic or a multi-gigabyte reservation.
 
 ## Build, test, audit
 
 ```sh
 cargo build --release       # optimised binary at target/release/bitnet-toy
-cargo test                  # runs 163 tests (206 with --features cuda)
+cargo test                  # runs 166 tests (209 with --features cuda)
 cargo fmt                   # apply rustfmt
 cargo clippy --all-targets  # extra lints (pedantic warnings allowed at crate level)
 cargo audit                 # security audit; trivially clean (no deps)
