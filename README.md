@@ -176,10 +176,12 @@ bitnet-toy/
 | `src/block.rs`         | transformer block (RMSNorm + attention + FFN + residuals) |
 | `src/model.rs`         | `Model`, `ModelConfig`, parameter visitor, init via LCG |
 | `src/data.rs`          | char vocab, sliding windows, file loader, LCG, shuffler |
+| `src/bpe.rs`           | byte-level BPE tokeniser: train, encode, decode, `.bpe` artefact save/load |
 | `src/optim.rs`         | AdamW, gradient clipping, cosine LR with warmup, resume continuation |
 | `src/inference.rs`     | greedy / temperature / top-k / top-p autoregressive generation |
 | `src/inference_kv.rs`  | KV-cached generator (~50-100x faster per-token vs full-forward path) |
 | `src/export.rs`        | three binary formats with header + round-trip importer + AdamW state payload |
+| `src/plot.rs`          | training-log parser and hand-written SVG loss curve for the `plot` subcommand |
 | `src/device.rs`        | per-op traits (`MatMul`, `Add`, `Mul`, `MulScalar`, `Transpose2D`, `Softmax`, `CausalMask`, `Rope`, `Silu`, `RmsNorm`); generic helpers `attention_head_inference<T>`, `ffn_inference<T>`, `block_inference<T>` |
 | `src/cuda.rs`          | CUDA back-end (gated `--features cuda`): NVRTC kernels, cuBLAS sgemm + int8 `cublasGemmEx` tensor-core GEMM, `CudaTensor`, `CudaModel` forward + GPU ternary training |
 | `src/main.rs`          | CLI dispatch, `TrainConfig`, demos, integration tests, `cuda-demo` + `cuda-forward-bench` benches |
