@@ -1935,6 +1935,7 @@ fn print_help() {
          shakespeare [resume]          ~5M-param TinyShakespeare training\n  \
          shakespeare-large [resume]    ~8.5M-param variant, seq_len 128\n  \
          sample <checkpoint> [--corpus <path>] [prompt]\n                                generate from a checkpoint, no training; --corpus\n                                rebuilds the vocab for `train`-made checkpoints\n  \
+         inspect <checkpoint>          config, parameter count, ternary histogram per block\n  \
          cuda-shakespeare [resume]     GPU ~5M training        (needs --features cuda)\n  \
          cuda-shakespeare-large        GPU ~8.5M training      (needs --features cuda)\n  \
          cuda-demo                     CPU vs CUDA matmul timings (needs --features cuda)\n  \
@@ -2238,6 +2239,83 @@ fn parse_sample_args(args: &[String]) -> Result<SampleArgs, String> {
 /// characters are dropped with a warning instead of panicking, so
 /// "feed it random BS" stays friendly. Without one, the stock prompts
 /// run, filtered to those the vocab can actually encode.
+/// `inspect <checkpoint>`: header, parameter count, and how the BitLinear
+/// weights split into -1 / 0 / +1 under absmean quantisation, per block
+/// and in total. The embedding is not a BitLinear weight and is left out
+/// of the histogram. Needs no corpus, so it works on any checkpoint.
+fn run_inspect_cli(path: std::path::PathBuf) {
+    use crate::bitlinear::ternary_counts;
+
+    let mut f = match std::fs::File::open(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("could not open checkpoint {}: {e}", path.display());
+            std::process::exit(1);
+        }
+    };
+    let (model, fmt, optim, bpe) = match export::import(&mut f) {
+        Ok(parts) => parts,
+        Err(e) => {
+            eprintln!("could not parse checkpoint {}: {e}", path.display());
+            std::process::exit(1);
+        }
+    };
+    let c = &model.config;
+    let n_params: usize = model
+        .param_shapes()
+        .iter()
+        .map(|s| s.iter().product::<usize>())
+        .sum();
+    println!("{}: {fmt:?} format", path.display());
+    println!(
+        "model     = vocab {}, hidden {}, ffn {}, n_heads {}, head_dim {}, blocks {}, seq_len {}",
+        c.vocab_size, c.hidden_dim, c.ffn_dim, c.n_heads, c.head_dim, c.n_blocks, c.max_seq_len
+    );
+    println!(
+        "params    = {n_params} ({} in the embedding, tied to lm_head)",
+        c.vocab_size * c.hidden_dim
+    );
+    println!(
+        "trailers  = optimiser state: {}, embedded BPE: {}",
+        if optim.is_some() { "yes" } else { "no" },
+        bpe.map_or("no".to_string(), |b| format!("yes ({} tokens)", b.size()))
+    );
+
+    println!("\nternary histogram of BitLinear weights (absmean quantisation):");
+    println!(
+        "{:>6} {:>10} {:>8} {:>8} {:>8}",
+        "block", "weights", "-1", "0", "+1"
+    );
+    let mut total = [0usize; 3];
+    for (i, b) in model.blocks.iter().enumerate() {
+        let tensors = b
+            .heads
+            .iter()
+            .flat_map(|h| [&h.w_q, &h.w_k, &h.w_v, &h.w_o])
+            .chain([&b.ffn_gate_w, &b.ffn_up_w, &b.ffn_down_w]);
+        let counts = tensors.map(ternary_counts).fold([0usize; 3], |acc, c| {
+            [acc[0] + c[0], acc[1] + c[1], acc[2] + c[2]]
+        });
+        print_histogram_row(&i.to_string(), counts);
+        for (t, c) in total.iter_mut().zip(counts) {
+            *t += c;
+        }
+    }
+    print_histogram_row("all", total);
+}
+
+fn print_histogram_row(label: &str, counts: [usize; 3]) {
+    let n = counts.iter().sum::<usize>().max(1) as f32;
+    let pct = |c: usize| format!("{:.1}%", 100.0 * c as f32 / n);
+    println!(
+        "{label:>6} {:>10} {:>8} {:>8} {:>8}",
+        counts.iter().sum::<usize>(),
+        pct(counts[0]),
+        pct(counts[1]),
+        pct(counts[2])
+    );
+}
+
 fn run_sample_cli(
     path: std::path::PathBuf,
     corpus_override: Option<std::path::PathBuf>,
@@ -2800,6 +2878,16 @@ fn main() {
             .map(std::path::PathBuf::from)
             .filter(|p| p.exists());
         run_shakespeare_training(resume_path, large, /*use_cuda=*/ false);
+        return;
+    }
+    if args.len() > 1 && args[1] == "inspect" {
+        match args.get(2) {
+            Some(p) => run_inspect_cli(std::path::PathBuf::from(p)),
+            None => {
+                eprintln!("usage: cargo run --release -- inspect <checkpoint_path>");
+                std::process::exit(2);
+            }
+        }
         return;
     }
     if args.len() > 1 && args[1] == "sample" {

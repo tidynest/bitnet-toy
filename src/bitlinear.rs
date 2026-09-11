@@ -56,6 +56,17 @@ pub fn absmean_ternary(w: &Tensor) -> (Tensor, f32) {
     )
 }
 
+/// How many of `w`'s entries quantise to -1, 0 and +1 under
+/// `absmean_ternary`, in that order. The zero share is the number the
+/// b1.58 paper's "1.58 bits" rests on; `inspect` prints it per block.
+pub fn ternary_counts(w: &Tensor) -> [usize; 3] {
+    let (w_q, _) = absmean_ternary(w);
+    w_q.data.iter().fold([0; 3], |mut acc, &q| {
+        acc[(q as i32 + 1) as usize] += 1;
+        acc
+    })
+}
+
 /// Absmax INT8 activation quantisation, per-token (BitNet b1.58 §2).
 ///
 /// Per row of the 2D input:
@@ -119,6 +130,14 @@ mod tests {
         assert!((gamma - 1.0).abs() < 1e-4, "γ ≈ 1.0, got {}", gamma);
         assert_eq!(w_q.data, vec![1.0, -1.0, 0.0, 0.0]);
         assert_eq!(w_q.shape, vec![1, 4]);
+    }
+
+    /// Pins the number by hand: γ = (1 + 2 + 0.1 + 3) / 4 = 1.525, so the
+    /// scaled entries round to +1, -1, 0, +2 -> clamp -> one -1, one 0, two +1.
+    #[test]
+    fn ternary_counts_match_hand_count() {
+        let w = Tensor::from_vec(vec![1.0, -2.0, 0.1, 3.0], vec![2, 2]);
+        assert_eq!(ternary_counts(&w), [1, 1, 2]);
     }
 
     #[test]
