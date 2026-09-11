@@ -246,10 +246,12 @@ fn matmul_thread_count() -> usize {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum MatmulSimd {
     /// 16-lane AVX-512 (`_mm512_mul_ps` + `_mm512_add_ps`). Available on Zen 4
-    /// and Intel Sapphire Rapids onwards.
+    /// and Intel Sapphire Rapids onwards. Never constructed on aarch64.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     Avx512,
     /// 8-lane AVX2 (`_mm256_mul_ps` + `_mm256_add_ps`). Available on every
-    /// modern x86_64 CPU shipped since ~2013.
+    /// modern x86_64 CPU shipped since ~2013. Never constructed on aarch64.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     Avx2,
     /// 4-lane ARM NEON (`vmulq_f32` + `vaddq_f32`). Baseline on every
     /// ARMv8/aarch64 CPU (Apple Silicon, Graviton, Raspberry Pi 4+), so
