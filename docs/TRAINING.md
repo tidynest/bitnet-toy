@@ -746,12 +746,14 @@ as well as in whatever was being tested. Re-measure the older
 checkpoint on the same basis before comparing, which is now cheap:
 
 ```sh
-bitnet-toy train <corpus> <same geometry flags> --steps 1 \
-    --resume models/<old>.best.f32.bin --cuda --checkpoint-every 0
+bitnet-toy eval models/<old>.best.f32.bin <corpus> --cuda
 ```
 
-The step-0 validation line reports the resumed weights on the current
-default sample count.
+Geometry comes from the checkpoint header; `--val-split` must match
+the run (default 0.10, which every recorded run used) and
+`--val-samples` defaults to 2000 with `--cuda`. At 100 windows `eval`
+reproduces the trainer's recorded figure exactly (checked on
+`full-char-seq256-b8`: 2.263 both ways), so the two are one basis.
 
 ### The lesson that keeps recurring
 
