@@ -34,7 +34,8 @@ inference, binary export. No third-party ML dependencies.
   `cuda` feature pulls `cudarc` and its small dynamic-loading deps.
 - Trains end-to-end on the full TinyShakespeare corpus in ~8-15
   minutes on CPU (v0.13 ~5M-param config).
-- Current best model: **2.263 bits/char** on the 5.36M-char complete
+- Current best model: **2.277 bits/char** at 2000 validation windows
+  (2.263 on the original 100-window basis) on the 5.36M-char complete
   works (`models/full-char-seq256-b8.best.f32.bin`; ~8.5M params,
   seq_len 256, batch 8, val_ppl 4.80 at step 3500 of 4000). Reached by
   tuning the LR schedule and gradient throughput rather than by adding
