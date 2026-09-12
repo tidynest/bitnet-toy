@@ -755,6 +755,67 @@ the run (default 0.10, which every recorded run used) and
 reproduces the trainer's recorded figure exactly (checked on
 `full-char-seq256-b8`: 2.263 both ways), so the two are one basis.
 
+### Re-measured at 2000 windows (2026-09-11)
+
+Every best checkpoint cited on this page, run through `eval --cuda`
+on the same held-out tail at 2000 windows. The old column is the
+100-window figure the tables above record.
+
+| checkpoint | 100 windows | 2000 windows | shift |
+|---|---|---|---|
+| `full-char-4k-tuned` | 2.432 | 2.497 | +0.065 |
+| `full-char-8k-tuned` | 2.43 | 2.478 | +0.048 |
+| `full-char-30k` | 3.13 | 3.209 | +0.079 |
+| `full-char-seq128-b8` | 2.348 | 2.399 | +0.051 |
+| `full-char-seq256` (batch 4) | 2.390 | 2.406 | +0.016 |
+| `full-char-seq256-b2` | 2.499 | 2.514 | +0.015 |
+| `full-char-seq256-b8` | **2.263** | **2.277** | +0.014 |
+| `full-char-hidden384` | 2.370 | 2.422 | +0.052 |
+| `full-char-hidden384-8k` | 2.473 | 2.522 | +0.049 |
+| `full-bpe-4k-tuned` | ~3.50 | 3.610 | +0.11 |
+| `gutenberg-baseline` (4k) | 2.170 | 2.158 | -0.012 |
+| `gutenberg-8k` | 1.986 | 1.976 | -0.010 |
+| `gutenberg-b16` | 1.935 | 1.918 | -0.017 |
+| `gutenberg-b16-lr21e3` | 1.995 | 1.976 | -0.019 |
+| `gutenberg-h384` | **1.772** | **1.752** | -0.020 |
+
+(`gutenberg-h512` reads 6.651: its log stops at step 400, so the
+"best" file is an early checkpoint of an aborted run, not a result.)
+
+Two things the table says that the 0.02 estimate did not. First, the
+Shakespeare 100-window subset was **optimistic by up to 0.065**, three
+times the estimate, while Gutenberg's was pessimistic by 0.01 to 0.02.
+The stride is deterministic, so all Shakespeare runs shared the same
+100 easy windows; the offset is correlated across runs, which is why
+the rankings mostly survive even though the absolute numbers do not.
+Second, the offset is not uniform: the seq 256 runs moved by 0.015
+and the seq 128 runs by 0.05, so effects that compare across window
+lengths were the ones most distorted.
+
+What changes on the 2000 basis:
+
+| effect (Shakespeare) | 100-window | 2000-window |
+|---|---|---|
+| 2x batch at seq 128 (4k-tuned -> seq128-b8) | -0.084 | -0.098 |
+| 2x context at batch 4 (4k-tuned -> seq256) | -0.042 | -0.091 |
+| both together (4k-tuned -> seq256-b8) | -0.169 | -0.220 |
+| 2.25x parameters (4k-tuned -> hidden384) | -0.062 | -0.075 |
+| 2x schedule, hidden384 | +0.103 | +0.100 |
+
+- "Batch size is roughly twice the lever context length is" does not
+  survive: on one basis the two levers are within 0.007 of each other.
+  Super-additivity does (0.220 against a 0.189 sum).
+- 2x context now beats 2.25x parameters on Shakespeare (0.091 vs
+  0.075); the 100-window ranking had it the other way round.
+- Every Gutenberg conclusion holds with the numbers barely moved:
+  4k -> 8k gains 0.182, batch 16 gains 0.058, the 2.1e-3 peak LR
+  gives that gain back (+0.058), hidden 384 gains 0.224 (was 0.162;
+  the baseline moved less than the bigger model).
+- Best models stand: 2.277 on Shakespeare, 1.752 on Gutenberg.
+
+The tables above are left as recorded; this one is the basis to
+compare any new run against.
+
 ### The lesson that keeps recurring
 
 Two conclusions on this page were drawn on 5.36M characters and then
