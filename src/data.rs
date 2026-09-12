@@ -14,7 +14,7 @@ use std::path::Path;
 
 /// Char ↔ id bidirectional mapping. Sorted lexicographically by char,
 /// so the same input text always produces the same id assignment.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Vocab {
     /// Forward mapping. BTreeMap (not HashMap) for deterministic iteration
     /// order - useful when you want to print the vocab and not see it shuffle.
@@ -89,6 +89,7 @@ impl Vocab {
 /// Unified tokeniser surface (issue #24): the char vocab or a BPE
 /// tokeniser behind one API, so training, generation and the CLI
 /// never branch on which one is active.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Tokeniser {
     Char(Vocab),
     Bpe(crate::bpe::Bpe),

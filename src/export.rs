@@ -507,31 +507,70 @@ pub fn export_ternary_packed<W: Write>(
     Ok(total)
 }
 
-// ---- BPE tokeniser section (issue #24) ----
+// ---- tokeniser section ----
 //
-// Optional trailing section AFTER the OPTM payload: marker "BPEM" then
-// the `Bpe::save` bytes. A BPE-trained model is unusable without its
-// merges, so the tokeniser travels inside the checkpoint - `sample`
-// needs no corpus and no side-channel file. Char-vocab checkpoints
-// simply omit the section (fully backward compatible).
+// Optional trailing section after the OPTM payload, one of two markers:
+// "BPEM" then the `Bpe::save` bytes (issue #24), or "VOCB" then a u32
+// byte length and the char vocab as UTF-8, one char per id in id order.
+// Either way the checkpoint is self-contained: `sample` and `eval` need
+// no corpus and no side-channel file. Files written before VOCB existed
+// omit the section and still load; the caller falls back to a corpus.
 
 const BPE_MARKER: &[u8; 4] = b"BPEM";
+const VOCAB_MARKER: &[u8; 4] = b"VOCB";
 
-pub fn append_bpe_section<W: Write>(w: &mut W, bpe: &crate::bpe::Bpe) -> io::Result<()> {
-    w.write_all(BPE_MARKER)?;
-    bpe.save(w)
+pub fn append_tokeniser_section<W: Write>(
+    w: &mut W,
+    tokeniser: &crate::data::Tokeniser,
+) -> io::Result<()> {
+    match tokeniser {
+        crate::data::Tokeniser::Bpe(b) => {
+            w.write_all(BPE_MARKER)?;
+            b.save(w)
+        }
+        crate::data::Tokeniser::Char(v) => {
+            let text: String = v.id_to_char.iter().collect();
+            w.write_all(VOCAB_MARKER)?;
+            w.write_all(&(text.len() as u32).to_le_bytes())?;
+            w.write_all(text.as_bytes())
+        }
+    }
+}
+
+/// Body of a VOCB section. The length is untrusted: read through `take`
+/// so a lying header stops at EOF instead of reserving the claimed size.
+fn read_vocab_body<R: Read>(r: &mut R) -> io::Result<crate::data::Vocab> {
+    let mut buf4 = [0u8; 4];
+    r.read_exact(&mut buf4)?;
+    let len = u32::from_le_bytes(buf4) as usize;
+    let mut bytes = Vec::with_capacity(len.min(PREALLOC_CAP));
+    r.take(len as u64).read_to_end(&mut bytes)?;
+    if bytes.len() != len {
+        return Err(io::Error::new(
+            ErrorKind::UnexpectedEof,
+            "VOCB section truncated",
+        ));
+    }
+    let text = String::from_utf8(bytes)
+        .map_err(|e| io::Error::new(ErrorKind::InvalidData, format!("VOCB not UTF-8: {e}")))?;
+    Ok(crate::data::Vocab::from_text(&text))
 }
 
 // ---- public import ----
 
 /// Read a model file (any format) and reconstruct the `Model`, the `Format`
-/// it was stored in, and an optional `OptimState` if the file carries one.
-/// Older BNT3 files written before optim-state persistence terminate after
-/// `lm_head`; this function returns `Ok((model, fmt, None))` for those.
+/// it was stored in, an optional `OptimState`, and the tokeniser if the
+/// file carries one (BPEM or VOCB trailer). A tokeniser whose size
+/// disagrees with the header's `vocab_size` is corruption, not a warning.
 #[allow(clippy::type_complexity)]
 pub fn import<R: Read>(
     r: &mut R,
-) -> io::Result<(Model, Format, Option<OptimState>, Option<crate::bpe::Bpe>)> {
+) -> io::Result<(
+    Model,
+    Format,
+    Option<OptimState>,
+    Option<crate::data::Tokeniser>,
+)> {
     let (fmt, cfg) = read_header(r)?;
     let h = cfg.hidden_dim;
     let d = cfg.head_dim;
@@ -583,7 +622,7 @@ pub fn import<R: Read>(
     // optional. EOF ends the trailer; an unknown marker is corruption.
     let param_shapes = model.param_shapes();
     let mut optim = None;
-    let mut bpe = None;
+    let mut tokeniser = None;
     let mut marker = [0u8; 4];
     loop {
         match r.read_exact(&mut marker) {
@@ -592,7 +631,12 @@ pub fn import<R: Read>(
         }
         match &marker {
             m if m == OPTM_MARKER => optim = Some(read_optim_state_body(r, &param_shapes)?),
-            m if m == BPE_MARKER => bpe = Some(crate::bpe::Bpe::load(r)?),
+            m if m == BPE_MARKER => {
+                tokeniser = Some(crate::data::Tokeniser::Bpe(crate::bpe::Bpe::load(r)?));
+            }
+            m if m == VOCAB_MARKER => {
+                tokeniser = Some(crate::data::Tokeniser::Char(read_vocab_body(r)?));
+            }
             other => {
                 return Err(io::Error::new(
                     ErrorKind::InvalidData,
@@ -605,7 +649,19 @@ pub fn import<R: Read>(
         }
     }
 
-    Ok((model, fmt, optim, bpe))
+    if let Some(t) = &tokeniser
+        && t.size() != model.config.vocab_size
+    {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "embedded tokeniser has {} tokens, header says vocab_size {}",
+                t.size(),
+                model.config.vocab_size
+            ),
+        ));
+    }
+    Ok((model, fmt, optim, tokeniser))
 }
 
 #[cfg(test)]
@@ -1020,22 +1076,64 @@ mod tests {
             .collect()
     }
 
-    /// Issue #24: the BPEM trailing section round-trips the tokeniser
-    /// through a checkpoint, and files without one read back None.
-    #[test]
-    fn bpe_section_round_trips_through_checkpoint() {
-        let model = tiny_model();
-        let bpe = crate::bpe::Bpe::train(b"the theme thereof there ", 270);
+    fn model_with_vocab(vocab_size: usize) -> Model {
+        let mut cfg = tiny_model().config;
+        cfg.vocab_size = vocab_size;
+        Model::new(&cfg, 0)
+    }
+
+    fn checkpoint_with(model: &Model, t: &crate::data::Tokeniser) -> Vec<u8> {
         let mut buf = Vec::new();
-        export_bf16(&model, &mut buf, None).unwrap();
-        append_bpe_section(&mut buf, &bpe).unwrap();
+        export_bf16(model, &mut buf, None).unwrap();
+        append_tokeniser_section(&mut buf, t).unwrap();
+        buf
+    }
+
+    /// Both trailer kinds round-trip the tokeniser through a checkpoint,
+    /// and a file without one reads back None.
+    #[test]
+    fn tokeniser_section_round_trips_both_kinds() {
+        use crate::data::Tokeniser;
+        // Short text runs out of pairs before 270, so size the model from
+        // what training actually produced.
+        let bpe = Tokeniser::Bpe(crate::bpe::Bpe::train(b"the theme thereof there ", 270));
+        let buf = checkpoint_with(&model_with_vocab(bpe.size()), &bpe);
         let (_m, _fmt, _opt, loaded) = import(&mut Cursor::new(&buf)).unwrap();
         assert_eq!(loaded.expect("BPEM section lost"), bpe);
 
+        // Eight distinct chars, multibyte included, matching tiny_model.
+        let vocab = Tokeniser::Char(crate::data::Vocab::from_text("ab\ncd\u{e9}\u{4e16} "));
+        assert_eq!(vocab.size(), 8);
+        let buf = checkpoint_with(&tiny_model(), &vocab);
+        let (_m, _fmt, _opt, loaded) = import(&mut Cursor::new(&buf)).unwrap();
+        assert_eq!(loaded.expect("VOCB section lost"), vocab);
+
         let mut plain = Vec::new();
-        export_bf16(&model, &mut plain, None).unwrap();
+        export_bf16(&tiny_model(), &mut plain, None).unwrap();
         let (_m, _fmt, _opt, none) = import(&mut Cursor::new(&plain)).unwrap();
         assert!(none.is_none(), "phantom tokeniser from a plain checkpoint");
+    }
+
+    /// A tokeniser that disagrees with the header is corruption.
+    #[test]
+    fn import_rejects_tokeniser_of_the_wrong_size() {
+        let vocab = crate::data::Tokeniser::Char(crate::data::Vocab::from_text("abc"));
+        let buf = checkpoint_with(&tiny_model(), &vocab);
+        let err = import(&mut Cursor::new(&buf)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// VOCB length is untrusted: a claim of u32::MAX with two real bytes
+    /// must fail at EOF, not reserve 4 GB.
+    #[test]
+    fn vocab_section_survives_absurd_length() {
+        let mut buf = Vec::new();
+        export_bf16(&tiny_model(), &mut buf, None).unwrap();
+        buf.extend_from_slice(VOCAB_MARKER);
+        buf.extend_from_slice(&u32::MAX.to_le_bytes());
+        buf.extend_from_slice(b"ab");
+        let err = import(&mut Cursor::new(&buf)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     }
 
     /// Build a BNT5 header by hand: magic, format byte, then seven
